@@ -5,7 +5,7 @@ use crate::agent::eval::AutoClassifyExt;
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::i18n::ToolDescriptions;
-use crate::observability::{self, Observer, ObserverEvent};
+use crate::observability::{self, Observer, ObserverEvent, runtime_trace};
 use crate::platform;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
+use uuid::Uuid;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
@@ -60,6 +61,10 @@ pub struct Agent {
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    /// Provider name string used in observability events (e.g. "openrouter").
+    provider_name: String,
+    /// Channel name for runtime trace correlation. Defaults to "agent".
+    channel_name: String,
 }
 
 pub struct AgentBuilder {
@@ -89,6 +94,8 @@ pub struct AgentBuilder {
     autonomy_level: Option<crate::security::AutonomyLevel>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    provider_name: Option<String>,
+    channel_name: Option<String>,
 }
 
 impl Default for AgentBuilder {
@@ -126,6 +133,8 @@ impl AgentBuilder {
             autonomy_level: None,
             activated_tools: None,
             hook_runner: None,
+            provider_name: None,
+            channel_name: None,
         }
     }
 
@@ -274,6 +283,16 @@ impl AgentBuilder {
         self
     }
 
+    pub fn provider_name(mut self, name: impl Into<String>) -> Self {
+        self.provider_name = Some(name.into());
+        self
+    }
+
+    pub fn channel_name(mut self, name: impl Into<String>) -> Self {
+        self.channel_name = Some(name.into());
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -331,6 +350,8 @@ impl AgentBuilder {
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
             hook_runner: self.hook_runner,
+            provider_name: self.provider_name.unwrap_or_else(|| "unknown".to_string()),
+            channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
         })
     }
 }
@@ -583,6 +604,7 @@ impl Agent {
             } else {
                 None
             })
+            .provider_name(provider_name.to_string())
             .build()
     }
 
@@ -647,7 +669,7 @@ impl Agent {
         self.prompt_builder.build(&ctx)
     }
 
-    async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
+    async fn execute_tool_call(&self, call: &ParsedToolCall, turn_id: &str) -> ToolExecutionResult {
         let start = Instant::now();
 
         // ── Hook: before_tool_call (modifying) ──────────────────
@@ -680,6 +702,23 @@ impl Agent {
         }
 
         // First try to find tool in static registry, then in activated MCP tools.
+        self.observer.record_event(&ObserverEvent::ToolCallStart {
+            tool: call.name.clone(),
+            arguments: Some(serde_json::to_string(&call.arguments).unwrap_or_default()),
+        });
+        runtime_trace::record_event(
+            "tool_call_start",
+            Some(&self.channel_name),
+            Some(&self.provider_name),
+            Some(&self.model_name),
+            Some(turn_id),
+            None,
+            None,
+            serde_json::json!({
+                "tool": call.name,
+                "arguments": serde_json::to_string(&call.arguments).unwrap_or_default(),
+            }),
+        );
         let (result, success) =
             if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
                 match tool.execute(tool_args.clone()).await {
@@ -750,6 +789,21 @@ impl Agent {
                 .await;
         }
 
+        runtime_trace::record_event(
+            "tool_call_result",
+            Some(&self.channel_name),
+            Some(&self.provider_name),
+            Some(&self.model_name),
+            Some(turn_id),
+            Some(success),
+            if success { None } else { Some(result.as_str()) },
+            serde_json::json!({
+                "tool": tool_name.clone(),
+                "duration_ms": duration.as_millis(),
+                "output": result.clone(),
+            }),
+        );
+
         ToolExecutionResult {
             name: tool_name,
             output: result,
@@ -758,18 +812,22 @@ impl Agent {
         }
     }
 
-    async fn execute_tools(&self, calls: &[ParsedToolCall]) -> Vec<ToolExecutionResult> {
+    async fn execute_tools(
+        &self,
+        calls: &[ParsedToolCall],
+        turn_id: &str,
+    ) -> Vec<ToolExecutionResult> {
         if !self.config.parallel_tools {
             let mut results = Vec::with_capacity(calls.len());
             for call in calls {
-                results.push(self.execute_tool_call(call).await);
+                results.push(self.execute_tool_call(call, turn_id).await);
             }
             return results;
         }
 
         let futs: Vec<_> = calls
             .iter()
-            .map(|call| self.execute_tool_call(call))
+            .map(|call| self.execute_tool_call(call, turn_id))
             .collect();
         futures_util::future::join_all(futs).await
     }
@@ -816,6 +874,8 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        let turn_id = Uuid::new_v4().to_string();
+
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
             self.history
@@ -907,6 +967,22 @@ impl Agent {
                 });
             }
 
+            self.observer.record_event(&ObserverEvent::LlmRequest {
+                provider: self.provider_name.clone(),
+                model: effective_model.clone(),
+                messages_count: messages.len(),
+            });
+            runtime_trace::record_event(
+                "llm_request",
+                Some(&self.channel_name),
+                Some(&self.provider_name),
+                Some(&effective_model),
+                Some(&turn_id),
+                None,
+                None,
+                serde_json::json!({ "messages_count": messages.len() }),
+            );
+            let llm_start = Instant::now();
             let response = match self
                 .provider
                 .chat(
@@ -923,8 +999,57 @@ impl Agent {
                 )
                 .await
             {
-                Ok(resp) => resp,
-                Err(err) => return Err(err),
+                Ok(resp) => {
+                    let llm_duration = llm_start.elapsed();
+                    self.observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: self.provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: llm_duration,
+                        success: true,
+                        error_message: None,
+                        input_tokens: resp.usage.as_ref().and_then(|u| u.input_tokens),
+                        output_tokens: resp.usage.as_ref().and_then(|u| u.output_tokens),
+                    });
+                    runtime_trace::record_event(
+                        "llm_response",
+                        Some(&self.channel_name),
+                        Some(&self.provider_name),
+                        Some(&effective_model),
+                        Some(&turn_id),
+                        Some(true),
+                        None,
+                        serde_json::json!({
+                            "duration_ms": llm_duration.as_millis(),
+                            "input_tokens": resp.usage.as_ref().and_then(|u| u.input_tokens),
+                            "output_tokens": resp.usage.as_ref().and_then(|u| u.output_tokens),
+                        }),
+                    );
+                    resp
+                }
+                Err(err) => {
+                    let llm_duration = llm_start.elapsed();
+                    let err_str = err.to_string();
+                    self.observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: self.provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: llm_duration,
+                        success: false,
+                        error_message: Some(err_str.clone()),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                    runtime_trace::record_event(
+                        "llm_response",
+                        Some(&self.channel_name),
+                        Some(&self.provider_name),
+                        Some(&effective_model),
+                        Some(&turn_id),
+                        Some(false),
+                        Some(err_str.as_str()),
+                        serde_json::json!({ "duration_ms": llm_duration.as_millis() }),
+                    );
+                    return Err(err);
+                }
             };
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
@@ -951,6 +1076,17 @@ impl Agent {
                         final_text.clone(),
                     )));
                 self.trim_history();
+                runtime_trace::record_event(
+                    "turn_final_response",
+                    Some(&self.channel_name),
+                    Some(&self.provider_name),
+                    Some(&effective_model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({ "response_len": final_text.len() }),
+                );
+                self.observer.record_event(&ObserverEvent::TurnComplete);
 
                 return Ok(final_text);
             }
@@ -970,7 +1106,7 @@ impl Agent {
                 reasoning_content: response.reasoning_content.clone(),
             });
 
-            let results = self.execute_tools(&calls).await;
+            let results = self.execute_tools(&calls, &turn_id).await;
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();
@@ -995,6 +1131,8 @@ impl Agent {
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
     ) -> Result<String> {
+        let turn_id = Uuid::new_v4().to_string();
+
         // ── Preamble (identical to turn) ───────────────────────────────
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
@@ -1087,6 +1225,23 @@ impl Agent {
             // forward deltas.  Otherwise fall back to non-streaming chat.
             use futures_util::StreamExt;
 
+            self.observer.record_event(&ObserverEvent::LlmRequest {
+                provider: self.provider_name.clone(),
+                model: effective_model.clone(),
+                messages_count: messages.len(),
+            });
+            runtime_trace::record_event(
+                "llm_request",
+                Some(&self.channel_name),
+                Some(&self.provider_name),
+                Some(&effective_model),
+                Some(&turn_id),
+                None,
+                None,
+                serde_json::json!({ "messages_count": messages.len() }),
+            );
+            let llm_start = Instant::now();
+
             let stream_opts = zeroclaw_providers::traits::StreamOptions::new(true);
             let mut stream = self.provider.stream_chat(
                 zeroclaw_providers::ChatRequest {
@@ -1172,6 +1327,16 @@ impl Agent {
                 }
             } else {
                 // Fall back to non-streaming chat
+                runtime_trace::record_event(
+                    "llm_stream_fallback",
+                    Some(&self.channel_name),
+                    Some(&self.provider_name),
+                    Some(&effective_model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some("stream produced no content, falling back to chat"),
+                    serde_json::json!({ "reason": "got_stream=false" }),
+                );
                 match self
                     .provider
                     .chat(
@@ -1189,9 +1354,57 @@ impl Agent {
                     .await
                 {
                     Ok(resp) => resp,
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        let llm_duration = llm_start.elapsed();
+                        let err_str = err.to_string();
+                        self.observer.record_event(&ObserverEvent::LlmResponse {
+                            provider: self.provider_name.clone(),
+                            model: effective_model.clone(),
+                            duration: llm_duration,
+                            success: false,
+                            error_message: Some(err_str.clone()),
+                            input_tokens: None,
+                            output_tokens: None,
+                        });
+                        runtime_trace::record_event(
+                            "llm_response",
+                            Some(&self.channel_name),
+                            Some(&self.provider_name),
+                            Some(&effective_model),
+                            Some(&turn_id),
+                            Some(false),
+                            Some(err_str.as_str()),
+                            serde_json::json!({ "duration_ms": llm_duration.as_millis() }),
+                        );
+                        return Err(err);
+                    }
                 }
             };
+
+            let llm_duration = llm_start.elapsed();
+            self.observer.record_event(&ObserverEvent::LlmResponse {
+                provider: self.provider_name.clone(),
+                model: effective_model.clone(),
+                duration: llm_duration,
+                success: true,
+                error_message: None,
+                input_tokens: response.usage.as_ref().and_then(|u| u.input_tokens),
+                output_tokens: response.usage.as_ref().and_then(|u| u.output_tokens),
+            });
+            runtime_trace::record_event(
+                "llm_response",
+                Some(&self.channel_name),
+                Some(&self.provider_name),
+                Some(&effective_model),
+                Some(&turn_id),
+                Some(true),
+                None,
+                serde_json::json!({
+                    "duration_ms": llm_duration.as_millis(),
+                    "input_tokens": response.usage.as_ref().and_then(|u| u.input_tokens),
+                    "output_tokens": response.usage.as_ref().and_then(|u| u.output_tokens),
+                }),
+            );
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {
@@ -1226,6 +1439,17 @@ impl Agent {
                         final_text.clone(),
                     )));
                 self.trim_history();
+                runtime_trace::record_event(
+                    "turn_final_response",
+                    Some(&self.channel_name),
+                    Some(&self.provider_name),
+                    Some(&effective_model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({ "response_len": final_text.len() }),
+                );
+                self.observer.record_event(&ObserverEvent::TurnComplete);
 
                 return Ok(final_text);
             }
@@ -1254,7 +1478,7 @@ impl Agent {
                     .await;
             }
 
-            let results = self.execute_tools(&calls).await;
+            let results = self.execute_tools(&calls, &turn_id).await;
 
             // Notify about each tool result
             for result in &results {
@@ -1370,9 +1594,13 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability::runtime_trace::{self, load_events};
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::collections::HashMap;
+    use std::sync::LazyLock;
+    use tempfile::TempDir;
+    use zeroclaw_api::observability_traits::ObserverMetric;
 
     struct MockProvider {
         responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
@@ -1471,6 +1699,71 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: Mutex<Vec<ObserverEvent>>,
+    }
+
+    static RUNTIME_TRACE_TEST_LOCK: LazyLock<std::sync::Mutex<()>> =
+        LazyLock::new(|| std::sync::Mutex::new(()));
+
+    impl Observer for RecordingObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            self.events.lock().push(event.clone());
+        }
+
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "recording-observer"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn test_memory() -> Arc<dyn Memory> {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        )
+    }
+
+    fn enable_runtime_trace(
+        workspace: &TempDir,
+    ) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
+        let guard = RUNTIME_TRACE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg = zeroclaw_config::schema::ObservabilityConfig {
+            backend: "none".to_string(),
+            otel_endpoint: None,
+            otel_service_name: None,
+            runtime_trace_mode: "full".to_string(),
+            runtime_trace_path: "state/runtime-trace.jsonl".to_string(),
+            runtime_trace_max_entries: 100,
+        };
+        runtime_trace::init_from_config(&cfg, workspace.path());
+        (workspace.path().join("state/runtime-trace.jsonl"), guard)
+    }
+
+    fn disable_runtime_trace(workspace: &TempDir) {
+        let cfg = zeroclaw_config::schema::ObservabilityConfig {
+            backend: "none".to_string(),
+            otel_endpoint: None,
+            otel_service_name: None,
+            runtime_trace_mode: "none".to_string(),
+            runtime_trace_path: "state/runtime-trace.jsonl".to_string(),
+            runtime_trace_max_entries: 1,
+        };
+        runtime_trace::init_from_config(&cfg, workspace.path());
+    }
+
     #[tokio::test]
     async fn turn_without_tools_returns_text() {
         let provider = Box::new(MockProvider {
@@ -1504,6 +1797,89 @@ mod tests {
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "hello");
+    }
+
+    #[tokio::test]
+    async fn turn_records_llm_and_turn_completion_observability() {
+        let workspace = TempDir::new().unwrap();
+        let (trace_path, _trace_guard) = enable_runtime_trace(&workspace);
+        let observer = Arc::new(RecordingObserver::default());
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some("hello-observed".into()),
+                tool_calls: vec![],
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(11),
+                    output_tokens: Some(7),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]),
+        });
+
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .provider_name("openrouter")
+            .channel_name("agent")
+            .tools(vec![Box::new(MockTool)])
+            .memory(test_memory())
+            .observer(observer.clone())
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let response = agent.turn("hi").await.unwrap();
+        assert_eq!(response, "hello-observed");
+
+        let events = observer.events.lock().clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ObserverEvent::LlmRequest { provider, model, .. }
+            if provider == "openrouter" && model == &agent.model_name
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ObserverEvent::LlmResponse { success: true, input_tokens, output_tokens, .. }
+            if *input_tokens == Some(11) && *output_tokens == Some(7)
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ObserverEvent::TurnComplete))
+        );
+
+        let trace_events = load_events(&trace_path, 20, None, None).unwrap();
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| event.event_type == "llm_request")
+        );
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| event.event_type == "llm_response" && event.success == Some(true))
+        );
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| event.event_type == "turn_final_response")
+        );
+        // Verify channel/provider/turn_id via the Observer (instance-scoped,
+        // not affected by concurrent tests sharing the global TRACE_LOGGER).
+        // The trace file assertions above confirm the events were written.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ObserverEvent::LlmRequest { provider, .. }
+            if provider == "openrouter"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ObserverEvent::LlmResponse { provider, success: true, .. }
+            if provider == "openrouter"
+        )));
+
+        disable_runtime_trace(&workspace);
     }
 
     #[tokio::test]
@@ -1557,6 +1933,74 @@ mod tests {
                 .iter()
                 .any(|msg| matches!(msg, ConversationMessage::ToolResults(_)))
         );
+    }
+
+    #[tokio::test]
+    async fn turn_records_tool_call_observability() {
+        let workspace = TempDir::new().unwrap();
+        let (trace_path, _trace_guard) = enable_runtime_trace(&workspace);
+        let observer = Arc::new(RecordingObserver::default());
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![
+                zeroclaw_providers::ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "tc1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                zeroclaw_providers::ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+        });
+
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .provider_name("openrouter")
+            .channel_name("agent")
+            .tools(vec![Box::new(MockTool)])
+            .memory(test_memory())
+            .observer(observer.clone())
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let response = agent.turn("use the echo tool").await.unwrap();
+        assert_eq!(response, "done");
+
+        let events = observer.events.lock().clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ObserverEvent::ToolCallStart { tool, arguments }
+            if tool == "echo" && arguments.as_deref() == Some("{}")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ObserverEvent::ToolCall { tool, success: true, .. }
+            if tool == "echo"
+        )));
+
+        let trace_events = load_events(&trace_path, 30, None, None).unwrap();
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| event.event_type == "tool_call_start")
+        );
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| event.event_type == "tool_call_result" && event.success == Some(true))
+        );
+
+        disable_runtime_trace(&workspace);
     }
 
     #[tokio::test]
@@ -1914,6 +2358,57 @@ mod tests {
         }
     }
 
+    struct StreamFallbackProvider;
+
+    #[async_trait]
+    impl Provider for StreamFallbackProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("fallback-done".into()),
+                tool_calls: vec![],
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(5),
+                    output_tokens: Some(3),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+            stream::iter(vec![Ok(zeroclaw_providers::traits::StreamEvent::Final)]).boxed()
+        }
+    }
+
     #[tokio::test]
     async fn turn_streamed_passes_tool_specs_to_provider() {
         let tools_received = Arc::new(Mutex::new(Vec::new()));
@@ -1984,6 +2479,69 @@ mod tests {
             has_tool_result,
             "Should have emitted a ToolResult event for 'echo'"
         );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_records_fallback_and_completion_observability() {
+        let workspace = TempDir::new().unwrap();
+        let (trace_path, _trace_guard) = enable_runtime_trace(&workspace);
+        let observer = Arc::new(RecordingObserver::default());
+        let mut agent = Agent::builder()
+            .provider(Box::new(StreamFallbackProvider))
+            .provider_name("openrouter")
+            .channel_name("agent")
+            .tools(vec![Box::new(MockTool)])
+            .memory(test_memory())
+            .observer(observer.clone())
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(32);
+        let response = agent.turn_streamed("hi", event_tx).await.unwrap();
+        assert_eq!(response, "fallback-done");
+
+        let events = observer.events.lock().clone();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ObserverEvent::LlmRequest { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ObserverEvent::LlmResponse { success: true, input_tokens, output_tokens, .. }
+            if *input_tokens == Some(5) && *output_tokens == Some(3)
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ObserverEvent::TurnComplete))
+        );
+
+        let trace_events = load_events(&trace_path, 20, None, None).unwrap();
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| event.event_type == "llm_request")
+        );
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| event.event_type == "llm_stream_fallback")
+        );
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| event.event_type == "llm_response" && event.success == Some(true))
+        );
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| event.event_type == "turn_final_response")
+        );
+
+        disable_runtime_trace(&workspace);
     }
 
     /// Reproduction test for the orphan-tool_results trim bug.
