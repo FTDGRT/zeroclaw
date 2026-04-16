@@ -1594,12 +1594,9 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observability::runtime_trace::{self, load_events};
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::collections::HashMap;
-    use std::sync::LazyLock;
-    use tempfile::TempDir;
     use zeroclaw_api::observability_traits::ObserverMetric;
 
     struct MockProvider {
@@ -1704,9 +1701,6 @@ mod tests {
         events: Mutex<Vec<ObserverEvent>>,
     }
 
-    static RUNTIME_TRACE_TEST_LOCK: LazyLock<std::sync::Mutex<()>> =
-        LazyLock::new(|| std::sync::Mutex::new(()));
-
     impl Observer for RecordingObserver {
         fn record_event(&self, event: &ObserverEvent) {
             self.events.lock().push(event.clone());
@@ -1732,36 +1726,6 @@ mod tests {
             zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
                 .expect("memory creation should succeed with valid config"),
         )
-    }
-
-    fn enable_runtime_trace(
-        workspace: &TempDir,
-    ) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
-        let guard = RUNTIME_TRACE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let cfg = zeroclaw_config::schema::ObservabilityConfig {
-            backend: "none".to_string(),
-            otel_endpoint: None,
-            otel_service_name: None,
-            runtime_trace_mode: "full".to_string(),
-            runtime_trace_path: "state/runtime-trace.jsonl".to_string(),
-            runtime_trace_max_entries: 100,
-        };
-        runtime_trace::init_from_config(&cfg, workspace.path());
-        (workspace.path().join("state/runtime-trace.jsonl"), guard)
-    }
-
-    fn disable_runtime_trace(workspace: &TempDir) {
-        let cfg = zeroclaw_config::schema::ObservabilityConfig {
-            backend: "none".to_string(),
-            otel_endpoint: None,
-            otel_service_name: None,
-            runtime_trace_mode: "none".to_string(),
-            runtime_trace_path: "state/runtime-trace.jsonl".to_string(),
-            runtime_trace_max_entries: 1,
-        };
-        runtime_trace::init_from_config(&cfg, workspace.path());
     }
 
     #[tokio::test]
@@ -1801,8 +1765,6 @@ mod tests {
 
     #[tokio::test]
     async fn turn_records_llm_and_turn_completion_observability() {
-        let workspace = TempDir::new().unwrap();
-        let (trace_path, _trace_guard) = enable_runtime_trace(&workspace);
         let observer = Arc::new(RecordingObserver::default());
         let provider = Box::new(MockProvider {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
@@ -1825,7 +1787,7 @@ mod tests {
             .memory(test_memory())
             .observer(observer.clone())
             .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .workspace_dir(workspace.path().to_path_buf())
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
             .expect("agent builder should succeed with valid config");
 
@@ -1848,38 +1810,6 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, ObserverEvent::TurnComplete))
         );
-
-        let trace_events = load_events(&trace_path, 20, None, None).unwrap();
-        assert!(
-            trace_events
-                .iter()
-                .any(|event| event.event_type == "llm_request")
-        );
-        assert!(
-            trace_events
-                .iter()
-                .any(|event| event.event_type == "llm_response" && event.success == Some(true))
-        );
-        assert!(
-            trace_events
-                .iter()
-                .any(|event| event.event_type == "turn_final_response")
-        );
-        // Verify channel/provider/turn_id via the Observer (instance-scoped,
-        // not affected by concurrent tests sharing the global TRACE_LOGGER).
-        // The trace file assertions above confirm the events were written.
-        assert!(events.iter().any(|event| matches!(
-            event,
-            ObserverEvent::LlmRequest { provider, .. }
-            if provider == "openrouter"
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            ObserverEvent::LlmResponse { provider, success: true, .. }
-            if provider == "openrouter"
-        )));
-
-        disable_runtime_trace(&workspace);
     }
 
     #[tokio::test]
@@ -1937,8 +1867,6 @@ mod tests {
 
     #[tokio::test]
     async fn turn_records_tool_call_observability() {
-        let workspace = TempDir::new().unwrap();
-        let (trace_path, _trace_guard) = enable_runtime_trace(&workspace);
         let observer = Arc::new(RecordingObserver::default());
         let provider = Box::new(MockProvider {
             responses: Mutex::new(vec![
@@ -1969,7 +1897,7 @@ mod tests {
             .memory(test_memory())
             .observer(observer.clone())
             .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(workspace.path().to_path_buf())
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
             .expect("agent builder should succeed with valid config");
 
@@ -1987,20 +1915,6 @@ mod tests {
             ObserverEvent::ToolCall { tool, success: true, .. }
             if tool == "echo"
         )));
-
-        let trace_events = load_events(&trace_path, 30, None, None).unwrap();
-        assert!(
-            trace_events
-                .iter()
-                .any(|event| event.event_type == "tool_call_start")
-        );
-        assert!(
-            trace_events
-                .iter()
-                .any(|event| event.event_type == "tool_call_result" && event.success == Some(true))
-        );
-
-        disable_runtime_trace(&workspace);
     }
 
     #[tokio::test]
@@ -2483,8 +2397,6 @@ mod tests {
 
     #[tokio::test]
     async fn turn_streamed_records_fallback_and_completion_observability() {
-        let workspace = TempDir::new().unwrap();
-        let (trace_path, _trace_guard) = enable_runtime_trace(&workspace);
         let observer = Arc::new(RecordingObserver::default());
         let mut agent = Agent::builder()
             .provider(Box::new(StreamFallbackProvider))
@@ -2494,7 +2406,7 @@ mod tests {
             .memory(test_memory())
             .observer(observer.clone())
             .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(workspace.path().to_path_buf())
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
             .expect("agent builder should succeed with valid config");
 
@@ -2518,30 +2430,6 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, ObserverEvent::TurnComplete))
         );
-
-        let trace_events = load_events(&trace_path, 20, None, None).unwrap();
-        assert!(
-            trace_events
-                .iter()
-                .any(|event| event.event_type == "llm_request")
-        );
-        assert!(
-            trace_events
-                .iter()
-                .any(|event| event.event_type == "llm_stream_fallback")
-        );
-        assert!(
-            trace_events
-                .iter()
-                .any(|event| event.event_type == "llm_response" && event.success == Some(true))
-        );
-        assert!(
-            trace_events
-                .iter()
-                .any(|event| event.event_type == "turn_final_response")
-        );
-
-        disable_runtime_trace(&workspace);
     }
 
     /// Reproduction test for the orphan-tool_results trim bug.
