@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use zeroclaw_api::provider::{ChatMessage, Provider};
 use zeroclaw_memory::traits::Memory;
+use zeroclaw_providers::multimodal;
 
 pub use zeroclaw_config::scattered_types::ContextCompressionConfig;
 
@@ -28,6 +29,10 @@ pub struct CompressionResult {
 const PROBE_TIERS: &[usize] = &[
     2_000_000, 1_000_000, 512_000, 200_000, 128_000, 64_000, 32_000,
 ];
+
+/// Low temperature for near-deterministic summarization; history compression
+/// must faithfully reflect the source conversation, not invent or embellish.
+const SUMMARIZER_TEMPERATURE: f64 = 0.1;
 
 fn next_probe_tier(current: usize) -> usize {
     PROBE_TIERS
@@ -301,7 +306,11 @@ impl ContextCompressor {
 
         // Build transcript from the middle section
         let middle = &history[start..end];
-        let transcript = build_transcript(middle, self.config.source_max_chars);
+        let transcript = build_summarizer_transcript(
+            middle,
+            self.config.source_max_chars,
+            provider.supports_vision(),
+        );
 
         if transcript.is_empty() {
             return Ok(false);
@@ -325,7 +334,12 @@ impl ContextCompressor {
         let timeout = Duration::from_secs(self.config.timeout_secs);
         let summary_raw = match tokio::time::timeout(
             timeout,
-            provider.chat_with_system(Some(SUMMARIZER_SYSTEM), &user_prompt, summary_model, 0.1),
+            provider.chat_with_system(
+                Some(SUMMARIZER_SYSTEM),
+                &user_prompt,
+                summary_model,
+                Some(SUMMARIZER_TEMPERATURE),
+            ),
         )
         .await
         {
@@ -392,15 +406,35 @@ fn align_boundary_forward(messages: &[ChatMessage], idx: usize) -> usize {
     i
 }
 
-/// Move boundary backward past any tool_call-bearing assistant messages at the end
-/// so their results stay in the protected tail.
+/// Move the tail boundary backward past any orphan-creating split.
+///
+/// First step past any leading `tool` messages — their owning assistant
+/// is earlier and must travel with them into the protected tail.
+///
+/// Second, if we land on an assistant that owns `tool_calls`, back up
+/// past it as well. Otherwise that assistant gets summarized while its
+/// already-protected `tool_result` blocks remain in the tail, creating
+/// the 400 "unexpected tool_use_id in tool_result blocks" failure mode
+/// at the root of #5813.
 fn align_boundary_backward(messages: &[ChatMessage], idx: usize) -> usize {
     let mut i = idx;
-    // If the message just before the boundary is an assistant message that likely
-    // contains tool calls (heuristic: followed by a tool result), pull the boundary back.
-    while i > 0 && i < messages.len() && messages[i].role == "tool" {
-        // The tool result at `i` belongs to a tool_call before it — move boundary past it
-        i -= 1;
+    loop {
+        while i > 0 && messages[i].role == "tool" {
+            i -= 1;
+        }
+        if messages[i].role == "assistant"
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&messages[i].content)
+            && v.get("tool_calls")
+                .and_then(|a| a.as_array())
+                .is_some_and(|a| !a.is_empty())
+        {
+            if i == 0 {
+                break;
+            }
+            i -= 1;
+            continue;
+        }
+        break;
     }
     i
 }
@@ -462,6 +496,20 @@ fn build_transcript(messages: &[ChatMessage], max_chars: usize) -> String {
     }
 }
 
+fn build_summarizer_transcript(
+    messages: &[ChatMessage],
+    max_chars: usize,
+    supports_vision: bool,
+) -> String {
+    let transcript = build_transcript(messages, max_chars);
+    if supports_vision {
+        return transcript;
+    }
+
+    let (cleaned, refs) = multimodal::parse_image_markers(&transcript);
+    if refs.is_empty() { transcript } else { cleaned }
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -483,11 +531,45 @@ fn truncate_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use parking_lot::Mutex;
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: role.to_string(),
             content: content.to_string(),
+        }
+    }
+
+    struct CaptureSummarizerProvider {
+        supports_vision: bool,
+        seen_messages: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for CaptureSummarizerProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            self.seen_messages.lock().push(message.to_string());
+            Ok("summary".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_api::provider::ChatResponse> {
+            unreachable!("context compressor uses chat_with_system")
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.supports_vision
         }
     }
 
@@ -595,6 +677,47 @@ mod tests {
         assert_eq!(messages.len(), 5); // no change
     }
 
+    /// Regression test for the root-cause #5813 fix: when the tail
+    /// boundary lands on an assistant with `tool_calls`, the function
+    /// must back up past it so the assistant travels with its
+    /// `tool_result` blocks into the protected tail. Otherwise the
+    /// assistant gets summarized while its results survive, creating an
+    /// orphan and producing the 400 "unexpected tool_use_id" failure.
+    #[test]
+    fn test_align_boundary_backward_backs_up_past_tool_call_assistant() {
+        let messages = vec![
+            msg("system", "sys"),
+            msg("user", "q1"),
+            msg("assistant", "old reply 1"),
+            msg("user", "q2"),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"toolu_X","name":"shell","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"toolu_X","content":"result"}"#),
+            msg("user", "follow-up"),
+        ];
+        // Initial boundary lands on the assistant(tool_calls) at index 4.
+        // The function must back up past it so the pair stays in the tail.
+        let aligned = align_boundary_backward(&messages, 4);
+        assert!(
+            aligned < 4,
+            "boundary should retreat past assistant(tool_calls) at idx 4, got {aligned}"
+        );
+    }
+
+    #[test]
+    fn test_align_boundary_backward_noop_on_plain_assistant() {
+        let messages = vec![
+            msg("system", "sys"),
+            msg("user", "q"),
+            msg("assistant", "plain text reply"),
+            msg("user", "next"),
+        ];
+        // No tool_calls on the assistant — boundary should not retreat.
+        assert_eq!(align_boundary_backward(&messages, 2), 2);
+    }
+
     #[test]
     fn test_build_transcript() {
         let messages = vec![msg("user", "hello"), msg("assistant", "hi there")];
@@ -608,6 +731,25 @@ mod tests {
         let messages = vec![msg("user", &"x".repeat(1000))];
         let t = build_transcript(&messages, 100);
         assert!(t.len() <= 103); // 100 + "..."
+    }
+
+    #[test]
+    fn test_build_summarizer_transcript_strips_image_markers_for_non_vision_provider() {
+        let messages = vec![msg(
+            "user",
+            "Describe this photo [IMAGE:/tmp/test.png]\nKeep the caption",
+        )];
+        let transcript = build_summarizer_transcript(&messages, 10_000, false);
+        assert!(!transcript.contains("[IMAGE:"));
+        assert!(transcript.contains("Describe this photo"));
+        assert!(transcript.contains("Keep the caption"));
+    }
+
+    #[test]
+    fn test_build_summarizer_transcript_keeps_image_markers_for_vision_provider() {
+        let messages = vec![msg("user", "Describe this photo [IMAGE:/tmp/test.png]")];
+        let transcript = build_summarizer_transcript(&messages, 10_000, true);
+        assert!(transcript.contains("[IMAGE:/tmp/test.png]"));
     }
 
     #[test]
@@ -647,6 +789,38 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.protect_first_n, 5);
         assert_eq!(config.max_passes, 1);
+    }
+
+    #[tokio::test]
+    async fn compress_if_needed_strips_image_markers_before_non_vision_summarization() {
+        let config = ContextCompressionConfig {
+            protect_first_n: 1,
+            protect_last_n: 1,
+            threshold_ratio: 0.01,
+            ..Default::default()
+        };
+        let compressor = ContextCompressor::new(config, 64);
+        let provider = CaptureSummarizerProvider {
+            supports_vision: false,
+            seen_messages: Mutex::new(Vec::new()),
+        };
+        let mut history = vec![
+            msg("system", "sys"),
+            msg("user", "Earlier question [IMAGE:/tmp/example.png]"),
+            msg("assistant", "Earlier answer"),
+            msg("user", "Newest question"),
+        ];
+
+        let result = compressor
+            .compress_if_needed(&mut history, &provider, "model")
+            .await
+            .expect("compression should succeed");
+
+        assert!(result.compressed);
+        let seen = provider.seen_messages.lock();
+        let prompt = seen.last().expect("summarizer should be invoked");
+        assert!(!prompt.contains("[IMAGE:"));
+        assert!(!prompt.contains("/tmp/example.png"));
     }
 
     // ── fast_trim_tool_results tests ────────────────────────────────

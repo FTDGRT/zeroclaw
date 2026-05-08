@@ -48,6 +48,9 @@ pub struct OpenAiCompatibleProvider {
     api_path: Option<String>,
     /// Maximum output tokens to include in API requests.
     max_tokens: Option<u32>,
+    /// models.dev catalog key for this provider (e.g. "xai").
+    /// When set, `list_models` fetches from the models.dev catalog.
+    models_dev_key: Option<String>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -119,6 +122,27 @@ fn apply_auth_to_request(
             Err(_) => req.header("Authorization", format!("Bearer {credential}")),
         },
     }
+}
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
+    let mut ids: Vec<String> = body
+        .data
+        .into_iter()
+        .map(|e| e.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort();
+    ids
 }
 
 impl OpenAiCompatibleProvider {
@@ -246,6 +270,7 @@ impl OpenAiCompatibleProvider {
             reasoning_effort: None,
             api_path: None,
             max_tokens: None,
+            models_dev_key: None,
         }
     }
 
@@ -296,10 +321,20 @@ impl OpenAiCompatibleProvider {
         self
     }
 
+    /// Set the models.dev catalog key for this provider.
+    /// When set, `list_models` returns the catalog's model list for that key.
+    pub fn with_models_dev_key(mut self, key: &str) -> Self {
+        self.models_dev_key = Some(key.to_string());
+        self
+    }
+
     /// Collect all `system` role messages, concatenate their content,
     /// and prepend to the first `user` message. Drop all system messages.
     /// Used for providers (e.g. MiniMax) that reject `role: system`.
-    fn flatten_system_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    fn flatten_system_messages(messages: &[ChatMessage], merge: bool) -> Vec<ChatMessage> {
+        if !merge {
+            return messages.to_vec();
+        }
         let system_content: String = messages
             .iter()
             .filter(|m| m.role == "system")
@@ -518,6 +553,8 @@ struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptionsBody>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_stream: Option<bool>,
@@ -527,6 +564,15 @@ struct ApiChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+}
+
+/// OpenAI-compatible `stream_options.include_usage` toggle.
+/// When set with streaming, providers emit a final SSE chunk carrying usage
+/// counts (prompt_tokens / completion_tokens) so the agent can populate cost
+/// records and the WebSocket done frame for streaming responses.
+#[derive(Debug, Serialize, Clone, Copy)]
+struct StreamOptionsBody {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -669,6 +715,10 @@ struct ToolCall {
         skip_serializing_if = "Option::is_none"
     )]
     parameters: Option<serde_json::Value>,
+
+    /// See [`zeroclaw_api::ToolCall::extra_content`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra_content: Option<serde_json::Value>,
 }
 
 impl ToolCall {
@@ -719,6 +769,13 @@ struct NativeChatRequest {
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// Mirrors `ApiChatRequest::stream_options`. Without this, tool-enabled
+    /// streaming requests omit `stream_options.include_usage` and OpenAI-
+    /// compatible providers never send the final `usage` SSE event — leaving
+    /// `/ws/chat` with no token-usage signal whenever native tools are active
+    /// (which is the normal gateway path). See #6001 / #6159.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptionsBody>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -829,6 +886,10 @@ struct ResponsesContent {
 struct StreamChunkResponse {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    /// Final-chunk usage counts. Populated only when the request includes
+    /// `stream_options.include_usage: true` and the provider supports it.
+    #[serde(default)]
+    usage: Option<UsageInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -864,6 +925,8 @@ struct StreamToolCallDelta {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+    #[serde(default)]
+    extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -879,6 +942,7 @@ struct StreamToolCallAccumulator {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    extra_content: Option<serde_json::Value>,
 }
 
 impl StreamToolCallAccumulator {
@@ -906,6 +970,11 @@ impl StreamToolCallAccumulator {
         {
             self.arguments.push_str(arguments_delta);
         }
+
+        // Last-write-wins: signature is opaque and delivered once per call.
+        if let Some(extra) = delta.extra_content.as_ref() {
+            self.extra_content = Some(extra.clone());
+        }
     }
 
     fn into_provider_tool_call(self) -> Option<ProviderToolCall> {
@@ -931,6 +1000,7 @@ impl StreamToolCallAccumulator {
             id: self.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             name,
             arguments: normalized_arguments,
+            extra_content: self.extra_content,
         })
     }
 }
@@ -1132,7 +1202,7 @@ fn sse_bytes_to_chunks(
 }
 
 /// Convert SSE byte stream to structured streaming events.
-fn sse_bytes_to_events(
+pub(crate) fn sse_bytes_to_events(
     response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
@@ -1243,6 +1313,17 @@ fn sse_bytes_to_events(
 
                             if choice.finish_reason.as_deref() == Some("tool_calls") {
                                 should_emit_tool_calls = true;
+                            }
+                        }
+
+                        if let Some(usage) = chunk.usage.as_ref() {
+                            let token_usage = zeroclaw_api::provider::TokenUsage {
+                                input_tokens: usage.prompt_tokens,
+                                output_tokens: usage.completion_tokens,
+                                cached_input_tokens: None,
+                            };
+                            if tx.send(Ok(StreamEvent::Usage(token_usage))).await.is_err() {
+                                return;
                             }
                         }
 
@@ -1511,6 +1592,9 @@ impl OpenAiCompatibleProvider {
                             name: None,
                             arguments: None,
                             parameters: None,
+                            // Round-trip extra_content (e.g. Gemini
+                            // thoughtSignature) — dropping it here was the bug.
+                            extra_content: tc.extra_content,
                         })
                         .collect::<Vec<_>>();
 
@@ -1570,6 +1654,70 @@ impl OpenAiCompatibleProvider {
             .collect()
     }
 
+    /// Strip native tool-calling constructs from messages for providers that
+    /// do not support native tool calling (e.g. MiniMax).
+    ///
+    /// Conversation history may contain tool-role messages and assistant
+    /// messages with `tool_calls` JSON from previous sessions or from
+    /// provider switches.  Sending these to a non-native-tool provider
+    /// causes hard API errors like MiniMax's
+    /// "tool result's tool id not found" (#5743).
+    ///
+    /// - **tool-role messages** are dropped entirely.
+    /// - **assistant messages with `tool_calls`** are converted to plain
+    ///   text by extracting only the `content` field (or dropped when the
+    ///   content is empty).
+    fn strip_native_tool_messages(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        if self.native_tool_calling {
+            return messages.to_vec();
+        }
+        let intermediate = messages.iter().filter_map(|msg| {
+            if msg.role == "tool" {
+                return None;
+            }
+            if msg.role == "assistant"
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content)
+                && value.get("tool_calls").is_some()
+            {
+                let text = value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                return if text.is_empty() {
+                    None
+                } else {
+                    Some(ChatMessage::assistant(&text))
+                };
+            }
+            Some(msg.clone())
+        });
+
+        // Coalesce adjacent assistant messages.
+        //
+        // A typical trace is:
+        //     user → assistant{content, tool_calls} → tool{result} → assistant{reply}
+        // After the filter_map above the `tool` message is gone and the first
+        // assistant has been rewritten to plain text, leaving two assistant
+        // messages in a row. Providers targeted by the `native_tool_calling =
+        // false` path (Anthropic upstream, MiniMax, and other OpenAI-compat
+        // wrappers) reject consecutive same-role messages with HTTP 400, so we
+        // merge them here. See #5825.
+        let mut coalesced: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+        for msg in intermediate {
+            match coalesced.last_mut() {
+                Some(last) if last.role == "assistant" && msg.role == "assistant" => {
+                    if !last.content.is_empty() && !msg.content.is_empty() {
+                        last.content.push_str("\n\n");
+                    }
+                    last.content.push_str(&msg.content);
+                }
+                _ => coalesced.push(msg),
+            }
+        }
+        coalesced
+    }
+
     fn with_prompt_guided_tool_instructions(
         messages: &[ChatMessage],
         tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
@@ -1622,6 +1770,7 @@ impl OpenAiCompatibleProvider {
                     id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     name,
                     arguments: normalized_arguments,
+                    extra_content: tc.extra_content,
                 })
             })
             .collect::<Vec<_>>();
@@ -1668,13 +1817,42 @@ impl Provider for OpenAiCompatibleProvider {
         }
     }
 
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // When a credential is present, hit the provider's native /models endpoint
+        // (OpenAI-compatible: GET {base_url}/models).
+        if let Some(credential) = self.credential.as_deref() {
+            let url = format!("{}/models", self.base_url);
+            let response = self
+                .apply_auth_header(self.http_client().get(&url), Some(credential))
+                .send()
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("{} model list request failed: {url}: {e}", self.name)
+                })?;
+            if !response.status().is_success() {
+                let status = response.status();
+                anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);
+            }
+            let body: ModelsResponse = response.json().await.map_err(|e| {
+                anyhow::anyhow!("{} model list returned invalid JSON: {e}", self.name)
+            })?;
+            return Ok(normalize_model_ids(body));
+        }
+        // No credential — fall back to the models.dev catalog when available.
+        match &self.models_dev_key {
+            Some(key) => crate::models_dev::list_models_for(key).await,
+            None => anyhow::bail!("live model listing is not supported for this provider"),
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
@@ -1707,6 +1885,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages,
             temperature,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: None,
             tools: None,
@@ -1721,11 +1900,7 @@ impl Provider for OpenAiCompatibleProvider {
             fallback_messages.push(ChatMessage::system(system_prompt));
         }
         fallback_messages.push(ChatMessage::user(message));
-        let fallback_messages = if merge {
-            Self::flatten_system_messages(&fallback_messages)
-        } else {
-            fallback_messages
-        };
+        let fallback_messages = Self::flatten_system_messages(&fallback_messages, merge);
 
         let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
@@ -1798,16 +1973,15 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
-        let effective_messages = if merge {
-            Self::flatten_system_messages(messages)
-        } else {
-            messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(messages, merge);
+        // Strip native tool constructs for non-native-tool providers (#5743).
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
@@ -1821,6 +1995,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages: api_messages,
             temperature,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: None,
             tools: None,
@@ -1900,16 +2075,14 @@ impl Provider for OpenAiCompatibleProvider {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
-        let effective_messages = if merge {
-            Self::flatten_system_messages(messages)
-        } else {
-            messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(messages, merge);
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
@@ -1923,6 +2096,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages: api_messages,
             temperature,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: self.tool_stream_for_tools(!tools.is_empty()),
             tools: if tools.is_empty() {
@@ -1950,7 +2124,9 @@ impl Provider for OpenAiCompatibleProvider {
                     "{} native tool call transport failed: {error}; falling back to history path",
                     self.name
                 );
-                let text = self.chat_with_history(messages, model, temperature).await?;
+                let text = self
+                    .chat_with_history(messages, model, Some(temperature))
+                    .await?;
                 return Ok(ProviderChatResponse {
                     text: Some(text),
                     tool_calls: vec![],
@@ -1992,6 +2168,7 @@ impl Provider for OpenAiCompatibleProvider {
                     id: uuid::Uuid::new_v4().to_string(),
                     name,
                     arguments,
+                    extra_content: tc.extra_content,
                 })
             })
             .collect::<Vec<_>>();
@@ -2008,22 +2185,23 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
         let tools = Self::convert_tool_specs(request.tools);
-        let effective_messages = if merge {
-            Self::flatten_system_messages(request.messages)
-        } else {
-            request.messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(request.messages, merge);
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages_for_native(&effective_messages, !merge),
             temperature,
             stream: Some(false),
+            // Non-streaming path; `usage` is on the final response body, not
+            // gated on `stream_options.include_usage`.
+            stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: self
                 .tool_stream_for_tools(tools.as_ref().is_some_and(|tools| !tools.is_empty())),
@@ -2075,7 +2253,7 @@ impl Provider for OpenAiCompatibleProvider {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
                 let text = self
-                    .chat_with_history(&fallback_messages, model, temperature)
+                    .chat_with_history(&fallback_messages, model, Some(temperature))
                     .await?;
                 return Ok(ProviderChatResponse {
                     text: Some(text),
@@ -2140,22 +2318,20 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
 
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.clone();
 
         let merge = self.effective_merge_system(model);
         let has_tools = request.tools.is_some_and(|tools| !tools.is_empty());
-        let effective_messages = if merge {
-            Self::flatten_system_messages(request.messages)
-        } else {
-            request.messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(request.messages, merge);
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
 
         let tools = Self::convert_tool_specs(request.tools);
         let payload = if has_tools {
@@ -2164,8 +2340,18 @@ impl Provider for OpenAiCompatibleProvider {
                 messages: Self::convert_messages_for_native(&effective_messages, !merge),
                 temperature,
                 reasoning_effort: self.reasoning_effort.clone(),
-                tool_stream: if options.enabled { Some(true) } else { None },
+                tool_stream: if options.enabled {
+                    self.tool_stream_for_tools(true)
+                } else {
+                    None
+                },
                 stream: Some(options.enabled),
+                // Mirror the no-tools path: opt the streaming response into a
+                // final `usage` event so `/ws/chat` can record token usage
+                // even when native tools are active.
+                stream_options: options.enabled.then_some(StreamOptionsBody {
+                    include_usage: true,
+                }),
                 tools: tools.clone(),
                 tool_choice: tools.as_ref().map(|_| "auto".to_string()),
                 max_tokens: self.max_tokens,
@@ -2184,8 +2370,15 @@ impl Provider for OpenAiCompatibleProvider {
                 messages,
                 temperature,
                 reasoning_effort: self.reasoning_effort.clone(),
-                tool_stream: if options.enabled { Some(true) } else { None },
+                tool_stream: if options.enabled {
+                    self.tool_stream_for_tools(false)
+                } else {
+                    None
+                },
                 stream: Some(options.enabled),
+                stream_options: options.enabled.then_some(StreamOptionsBody {
+                    include_usage: true,
+                }),
                 tools: None,
                 tool_choice: None,
                 max_tokens: self.max_tokens,
@@ -2251,9 +2444,10 @@ impl Provider for OpenAiCompatibleProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.clone();
 
         let merge = self.effective_merge_system(model);
@@ -2285,6 +2479,9 @@ impl Provider for OpenAiCompatibleProvider {
             messages,
             temperature,
             stream: Some(options.enabled),
+            stream_options: options.enabled.then_some(StreamOptionsBody {
+                include_usage: true,
+            }),
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: None,
             tools: None,
@@ -2351,17 +2548,15 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.clone();
 
         let merge = self.effective_merge_system(model);
-        let effective_messages = if merge {
-            Self::flatten_system_messages(messages)
-        } else {
-            messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(messages, merge);
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
@@ -2375,6 +2570,9 @@ impl Provider for OpenAiCompatibleProvider {
             messages: api_messages,
             temperature,
             stream: Some(options.enabled),
+            stream_options: options.enabled.then_some(StreamOptionsBody {
+                include_usage: true,
+            }),
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: None,
             tools: None,
@@ -2475,13 +2673,91 @@ mod tests {
     #[tokio::test]
     async fn chat_without_key_attempts_request() {
         let p = make_provider("Local", "http://127.0.0.1:1", None);
-        let result = p.chat_with_system(None, "hello", "default", 0.7).await;
+        let result = p
+            .chat_with_system(None, "hello", "default", Some(0.7))
+            .await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
             !err_msg.contains("API key not set"),
             "should not get credential error, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn native_chat_request_with_tools_includes_stream_options() {
+        // Regression: tool-enabled streaming requests must opt the response
+        // into a final `usage` SSE event, otherwise OpenAI-compatible providers
+        // never report token counts on the `/ws/chat` path (the gateway's
+        // primary path uses native tools). See Audacity88's #6159 review.
+        let req = NativeChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![NativeMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("hello".to_string())),
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+            }],
+            temperature: 0.7,
+            stream: Some(true),
+            stream_options: Some(StreamOptionsBody {
+                include_usage: true,
+            }),
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: Some(vec![serde_json::json!({"name": "echo"})]),
+            tool_choice: Some("auto".to_string()),
+            max_tokens: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value
+                .get("stream_options")
+                .and_then(|v| v.get("include_usage"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "tool-enabled streaming request must serialize stream_options.include_usage=true; \
+             without it OpenAI-compatible providers omit the final usage event"
+        );
+    }
+
+    #[test]
+    fn native_chat_request_omits_stream_options_when_none() {
+        // Non-streaming path (e.g. classic `chat()` call) does not need
+        // `stream_options.include_usage` because the final response carries
+        // `usage` directly. The field must be skipped in serialization.
+        let req = NativeChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![],
+            temperature: 0.7,
+            stream: Some(false),
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("stream_options").is_none(),
+            "non-streaming NativeChatRequest must not emit a stream_options key"
+        );
+    }
+
+    #[test]
+    fn normalize_model_ids_trims_filters_and_sorts() {
+        let body = serde_json::from_value(serde_json::json!({
+            "data": [
+                {"id": " zeta-model "},
+                {"id": ""},
+                {"id": "alpha-model"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(normalize_model_ids(body), vec!["alpha-model", "zeta-model"]);
     }
 
     #[test]
@@ -2500,6 +2776,7 @@ mod tests {
             ],
             temperature: 0.4,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: None,
             tool_stream: None,
             tools: None,
@@ -2665,7 +2942,7 @@ mod tests {
         ];
 
         for p in providers {
-            let result = p.chat_with_system(None, "test", "model", 0.7).await;
+            let result = p.chat_with_system(None, "test", "model", Some(0.7)).await;
             assert!(result.is_err(), "{} should fail (unreachable host)", p.name);
             let err_msg = result.unwrap_err().to_string();
             assert!(
@@ -3041,6 +3318,7 @@ mod tests {
                 name: None,
                 arguments: None,
                 parameters: None,
+                extra_content: None,
             }]),
             reasoning_content: None,
         };
@@ -3093,7 +3371,7 @@ mod tests {
             ChatMessage::assistant("post-user"),
         ];
 
-        let output = OpenAiCompatibleProvider::flatten_system_messages(&input);
+        let output = OpenAiCompatibleProvider::flatten_system_messages(&input, true);
         assert_eq!(output.len(), 3);
         assert_eq!(output[0].role, "assistant");
         assert_eq!(output[0].content, "ack");
@@ -3111,7 +3389,7 @@ mod tests {
             ChatMessage::assistant("ack"),
         ];
 
-        let output = OpenAiCompatibleProvider::flatten_system_messages(&input);
+        let output = OpenAiCompatibleProvider::flatten_system_messages(&input, true);
         assert_eq!(output.len(), 2);
         assert_eq!(output[0].role, "user");
         assert_eq!(output[0].content, "core policy");
@@ -3225,19 +3503,153 @@ mod tests {
     }
 
     #[test]
-    fn minimax_provider_disables_native_tool_calling() {
+    fn minimax_provider_supports_native_tool_calling_with_system_merge() {
+        let p = OpenAiCompatibleProvider::new(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        )
+        .with_merge_system_into_user();
+        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        assert!(
+            caps.native_tool_calling,
+            "MiniMax should preserve native tool calling when system messages are merged"
+        );
+        assert!(!caps.vision);
+    }
+
+    /// Regression test for #5743: native tool messages must be stripped for
+    /// providers that don't support native tool calling (e.g. MiniMax).
+    #[test]
+    fn strip_native_tool_messages_removes_tool_and_tool_calls() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("search for cats"),
+            ChatMessage::assistant(
+                r#"{"content":"I'll search","tool_calls":[{"id":"chatcmpl-tool-abc","name":"web_search","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"chatcmpl-tool-abc","content":"Found 10 results"}"#,
+            ),
+            ChatMessage::assistant("Here are the results about cats"),
+            ChatMessage::user("thanks"),
+        ];
         let p = OpenAiCompatibleProvider::new_merge_system_into_user(
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
             AuthStyle::Bearer,
         );
-        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        let stripped = p.strip_native_tool_messages(&messages);
+        // tool message dropped; the pre-tool narration and the reply that
+        // follows the tool result are now coalesced into a single assistant
+        // message so the output never contains consecutive assistants (see
+        // #5825).
+        assert_eq!(stripped.len(), 4);
+        assert_eq!(stripped[0].role, "system");
+        assert_eq!(stripped[1].role, "user");
+        assert_eq!(stripped[1].content, "search for cats");
+        assert_eq!(stripped[2].role, "assistant");
         assert!(
-            !caps.native_tool_calling,
-            "MiniMax should use prompt-guided tool calling, not native"
+            stripped[2].content.starts_with("I'll search"),
+            "coalesced assistant must preserve the pre-tool narration; got {:?}",
+            stripped[2].content
         );
-        assert!(!caps.vision);
+        assert!(
+            stripped[2]
+                .content
+                .contains("Here are the results about cats"),
+            "coalesced assistant must preserve the post-tool reply; got {:?}",
+            stripped[2].content
+        );
+        assert!(
+            !stripped[2].content.contains("tool_calls"),
+            "tool_calls structure must be stripped"
+        );
+        assert_eq!(stripped[3].role, "user");
+    }
+
+    #[test]
+    fn strip_native_tool_messages_drops_empty_assistant_tool_calls() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("do it"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"tc1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"tc1","content":"ok"}"#),
+            ChatMessage::assistant("Done"),
+        ];
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let stripped = p.strip_native_tool_messages(&messages);
+        // assistant with empty content + tool_calls → dropped; tool → dropped
+        assert_eq!(stripped.len(), 3);
+        assert_eq!(stripped[0].role, "system");
+        assert_eq!(stripped[1].role, "user");
+        assert_eq!(stripped[2].role, "assistant");
+        assert_eq!(stripped[2].content, "Done");
+    }
+
+    #[test]
+    fn strip_native_tool_messages_preserves_regular_messages() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi there"),
+            ChatMessage::user("bye"),
+        ];
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let stripped = p.strip_native_tool_messages(&messages);
+        assert_eq!(stripped.len(), 4);
+        for (orig, result) in messages.iter().zip(stripped.iter()) {
+            assert_eq!(orig.role, result.role);
+            assert_eq!(orig.content, result.content);
+        }
+    }
+
+    /// Confirm that `strip_native_tool_messages` is a no-op when the provider
+    /// has `native_tool_calling = true` — tool-role and assistant-with-tool-calls
+    /// messages must pass through unchanged.
+    #[test]
+    fn strip_native_tool_messages_passthrough_when_native_tool_calling_enabled() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("search for cats"),
+            ChatMessage::assistant(
+                r#"{"content":"I'll search","tool_calls":[{"id":"chatcmpl-tool-abc","name":"web_search","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"chatcmpl-tool-abc","content":"Found 10 results"}"#,
+            ),
+            ChatMessage::assistant("Here are the results about cats"),
+        ];
+        let p = OpenAiCompatibleProvider::new(
+            "NativeToolProvider",
+            "https://api.example.com/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        assert!(
+            <OpenAiCompatibleProvider as Provider>::capabilities(&p).native_tool_calling,
+            "provider must have native_tool_calling enabled for this test"
+        );
+        let result = p.strip_native_tool_messages(&messages);
+        assert_eq!(result.len(), messages.len());
+        for (orig, out) in messages.iter().zip(result.iter()) {
+            assert_eq!(orig.role, out.role);
+            assert_eq!(orig.content, out.content);
+        }
     }
 
     #[test]
@@ -3367,6 +3779,7 @@ mod tests {
             }],
             temperature: 0.7,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: None,
             tool_stream: None,
             tools: Some(tools),
@@ -3390,6 +3803,7 @@ mod tests {
             }],
             temperature: 0.7,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: None,
             tool_stream: provider.tool_stream_for_tools(true),
             tools: Some(vec![serde_json::json!({
@@ -3424,6 +3838,7 @@ mod tests {
             }],
             temperature: 0.7,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: None,
             tool_stream: provider.tool_stream_for_tools(true),
             tools: Some(vec![serde_json::json!({
@@ -3445,6 +3860,14 @@ mod tests {
 
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("\"tool_stream\""));
+    }
+
+    #[test]
+    fn non_zai_provider_omits_tool_stream_regardless_of_streaming() {
+        let provider = make_provider("custom", "https://proxy.example.com/v1", None);
+        // tool_stream_for_tools should return None for non-Z.AI providers
+        assert_eq!(provider.tool_stream_for_tools(true), None);
+        assert_eq!(provider.tool_stream_for_tools(false), None);
     }
 
     #[test]
@@ -3547,7 +3970,9 @@ mod tests {
             }
         })];
 
-        let result = p.chat_with_tools(&messages, &tools, "model", 0.7).await;
+        let result = p
+            .chat_with_tools(&messages, &tools, "model", Some(0.7))
+            .await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3575,7 +4000,7 @@ mod tests {
             ChatMessage::tool(r#"{"ok":true}"#),
         ];
 
-        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages);
+        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages, true);
         assert_eq!(flattened.len(), 3);
         assert_eq!(flattened[0].role, "assistant");
         assert_eq!(
@@ -3594,7 +4019,7 @@ mod tests {
             ChatMessage::system("Synthetic system"),
         ];
 
-        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages);
+        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages, true);
         assert_eq!(flattened.len(), 2);
         assert_eq!(flattened[0].role, "user");
         assert_eq!(flattened[0].content, "Synthetic system");
@@ -3767,6 +4192,7 @@ mod tests {
             }),
             name: None,
             arguments: None,
+            extra_content: None,
         });
         acc.apply_delta(&StreamToolCallDelta {
             index: Some(0),
@@ -3777,6 +4203,7 @@ mod tests {
             }),
             name: None,
             arguments: None,
+            extra_content: None,
         });
 
         let tool_call = acc
@@ -3825,6 +4252,7 @@ mod tests {
                 name: None,
                 arguments: None,
                 parameters: None,
+                extra_content: None,
             }]),
         };
 
@@ -4004,6 +4432,7 @@ mod tests {
             name: None,
             arguments: None,
             parameters: None,
+            extra_content: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert!(!json.as_object().unwrap().contains_key("name"));
@@ -4025,6 +4454,7 @@ mod tests {
             name: Some("shell".to_string()),
             arguments: Some("{\"command\":\"ls\"}".to_string()),
             parameters: None,
+            extra_content: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert_eq!(json["name"], "shell");
@@ -4108,5 +4538,77 @@ mod tests {
     #[test]
     fn proxy_tool_event_done_sentinel_returns_none() {
         assert!(parse_proxy_tool_event("data: [DONE]").is_none());
+    }
+
+    /// Regression for #5825.
+    ///
+    /// When `native_tool_calling = false`, the filter pass rewrites
+    /// `assistant{tool_calls, content="I'll search"}` into `assistant("I'll
+    /// search")` and drops the following `tool{result}`. That leaves two
+    /// adjacent assistant messages in the output, which providers targeted
+    /// by this path (Anthropic upstream, MiniMax, other OpenAI-compat
+    /// wrappers) reject with HTTP 400.
+    #[test]
+    fn strip_native_tool_messages_coalesces_adjacent_assistants() {
+        let messages = vec![
+            ChatMessage::user("search for cats"),
+            ChatMessage::assistant(
+                r#"{"content":"I'll search","tool_calls":[{"id":"t1","name":"web_search","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"Found 10 results"}"#),
+            ChatMessage::assistant("Here are the results about cats"),
+        ];
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let stripped = p.strip_native_tool_messages(&messages);
+        let roles: Vec<&str> = stripped.iter().map(|m| m.role.as_str()).collect();
+        assert!(
+            !roles.windows(2).any(|w| w[0] == w[1]),
+            "no two consecutive messages should share a role; got {roles:?}"
+        );
+        // Sanity: user turn and merged assistant content both survive.
+        assert_eq!(roles, vec!["user", "assistant"]);
+        assert_eq!(stripped[0].content, "search for cats");
+        assert!(
+            stripped[1].content.contains("I'll search")
+                && stripped[1]
+                    .content
+                    .contains("Here are the results about cats"),
+            "merged assistant should preserve both the pre-tool narration and the final reply; \
+             got {:?}",
+            stripped[1].content
+        );
+    }
+
+    /// Complementary regression for #5825: when the narration content is
+    /// empty, the pre-tool assistant is dropped entirely and no coalesce is
+    /// needed. This test documents that the coalesce pass does not produce
+    /// spurious blank-line concatenation.
+    #[test]
+    fn strip_native_tool_messages_drops_empty_narration_cleanly() {
+        let messages = vec![
+            ChatMessage::user("search for cats"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"t1","name":"web_search","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"Found"}"#),
+            ChatMessage::assistant("Here are the results"),
+        ];
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let stripped = p.strip_native_tool_messages(&messages);
+        assert_eq!(
+            stripped.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["user", "assistant"]
+        );
+        assert_eq!(stripped[1].content, "Here are the results");
     }
 }

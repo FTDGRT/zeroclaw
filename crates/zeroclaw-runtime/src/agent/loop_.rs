@@ -30,7 +30,6 @@ pub fn register_peripheral_tools_fn(f: PeripheralToolsFn) {
     let _ = PERIPHERAL_TOOLS_FN.set(f);
 }
 use crate::cost::types::BudgetCheck;
-use crate::i18n::ToolDescriptions;
 use crate::observability::{self, Observer, ObserverEvent, runtime_trace};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -47,6 +46,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use zeroclaw_api::channel::Channel;
 use zeroclaw_api::provider::StreamEvent;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory, decay};
@@ -57,8 +57,8 @@ use zeroclaw_providers::{
 
 // Cost tracking moved to `super::cost`.
 pub use super::cost::{
-    TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, check_tool_loop_budget,
-    record_tool_loop_cost_usage,
+    TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, TurnUsage,
+    check_tool_loop_budget, record_tool_loop_cost_usage,
 };
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -183,6 +183,7 @@ pub fn filter_by_allowed_tools(
 }
 
 // Re-export from zeroclaw-types for backwards compatibility.
+pub use zeroclaw_api::TOOL_LOOP_SESSION_KEY;
 pub use zeroclaw_api::TOOL_LOOP_THREAD_ID;
 
 // Re-export tool call parsing from the standalone parser crate.
@@ -199,6 +200,17 @@ where
     F: std::future::Future,
 {
     TOOL_LOOP_THREAD_ID.scope(thread_id, future).await
+}
+
+/// Run a future with the session key set in task-local storage.
+/// The scope wraps the entire agent turn, so all tools invoked during
+/// the turn (including nested calls) see the same session key.
+/// SessionsCurrentTool reads this to identify the active session.
+pub async fn scope_session_key<F>(session_key: Option<String>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TOOL_LOOP_SESSION_KEY.scope(session_key, future).await
 }
 
 /// Computes the list of MCP tool names that should be excluded for a given turn
@@ -323,11 +335,17 @@ fn autosave_memory_key(prefix: &str) -> String {
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
 /// Core memories are exempt from time decay (evergreen).
+///
+/// `exclude_conversation` skips `MemoryCategory::Conversation` entries
+/// regardless of their key shape. Set to `true` for autonomous/scheduled
+/// runs (cron, daemon heartbeat) so chat memory cannot leak into prompts
+/// the user did not initiate. See #5415 / #5456.
 async fn build_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
     session_id: Option<&str>,
+    exclude_conversation: bool,
 ) -> String {
     let mut context = String::new();
 
@@ -347,7 +365,21 @@ async fn build_context(
         if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &relevant {
+                // Scheduled (cron / heartbeat) runs must not see chat-origin
+                // memories. The autosave-key checks below catch the agent's
+                // own autosaves but miss Conversation entries written by
+                // channel handlers (Discord, gateway, WhatsApp, …) under
+                // their own keys. See #5415 / #5456.
+                if exclude_conversation && matches!(entry.category, MemoryCategory::Conversation) {
+                    continue;
+                }
                 if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
+                    continue;
+                }
+                // Skip raw per-turn user messages: re-injecting them causes each
+                // recalled entry to embed all prior generations, growing exponentially.
+                // Consolidated knowledge is already promoted to Core/Daily entries.
+                if zeroclaw_memory::is_user_autosave_key(&entry.key) {
                     continue;
                 }
                 if zeroclaw_memory::should_skip_autosave_content(&entry.content) {
@@ -525,8 +557,18 @@ pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)
 #[derive(Debug, Default)]
 struct StreamedChatOutcome {
     response_text: String,
+    /// Accumulated reasoning/thinking content from streaming deltas.
+    ///
+    /// Captured separately from `response_text` so it can be threaded into
+    /// `ChatResponse.reasoning_content` and ultimately persisted on the
+    /// `AssistantToolCalls` history entry. Required for providers like
+    /// DeepSeek V4 that reject follow-up requests when the assistant's
+    /// prior `reasoning_content` is missing from replayed tool-call turns
+    /// (see issue #6059).
+    reasoning_content: String,
     tool_calls: Vec<ToolCall>,
     forwarded_live_deltas: bool,
+    usage: Option<zeroclaw_providers::traits::TokenUsage>,
 }
 
 async fn consume_provider_streaming_response(
@@ -544,7 +586,7 @@ async fn consume_provider_streaming_response(
             tools: request_tools,
         },
         model,
-        temperature,
+        Some(temperature),
         zeroclaw_providers::traits::StreamOptions::new(true),
     );
     let mut outcome = StreamedChatOutcome::default();
@@ -569,6 +611,9 @@ async fn consume_provider_streaming_response(
         let event = event_result.map_err(|err| anyhow::anyhow!("provider stream error: {err}"))?;
         match event {
             StreamEvent::Final => break,
+            StreamEvent::Usage(usage) => {
+                outcome.usage = Some(usage);
+            }
             StreamEvent::ToolCall(tool_call) => {
                 outcome.tool_calls.push(tool_call);
                 suppress_forwarding = true;
@@ -579,6 +624,21 @@ async fn consume_provider_streaming_response(
                 // do not affect the agent's tool dispatch loop.
             }
             StreamEvent::TextDelta(chunk) => {
+                // Reasoning/thinking deltas arrive on the same `TextDelta`
+                // event as plain text but populate `chunk.reasoning` instead
+                // of `chunk.delta`. They must be captured into the outcome
+                // even when `chunk.delta` is empty — otherwise providers
+                // that require reasoning to round-trip on subsequent turns
+                // (DeepSeek V4 thinking mode; see #6059) reject the next
+                // request with a 400. Reasoning is never forwarded as a
+                // visible response delta — it is the model's internal
+                // monologue, kept for replay only.
+                if let Some(reasoning) = chunk.reasoning.as_deref()
+                    && !reasoning.is_empty()
+                {
+                    outcome.reasoning_content.push_str(reasoning);
+                }
+
                 if chunk.delta.is_empty() {
                     continue;
                 }
@@ -643,6 +703,7 @@ pub async fn agent_turn(
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
+    channel: Option<&dyn Channel>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -669,6 +730,9 @@ pub async fn agent_turn(
         0,    // max_tool_result_chars: 0 = disabled (legacy callers)
         0,    // context_token_budget: 0 = disabled (legacy callers)
         None, // shared_budget: no shared budget for legacy callers
+        channel,
+        None, // receipt_generator
+        None, // collected_receipts
     )
     .await
 }
@@ -779,6 +843,7 @@ fn maybe_inject_channel_delivery_defaults(
 //   • max_iterations is reached (runaway safety), or
 //   • the cancellation token fires (external abort).
 
+/// Append a receipt footer to the response text if any receipts were collected.
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 #[allow(clippy::too_many_arguments)]
@@ -807,6 +872,9 @@ pub async fn run_tool_call_loop(
     max_tool_result_chars: usize,
     context_token_budget: usize,
     shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    channel: Option<&dyn Channel>,
+    receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
+    collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -891,6 +959,12 @@ pub async fn run_tool_call_loop(
                 }
             }
         }
+
+        // Remove orphaned tool-role messages whose assistant (tool_calls)
+        // counterpart was dropped by proactive trimming, context compression,
+        // or session history reloading.  Without this, providers like MiniMax
+        // reject the request with "tool result's tool id not found" (bug #5743).
+        crate::agent::history_pruner::remove_orphaned_tool_messages(history);
 
         // Check if model switch was requested via model_switch tool
         if let Some(ref callback) = model_switch_callback
@@ -1063,11 +1137,16 @@ pub async fn run_tool_call_loop(
             {
                 Ok(streamed) => {
                     streamed_live_deltas = streamed.forwarded_live_deltas;
+                    let reasoning_content = if streamed.reasoning_content.is_empty() {
+                        None
+                    } else {
+                        Some(streamed.reasoning_content)
+                    };
                     Ok(zeroclaw_providers::ChatResponse {
                         text: Some(streamed.response_text),
                         tool_calls: streamed.tool_calls,
-                        usage: None,
-                        reasoning_content: None,
+                        usage: streamed.usage,
+                        reasoning_content,
                     })
                 }
                 Err(stream_err) => {
@@ -1097,7 +1176,7 @@ pub async fn run_tool_call_loop(
                                 tools: request_tools,
                             },
                             active_model,
-                            temperature,
+                            Some(temperature),
                         );
                         if let Some(token) = cancellation_token.as_ref() {
                             tokio::select! {
@@ -1119,7 +1198,7 @@ pub async fn run_tool_call_loop(
                     tools: request_tools,
                 },
                 active_model,
-                temperature,
+                Some(temperature),
             );
 
             match pacing.step_timeout_secs {
@@ -1489,6 +1568,7 @@ pub async fn run_tool_call_loop(
                                 success: false,
                                 error_reason: Some(scrub_credentials(&reason)),
                                 duration: Duration::ZERO,
+                                receipt: None,
                             },
                         ));
                         continue;
@@ -1517,10 +1597,40 @@ pub async fn run_tool_call_loop(
                 };
 
                 // Interactive CLI: prompt the operator.
-                // Non-interactive (channels): auto-deny since no operator
-                // is present to approve.
+                // Non-interactive (channels): try the channel's inline
+                // approval (e.g. Telegram inline keyboard) before falling
+                // back to auto-deny.
                 let decision = if mgr.is_non_interactive() {
-                    ApprovalResponse::No
+                    let channel_decision = if let Some(ch) = channel {
+                        let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
+                            tool_name: request.tool_name.clone(),
+                            arguments_summary: crate::approval::summarize_args(&request.arguments),
+                        };
+                        let recipient = channel_reply_target.unwrap_or_default();
+                        match ch.request_approval(recipient, &ch_request).await {
+                            Ok(Some(r)) => Some(r),
+                            Ok(None) => None,
+                            Err(e) => {
+                                tracing::warn!("Channel approval request failed: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    match channel_decision {
+                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve) => {
+                            ApprovalResponse::Yes
+                        }
+                        Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove) => {
+                            ApprovalResponse::Always
+                        }
+                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny) => {
+                            ApprovalResponse::No
+                        }
+                        // Channel doesn't support approval — auto-deny.
+                        None => ApprovalResponse::No,
+                    }
                 } else {
                     mgr.prompt_cli(&request)
                 };
@@ -1559,6 +1669,7 @@ pub async fn run_tool_call_loop(
                             success: false,
                             error_reason: Some(denied),
                             duration: Duration::ZERO,
+                            receipt: None,
                         },
                     ));
                     continue;
@@ -1607,6 +1718,7 @@ pub async fn run_tool_call_loop(
                         success: false,
                         error_reason: Some(duplicate),
                         duration: Duration::ZERO,
+                        receipt: None,
                     },
                 ));
                 continue;
@@ -1669,6 +1781,7 @@ pub async fn run_tool_call_loop(
                 activated_tools,
                 observer,
                 cancellation_token.as_ref(),
+                receipt_generator,
             )
             .await?
         } else {
@@ -1678,6 +1791,7 @@ pub async fn run_tool_call_loop(
                 activated_tools,
                 observer,
                 cancellation_token.as_ref(),
+                receipt_generator,
             )
             .await?
         };
@@ -1685,7 +1799,7 @@ pub async fn run_tool_call_loop(
         for ((idx, call), outcome) in executable_indices
             .iter()
             .zip(executable_calls.iter())
-            .zip(executed_outcomes.into_iter())
+            .zip(executed_outcomes)
         {
             runtime_trace::record_event(
                 "tool_call_result",
@@ -1788,7 +1902,17 @@ pub async fn run_tool_call_loop(
                     }
                 }
             }
-            let result_output = truncate_tool_result(&outcome.output, max_tool_result_chars);
+            let mut result_output = truncate_tool_result(&outcome.output, max_tool_result_chars);
+            // Append HMAC receipt to tool result when receipts are enabled (#4830)
+            if let Some(ref receipt) = outcome.receipt {
+                tracing::debug!(tool = %tool_name, receipt = %receipt, "Tool receipt generated");
+                result_output = format!("{result_output}\n\n[receipt: {receipt}]");
+                if let Some(store) = collected_receipts
+                    && let Ok(mut v) = store.lock()
+                {
+                    v.push(format!("{tool_name}: {receipt}"));
+                }
+            }
             individual_results.push((tool_call_id, result_output.clone()));
             let _ = writeln!(
                 tool_results,
@@ -1908,7 +2032,10 @@ pub async fn run_tool_call_loop(
         messages: history,
         tools: None, // No tools — force a text response
     };
-    match provider.chat(summary_request, model, temperature).await {
+    match provider
+        .chat(summary_request, model, Some(temperature))
+        .await
+    {
         Ok(resp) => {
             let text = resp.text.unwrap_or_default();
             if text.is_empty() {
@@ -1926,10 +2053,7 @@ pub async fn run_tool_call_loop(
 
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
-pub fn build_tool_instructions(
-    tools_registry: &[Box<dyn Tool>],
-    tool_descriptions: Option<&ToolDescriptions>,
-) -> String {
+pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -1945,9 +2069,7 @@ pub fn build_tool_instructions(
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
-        let desc = tool_descriptions
-            .and_then(|td| td.get(tool.name()))
-            .unwrap_or_else(|| tool.description());
+        let desc = tool.description();
         let _ = writeln!(
             instructions,
             "**{}**: {}\nParameters: `{}`\n",
@@ -2191,15 +2313,14 @@ pub async fn run(
         .map(|b| b.board.clone())
         .collect();
 
-    // ── Load locale-aware tool descriptions ────────────────────────
+    // ── Initialize locale-aware tool descriptions ──────────────────
     let i18n_locale = config
         .locale
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(crate::i18n::detect_locale);
-    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
-    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+    crate::i18n::init(&i18n_locale);
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
@@ -2347,7 +2468,7 @@ pub async fn run(
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -2376,7 +2497,7 @@ pub async fn run(
     let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
         crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.workspace_dir)
             .map(|tracker| {
-                ToolLoopCostTrackingContext::new(tracker, Arc::new(config.cost.prices.clone()))
+                ToolLoopCostTrackingContext::new(tracker, Arc::new(config.combined_pricing()))
             });
 
     // ── Execute ──────────────────────────────────────────────────
@@ -2429,12 +2550,16 @@ pub async fn run(
                 .await;
         }
 
-        // Inject memory + hardware RAG context into user message
+        // Inject memory + hardware RAG context into user message.
+        // For non-interactive runs (cron, daemon heartbeat), exclude
+        // Conversation-category memories so chat history does not leak
+        // into autonomous executions. See #5415 / #5456.
         let mem_context = build_context(
             mem.as_ref(),
             &effective_msg,
             config.memory.min_relevance_score,
             memory_session_id.as_deref(),
+            !interactive,
         )
         .await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -2501,6 +2626,9 @@ pub async fn run(
                         config.agent.max_tool_result_chars,
                         config.agent.max_context_tokens,
                         None, // shared_budget
+                        None, // channel: CLI mode — uses prompt_cli
+                        None, // receipt_generator
+                        None, // collected_receipts
                     ),
                 )
                 .await
@@ -2713,12 +2841,15 @@ pub async fn run(
                     .await;
             }
 
-            // Inject memory + hardware RAG context into user message
+            // Inject memory + hardware RAG context into user message.
+            // Interactive REPL: keep Conversation memories (user is actively
+            // chatting in this session and may want their own history recalled).
             let mem_context = build_context(
                 mem.as_ref(),
                 &effective_input,
                 config.memory.min_relevance_score,
                 memory_session_id.as_deref(),
+                false,
             )
             .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -2810,6 +2941,9 @@ pub async fn run(
                             config.agent.max_tool_result_chars,
                             config.agent.max_context_tokens,
                             None, // shared_budget
+                            None, // channel: interactive CLI — uses prompt_cli
+                            None, // receipt_generator
+                            None, // collected_receipts
                         ),
                     )
                     .await
@@ -3103,9 +3237,34 @@ pub async fn process_message(
     }
 
     let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
-    let model_name = fallback_provider_pm
-        .and_then(|e| e.model.clone())
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let model_name = match fallback_provider_pm
+        .and_then(|e| e.model.as_deref())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        Some(m) => m.to_string(),
+        None => match config.providers.resolve_default_model() {
+            Some(m) => {
+                tracing::warn!(
+                    provider = provider_name,
+                    model = %m,
+                    "fallback provider has no `model` set; using first configured \
+                     providers.models entry as default. Set [providers.models.{provider_name}] \
+                     model = \"...\" to silence this warning.",
+                );
+                m
+            }
+            None => {
+                anyhow::bail!(
+                    "no model configured: providers.fallback = {:?} resolves with no model, \
+                     and no [[providers.models.*]] entry has a `model` field set. \
+                     Configure at least one [providers.models.<name>] model = \"...\" \
+                     or define a [[model_routes]] hint.",
+                    config.providers.fallback,
+                )
+            }
+        },
+    };
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_from_config(&config);
     let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
@@ -3133,15 +3292,14 @@ pub async fn process_message(
         .map(|b| b.board.clone())
         .collect();
 
-    // ── Load locale-aware tool descriptions ────────────────────────
+    // ── Initialize locale-aware tool descriptions ──────────────────
     let i18n_locale = config
         .locale
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(crate::i18n::detect_locale);
-    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
-    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+    crate::i18n::init(&i18n_locale);
 
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
@@ -3234,7 +3392,7 @@ pub async fn process_message(
         config.agent.max_system_prompt_chars,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
@@ -3271,11 +3429,15 @@ pub async fn process_message(
     }
 
     let effective_msg_ref = effective_message.as_str();
+    // process_message is the channel entrypoint (Discord, Telegram, gateway,
+    // etc.) — recall is scoped to the channel's session_id, so retrieving the
+    // user's own Conversation history within their session is intended.
     let mem_context = build_context(
         mem.as_ref(),
         effective_msg_ref,
         config.memory.min_relevance_score,
         session_id,
+        false,
     )
     .await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -3322,6 +3484,7 @@ pub async fn process_message(
         &config.agent.tool_call_dedup_exempt,
         activated_handle_pm.as_ref(),
         None,
+        None, // channel: process_message path has no channel ref
     )
     .await
 }
@@ -3653,6 +3816,37 @@ mod tests {
         assert_eq!(restored[1].content, "orphan");
     }
 
+    /// Regression test for issue #5813: a persisted session whose assistant
+    /// (tool_use) was lost to compaction must self-heal on load so the next
+    /// API call doesn't fail with "unexpected tool_use_id found in tool_result
+    /// blocks".
+    #[test]
+    fn load_interactive_session_heals_orphaned_tool_result() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let orphan_tool = ChatMessage::tool(
+            r#"{"tool_call_id":"toolu_01OrphanFromCompaction","content":"stale result"}"#,
+        );
+        let payload = serde_json::to_string_pretty(&InteractiveSessionState {
+            version: 1,
+            history: vec![
+                ChatMessage::system("sys"),
+                orphan_tool,
+                ChatMessage::user("next question"),
+            ],
+        })
+        .unwrap();
+        std::fs::write(&path, payload).unwrap();
+
+        let restored = load_interactive_session_history(&path, "fallback").unwrap();
+
+        assert!(
+            !restored.iter().any(|m| m.role == "tool"),
+            "orphaned tool_result should be removed on load; got roles {:?}",
+            restored.iter().map(|m| &m.role).collect::<Vec<_>>()
+        );
+    }
+
     use super::*;
     use async_trait::async_trait;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -3691,8 +3885,16 @@ mod tests {
             .expect("should produce a sample whose byte index 300 is not a char boundary");
 
         let observer = NoopObserver;
-        let result =
-            execute_one_tool("unknown_tool", call_arguments, &[], None, &observer, None).await;
+        let result = execute_one_tool(
+            "unknown_tool",
+            call_arguments,
+            &[],
+            None,
+            &observer,
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_ok(), "execute_one_tool should not panic or error");
 
         let outcome = result.unwrap();
@@ -3721,6 +3923,7 @@ mod tests {
             Some(&activated),
             &observer,
             None,
+            None, // receipt_generator
         )
         .await
         .expect("suffix alias should execute the unique activated tool");
@@ -3730,6 +3933,27 @@ mod tests {
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn execute_one_tool_normalizes_empty_success_output() {
+        let observer = NoopObserver;
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EmptySuccessTool)];
+
+        let outcome = execute_one_tool(
+            "empty_success",
+            serde_json::json!({}),
+            &tools,
+            None,
+            &observer,
+            None,
+            None, // receipt_generator
+        )
+        .await
+        .expect("empty successful tool output should still execute");
+
+        assert!(outcome.success);
+        assert_eq!(outcome.output, "(no output)");
+        assert!(outcome.error_reason.is_none());
+    }
     use crate::observability::NoopObserver;
     use tempfile::TempDir;
     use zeroclaw_api::provider::{ProviderCapabilities, StreamChunk, StreamEvent, StreamOptions};
@@ -3748,7 +3972,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".to_string())
@@ -3774,7 +3998,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".to_string())
@@ -3784,7 +4008,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let marker_count =
@@ -3845,7 +4069,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!("chat_with_system should not be used in scripted provider tests");
         }
@@ -3854,7 +4078,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             let mut responses = self
                 .responses
@@ -3891,7 +4115,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!(
                 "chat_with_system should not be used in streaming scripted provider tests"
@@ -3902,7 +4126,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when streaming succeeds")
@@ -3916,7 +4140,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -3944,6 +4168,12 @@ mod tests {
     enum NativeStreamTurn {
         ToolCall(ToolCall),
         Text(String),
+        /// Emit a single text delta with associated reasoning content. Used by
+        /// regression tests for issue #6059 (DeepSeek V4 thinking-mode replay).
+        TextWithReasoning {
+            text: String,
+            reasoning: String,
+        },
     }
 
     struct StreamingNativeToolEventProvider {
@@ -3979,7 +4209,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!(
                 "chat_with_system should not be used in streaming native tool event provider tests"
@@ -3990,7 +4220,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when native streaming events succeed")
@@ -4008,7 +4238,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -4039,6 +4269,13 @@ mod tests {
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
                     Ok(StreamEvent::Final),
                 ])),
+                NativeStreamTurn::TextWithReasoning { text, reasoning } => {
+                    Box::pin(futures_util::stream::iter(vec![
+                        Ok(StreamEvent::TextDelta(StreamChunk::reasoning(reasoning))),
+                        Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
+                        Ok(StreamEvent::Final),
+                    ]))
+                }
             }
         }
     }
@@ -4068,7 +4305,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!("chat_with_system should not be used in route-aware stream tests");
         }
@@ -4077,7 +4314,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when routed streaming succeeds")
@@ -4091,7 +4328,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -4158,6 +4395,37 @@ mod tests {
             Ok(crate::tools::ToolResult {
                 success: true,
                 output: format!("counted:{value}"),
+                error: None,
+            })
+        }
+    }
+
+    struct EmptySuccessTool;
+
+    #[async_trait]
+    impl Tool for EmptySuccessTool {
+        fn name(&self) -> &str {
+            "empty_success"
+        }
+
+        fn description(&self) -> &str {
+            "Returns success with no stdout"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: String::new(),
                 error: None,
             })
         }
@@ -4367,6 +4635,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4422,6 +4693,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4471,6 +4745,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4519,6 +4796,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect_err("should fail without vision_provider config");
@@ -4574,6 +4854,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -4629,6 +4912,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("text-only messages should succeed with default provider");
@@ -4685,6 +4971,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -4739,6 +5028,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -4793,6 +5085,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
@@ -4930,6 +5225,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("parallel execution should complete");
@@ -5007,6 +5305,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -5076,6 +5377,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -5140,6 +5444,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -5217,6 +5524,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -5284,6 +5594,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -5371,6 +5684,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("loop should complete");
@@ -5432,6 +5748,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("native fallback id flow should complete");
@@ -5465,6 +5784,7 @@ mod tests {
                         id: "call_wait".into(),
                         name: "count_tool".into(),
                         arguments: r#"{"value":"A"}"#.into(),
+                        extra_content: None,
                     }],
                     usage: None,
                     reasoning_content: None,
@@ -5520,6 +5840,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -5585,6 +5908,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("streaming provider should complete");
@@ -5653,6 +5979,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -5688,6 +6017,7 @@ mod tests {
                 id: "call_native_1".to_string(),
                 name: "count_tool".to_string(),
                 arguments: r#"{"value":"A"}"#.to_string(),
+                extra_content: None,
             }),
             NativeStreamTurn::Text("done".to_string()),
         ]);
@@ -5728,6 +6058,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -5812,6 +6145,9 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("routed streaming provider should complete");
@@ -5895,6 +6231,7 @@ mod tests {
                 &[],
                 Some(&activated),
                 None,
+                None, // channel
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -5949,7 +6286,7 @@ mod tests {
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let instructions = build_tool_instructions(&tools, None);
+        let instructions = build_tool_instructions(&tools);
 
         assert!(instructions.contains("## Tool Use Protocol"));
         assert!(instructions.contains("<tool_call>"));
@@ -6063,7 +6400,7 @@ mod tests {
         .await
         .unwrap();
         mem.store(
-            "user_msg_real",
+            "user_preference",
             "User asked for concise status updates",
             MemoryCategory::Conversation,
             None,
@@ -6071,10 +6408,89 @@ mod tests {
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0, None).await;
-        assert!(context.contains("user_msg_real"));
+        let context = build_context(&mem, "status updates", 0.0, None, false).await;
+        assert!(context.contains("user_preference"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
+    }
+
+    #[tokio::test]
+    async fn build_context_ignores_user_autosave_entries() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "user_msg",
+            "Original user message with full conversation history",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "user_msg_a1b2c3d4",
+            "Follow-up user message embedding prior context verbatim",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "user_preference",
+            "User prefers concise answers",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let context = build_context(&mem, "answers", 0.0, None, false).await;
+        assert!(context.contains("user_preference"));
+        assert!(!context.contains("user_msg"));
+        assert!(!context.contains("embedding prior context"));
+    }
+
+    /// Regression: cron / heartbeat runs must not surface chat-origin
+    /// `Conversation` memories — the leak path the #5456 prefix filter
+    /// missed because `agent::run` performs a second, unfiltered recall
+    /// inside `build_context`. See #5415.
+    #[tokio::test]
+    async fn build_context_excludes_conversation_when_flag_set() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        // A Conversation entry written by a chat channel with a non-autosave
+        // key (autosave keys are already skipped by the existing filters).
+        mem.store(
+            "discord:guild:chan:msg-42",
+            "Reminder for Alice: the API key is in 1Password vault Foo.",
+            MemoryCategory::Conversation,
+            Some("discord:guild:chan"),
+        )
+        .await
+        .unwrap();
+        // A non-Conversation memory that should still surface so we know the
+        // function still does its job — only Conversation should be dropped.
+        mem.store(
+            "team_oncall",
+            "Primary on-call rotates every Monday at 09:00 UTC.",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let context = build_context(&mem, "Alice on-call", 0.0, None, true).await;
+        assert!(
+            !context.contains("Alice"),
+            "Conversation memory leaked into scheduled context: {context}"
+        );
+        assert!(
+            !context.contains("API key"),
+            "Conversation memory leaked into scheduled context: {context}"
+        );
+        assert!(
+            context.contains("team_oncall"),
+            "Non-Conversation memory should still surface: {context}"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -6622,6 +7038,7 @@ Let me check the result."#;
             id: "call_1".into(),
             name: "shell".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }];
         let result = build_native_assistant_history("answer", &calls, Some("thinking step"));
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -6636,6 +7053,7 @@ Let me check the result."#;
             id: "call_1".into(),
             name: "shell".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }];
         let result = build_native_assistant_history("answer", &calls, None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -6674,6 +7092,124 @@ Let me check the result."#;
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    /// Regression test for issue #6059 — DeepSeek V4 thinking-mode tool-call
+    /// replay rejected with `400` because the assistant's prior
+    /// `reasoning_content` was missing from the next request.
+    ///
+    /// Before the fix, the streaming consumer dropped reasoning chunks on the
+    /// floor (`chunk.delta.is_empty()` short-circuit + hardcoded
+    /// `reasoning_content: None` on the synthesized `ChatResponse`). After
+    /// the fix, reasoning deltas accumulate into `StreamedChatOutcome` and
+    /// surface on the response so the agent's history layer can persist them
+    /// and replay them on subsequent turns.
+    #[tokio::test]
+    async fn consume_provider_streaming_response_captures_reasoning_content() {
+        let provider = StreamingNativeToolEventProvider::with_turns(vec![
+            NativeStreamTurn::TextWithReasoning {
+                text: "Listing the directory now.".to_string(),
+                reasoning: "I need to call the shell tool to list files.".to_string(),
+            },
+        ]);
+        let messages = vec![ChatMessage::user(
+            "List the folders in the current directory",
+        )];
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            None,
+            "deepseek-v4-pro",
+            0.2,
+            None,
+            None,
+        )
+        .await
+        .expect("streaming should succeed");
+
+        assert_eq!(outcome.response_text, "Listing the directory now.");
+        assert_eq!(
+            outcome.reasoning_content,
+            "I need to call the shell tool to list files."
+        );
+        assert!(
+            outcome.tool_calls.is_empty(),
+            "this turn does not emit native tool calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_accumulates_split_reasoning_chunks() {
+        // Scripted multi-event stream: two reasoning chunks straddling a text
+        // delta. The outcome should concatenate the reasoning chunks in order
+        // and keep them out of the visible response text.
+        struct MultiChunkProvider;
+
+        #[async_trait]
+        impl Provider for MultiChunkProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used in this test")
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                anyhow::bail!("not used in this test")
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::reasoning("Step 1: "))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta("Hello "))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
+                        "consider options.",
+                    ))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta("there."))),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+
+        let provider = MultiChunkProvider;
+        let messages = vec![ChatMessage::user("hi")];
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            None,
+            "deepseek-v4-flash",
+            0.2,
+            None,
+            None,
+        )
+        .await
+        .expect("streaming should succeed");
+
+        assert_eq!(outcome.response_text, "Hello there.");
+        assert_eq!(outcome.reasoning_content, "Step 1: consider options.");
     }
 
     // ── glob_match tests ──────────────────────────────────────────────────────
@@ -6872,6 +7408,9 @@ Let me check the result."#;
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("tool loop should complete");
@@ -7031,6 +7570,9 @@ Let me check the result."#;
                     0,
                     0,
                     None,
+                    None, // channel
+                    None, // receipt_generator
+                    None, // collected_receipts
                 ),
             )
             .await
@@ -7116,6 +7658,9 @@ Let me check the result."#;
                     0,
                     0,
                     None,
+                    None, // channel
+                    None, // receipt_generator
+                    None, // collected_receipts
                 ),
             )
             .await
@@ -7174,6 +7719,9 @@ Let me check the result."#;
             0,
             0,
             None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("should succeed without cost scope");
