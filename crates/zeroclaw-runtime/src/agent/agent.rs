@@ -1501,8 +1501,8 @@ impl Agent {
                 serde_json::json!({ "messages_count": messages.len() }),
             );
             let llm_start = Instant::now();
-
-            let stream_opts = zeroclaw_providers::traits::StreamOptions::new(true);
+            let stream_opts =
+                zeroclaw_providers::traits::StreamOptions::new(self.provider.supports_streaming());
             let mut stream = self.provider.stream_chat(
                 zeroclaw_providers::ChatRequest {
                     messages: &messages,
