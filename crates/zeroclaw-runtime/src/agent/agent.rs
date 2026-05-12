@@ -2422,11 +2422,14 @@ mod tests {
         handle.write().insert("acp".to_string(), channel);
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "echo".into(),
-                arguments: serde_json::json!({"message": "hi"}),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "echo".into(),
+                    arguments: serde_json::json!({"message": "hi"}),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "test-turn-id",
+            )
             .await;
 
         assert!(result.success);
@@ -2479,11 +2482,14 @@ mod tests {
         handle.write().insert("acp".to_string(), channel);
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "echo".into(),
-                arguments: serde_json::json!({"message": "hi"}),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "echo".into(),
+                    arguments: serde_json::json!({"message": "hi"}),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "test-turn-id",
+            )
             .await;
 
         assert!(!result.success);
@@ -2537,14 +2543,17 @@ mod tests {
         handle.write().insert("acp".to_string(), channel);
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "shell".into(),
-                arguments: serde_json::json!({
-                    "command": "touch should-not-run",
-                    "approved": true
-                }),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "touch should-not-run",
+                        "approved": true
+                    }),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "test-turn-id",
+            )
             .await;
 
         assert!(!result.success);
@@ -2599,14 +2608,17 @@ mod tests {
         handle.write().insert("acp".to_string(), channel);
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "shell".into(),
-                arguments: serde_json::json!({
-                    "command": "touch should-run-after-human-approval",
-                    "approved": false
-                }),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "touch should-run-after-human-approval",
+                        "approved": false
+                    }),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "test-turn-id",
+            )
             .await;
 
         assert!(result.success);
@@ -2666,24 +2678,30 @@ mod tests {
         handle.write().insert("acp".to_string(), channel);
 
         let first_result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "shell".into(),
-                arguments: serde_json::json!({
-                    "command": "touch should-run-after-always-approval",
-                    "approved": false
-                }),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "touch should-run-after-always-approval",
+                        "approved": false
+                    }),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "test-turn-id",
+            )
             .await;
         let second_result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "shell".into(),
-                arguments: serde_json::json!({
-                    "command": "touch should-run-from-allowlist",
-                    "approved": false
-                }),
-                tool_call_id: Some("tc2".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "touch should-run-from-allowlist",
+                        "approved": false
+                    }),
+                    tool_call_id: Some("tc2".into()),
+                },
+                "test-turn-id",
+            )
             .await;
 
         assert!(first_result.success);
@@ -2730,14 +2748,17 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "cron_add".into(),
-                arguments: serde_json::json!({
-                    "command": "echo should-not-be-model-approved",
-                    "approved": true
-                }),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "cron_add".into(),
+                    arguments: serde_json::json!({
+                        "command": "echo should-not-be-model-approved",
+                        "approved": true
+                    }),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "test-turn-id",
+            )
             .await;
 
         assert!(result.success);
@@ -2809,24 +2830,17 @@ mod tests {
     async fn turn_records_tool_call_observability() {
         let observer = Arc::new(RecordingObserver::default());
         let provider = Box::new(MockProvider {
-            responses: Mutex::new(vec![
-                zeroclaw_providers::ChatResponse {
-                    text: Some(String::new()),
-                    tool_calls: vec![zeroclaw_providers::ToolCall {
-                        id: "tc1".into(),
-                        name: "echo".into(),
-                        arguments: "{}".into(),
-                    }],
-                    usage: None,
-                    reasoning_content: None,
-                },
-                zeroclaw_providers::ChatResponse {
-                    text: Some("done".into()),
-                    tool_calls: vec![],
-                    usage: None,
-                    reasoning_content: None,
-                },
-            ]),
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![zeroclaw_providers::ToolCall {
+                    id: "tc1".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            }]),
         });
 
         let mut agent = Agent::builder()
@@ -3257,7 +3271,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<String> {
             Ok("ok".into())
         }
@@ -3266,7 +3280,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             Ok(zeroclaw_providers::ChatResponse {
                 text: Some("fallback-done".into()),
@@ -3288,7 +3302,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             _options: zeroclaw_providers::traits::StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -3547,7 +3561,7 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(32);
-        let response = agent.turn_streamed("hi", event_tx).await.unwrap();
+        let response = agent.turn_streamed("hi", event_tx, None).await.unwrap();
         assert_eq!(response, "fallback-done");
 
         let events = observer.events.lock().clone();
