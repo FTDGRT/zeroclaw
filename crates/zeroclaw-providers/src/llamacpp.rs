@@ -15,7 +15,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, warn};
 
 // ── Request / response structs ──────────────────────────────────────────────
@@ -224,11 +224,46 @@ impl LlamaCppProvider {
         })
     }
 
+    fn should_sanitize_tool_schema(model: &str) -> bool {
+        let lower = model.to_ascii_lowercase();
+        model.is_empty() || lower.contains("gemma-4") || lower.contains("gemma4")
+    }
+
+    fn sanitize_tool_payload_for_model(
+        tools: Vec<serde_json::Value>,
+        model: &str,
+    ) -> Vec<serde_json::Value> {
+        if !Self::should_sanitize_tool_schema(model) {
+            return tools;
+        }
+
+        tools
+            .into_iter()
+            .map(|mut tool| {
+                let Some(raw_parameters) = tool.get("parameters").cloned() else {
+                    return tool;
+                };
+
+                let cleaned_parameters = zeroclaw_api::schema::SchemaCleanr::clean(
+                    raw_parameters,
+                    zeroclaw_api::schema::CleaningStrategy::Conservative,
+                );
+
+                if let Some(tool_obj) = tool.as_object_mut() {
+                    tool_obj.insert("parameters".to_string(), cleaned_parameters);
+                }
+
+                tool
+            })
+            .collect()
+    }
+
     fn convert_tools(
         tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
+        model: &str,
     ) -> Option<Vec<serde_json::Value>> {
         tools.map(|items| {
-            items
+            let converted = items
                 .iter()
                 .map(|tool| {
                     let params = zeroclaw_api::schema::SchemaCleanr::clean_for_openai(
@@ -241,7 +276,9 @@ impl LlamaCppProvider {
                         "parameters": params,
                     })
                 })
-                .collect()
+                .collect::<Vec<_>>();
+
+            Self::sanitize_tool_payload_for_model(converted, model)
         })
     }
 
@@ -453,6 +490,7 @@ impl Provider for LlamaCppProvider {
                 }))
             })
             .collect();
+        let converted = Self::sanitize_tool_payload_for_model(converted, model);
         let tools_opt = if converted.is_empty() {
             None
         } else {
@@ -467,7 +505,7 @@ impl Provider for LlamaCppProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let tools = Self::convert_tools(request.tools);
+        let tools = Self::convert_tools(request.tools, model);
         self.do_chat(request.messages, model, temperature, tools)
             .await
     }
@@ -491,7 +529,7 @@ impl Provider for LlamaCppProvider {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
         let messages = request.messages.to_vec();
-        let tools = Self::convert_tools(request.tools);
+        let tools = Self::convert_tools(request.tools, model);
         self.do_stream(messages, model, temperature, tools, options.count_tokens)
     }
 
@@ -746,6 +784,10 @@ fn parse_sse_responses(
         }
 
         let mut pending: HashMap<String, (String, String)> = HashMap::new();
+        // Track item_ids that have already emitted at least one delta (text or reasoning),
+        // so the corresponding *done events can serve as fallbacks for non-streaming models.
+        let mut text_delta_seen: HashSet<String> = HashSet::new();
+        let mut reasoning_delta_seen: HashSet<String> = HashSet::new();
         let mut buffer = String::new();
         let mut utf8_buf: Vec<u8> = Vec::new();
         let mut bytes_stream = response.bytes_stream();
@@ -809,7 +851,14 @@ fn parse_sse_responses(
                 debug!("llama.cpp SSE event type={kind:?}");
 
                 match kind {
+                    // Response lifecycle bookkeeping — no action needed.
+                    "response.created" | "response.in_progress" => {}
+                    // A new output_text part is starting; actual content follows via delta/done.
+                    "response.content_part.added" => {}
                     "response.output_text.delta" => {
+                        if let Some(item_id) = event.get("item_id").and_then(|v| v.as_str()) {
+                            text_delta_seen.insert(item_id.to_string());
+                        }
                         match event.get("delta").and_then(|v| v.as_str()) {
                             Some(delta) if !delta.is_empty() => {
                                 let mut chunk = StreamChunk::delta(delta.to_string());
@@ -823,10 +872,64 @@ fn parse_sse_responses(
                             _ => debug!("llama.cpp output_text.delta had no string delta: {event}"),
                         }
                     }
-                    // Chain-of-thought reasoning content — discard, wait for output_text.delta.
+                    // Emitted when a text part is complete.  Fallback for models that don't
+                    // stream character-by-character deltas.
+                    "response.output_text.done" => {
+                        let item_id = event.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+                        if !text_delta_seen.contains(item_id)
+                            && let Some(text) = event.get("text").and_then(|v| v.as_str())
+                            && !text.is_empty()
+                        {
+                            let mut chunk = StreamChunk::delta(text.to_string());
+                            if count_tokens {
+                                chunk = chunk.with_token_estimate();
+                            }
+                            if tx.send(Ok(StreamEvent::TextDelta(chunk))).await.is_err() {
+                                return;
+                            }
+                            text_delta_seen.insert(item_id.to_string());
+                        }
+                    }
+                    // content_part.done duplicates output_text.done for text parts; discard.
+                    "response.content_part.done" => {}
+                    // Chain-of-thought reasoning/thinking content from the model.
                     "response.reasoning_text.delta"
                     | "response.reasoning_summary_text.delta"
-                    | "response.reasoning.delta" => {}
+                    | "response.reasoning.delta" => {
+                        if let Some(item_id) = event.get("item_id").and_then(|v| v.as_str()) {
+                            reasoning_delta_seen.insert(item_id.to_string());
+                        }
+                        if let Some(delta) = event.get("delta").and_then(|v| v.as_str())
+                            && !delta.is_empty()
+                            && tx
+                                .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
+                                    delta.to_string(),
+                                ))))
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // Fallback for non-streaming reasoning output.
+                    "response.reasoning_text.done" | "response.reasoning.done" => {
+                        let item_id = event.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+                        if !reasoning_delta_seen.contains(item_id)
+                            && let Some(text) = event.get("text").and_then(|v| v.as_str())
+                            && !text.is_empty()
+                        {
+                            if tx
+                                .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
+                                    text.to_string(),
+                                ))))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            reasoning_delta_seen.insert(item_id.to_string());
+                        }
+                    }
                     "response.output_item.added" => {
                         if let Some(item) = event.get("item")
                             && item.get("type").and_then(|v| v.as_str()) == Some("function_call")
@@ -1034,6 +1137,82 @@ mod url_tests {
             provider("http://localhost:8080/openai/v1").responses_url(),
             "http://localhost:8080/openai/v1/responses"
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_schema_tests {
+    use super::LlamaCppProvider;
+
+    fn ref_tool_spec() -> zeroclaw_api::tool::ToolSpec {
+        zeroclaw_api::tool::ToolSpec {
+            name: "shell".to_string(),
+            description: "Run shell command".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "$ref": "#/$defs/Cmd" }
+                },
+                "required": ["command"],
+                "additionalProperties": false,
+                "$defs": {
+                    "Cmd": {
+                        "type": "string",
+                        "minLength": 1
+                    }
+                }
+            }),
+        }
+    }
+
+    #[test]
+    fn gemma4_sanitizes_tool_schema() {
+        let specs = vec![ref_tool_spec()];
+        let tools = LlamaCppProvider::convert_tools(Some(&specs), "gemma-4-27b-it")
+            .expect("tools should be present");
+        let params = &tools[0]["parameters"];
+
+        assert!(params.get("$defs").is_none());
+        assert!(params.get("additionalProperties").is_none());
+        assert_eq!(params["properties"]["command"]["type"], "string");
+    }
+
+    #[test]
+    fn gemma4_alias_sanitizes_tool_schema() {
+        let specs = vec![ref_tool_spec()];
+        let tools = LlamaCppProvider::convert_tools(Some(&specs), "gemma4:27b")
+            .expect("tools should be present");
+        let params = &tools[0]["parameters"];
+
+        assert!(params.get("$defs").is_none());
+        assert!(params.get("additionalProperties").is_none());
+        assert_eq!(params["properties"]["command"]["type"], "string");
+    }
+
+    #[test]
+    fn empty_model_sanitizes_tool_schema() {
+        let specs = vec![ref_tool_spec()];
+        let tools =
+            LlamaCppProvider::convert_tools(Some(&specs), "").expect("tools should be present");
+        let params = &tools[0]["parameters"];
+
+        assert!(params.get("$defs").is_none());
+        assert!(params.get("additionalProperties").is_none());
+        assert_eq!(params["properties"]["command"]["type"], "string");
+    }
+
+    #[test]
+    fn non_gemma_models_keep_openai_cleaned_tool_schema() {
+        let specs = vec![ref_tool_spec()];
+        let tools = LlamaCppProvider::convert_tools(Some(&specs), "llama-3.3-70b")
+            .expect("tools should be present");
+        let params = &tools[0]["parameters"];
+
+        let expected =
+            zeroclaw_api::schema::SchemaCleanr::clean_for_openai(specs[0].parameters.clone());
+
+        assert_eq!(params, &expected);
+        assert_eq!(params["additionalProperties"], serde_json::json!(false));
     }
 }
 
