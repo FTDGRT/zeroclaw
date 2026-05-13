@@ -103,7 +103,7 @@ cli-models-set-about = Set the default model in config
 cli-models-status-about = Show current model configuration and cache status
 
 cli-doctor-models-about = Probe model catalogs across providers and report availability
-cli-doctor-traces-about = Query runtime trace events (tool diagnostics and model replies)
+cli-doctor-traces-about = Query runtime trace events (tool diagnostics, model replies, and file observer output)
 
 cli-hardware-discover-about = Enumerate USB devices and show known boards
 cli-hardware-introspect-about = Introspect a device by its serial or device path

@@ -23,6 +23,12 @@ backend = "none"
 runtime_trace_mode = "none"
 runtime_trace_path = "state/runtime-trace.jsonl"
 runtime_trace_max_entries = 200
+file_path = "state/file-trace.jsonl"
+
+[observability.file_rotation]
+max_file_size_mb = 100
+max_age_days = 30
+max_rotated_files = 100
 
 [autonomy]
 level = "full"

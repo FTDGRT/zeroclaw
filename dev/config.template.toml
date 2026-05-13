@@ -31,3 +31,13 @@ allow_override = false
 # [cost.prices."openai/gpt-4o"]
 # input = 5.0
 # output = 15.0
+
+# Observability backend: "none" | "log" | "verbose" | "prometheus" | "otel" | "file"
+# [observability]
+# backend = "none"
+# file_path = "state/file-trace.jsonl"
+#
+# [observability.file_rotation]
+# max_file_size_mb = 100
+# max_age_days = 30
+# max_rotated_files = 100

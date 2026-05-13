@@ -133,6 +133,70 @@ Spans you'll see:
 
 Pair with Jaeger or Tempo for distributed tracing if you run multiple ZeroClaw instances or are instrumenting downstream services.
 
+## File trace backend
+
+The `file` observability backend writes structured JSONL events to a rotating file on disk. This is useful for environments without an external metrics/tracing stack — you get a persistent, greppable record of every agent lifecycle event.
+
+### Enable
+
+```toml
+[observability]
+backend = "file"
+file_path = "state/file-trace.jsonl"
+```
+
+`file_path` is resolved relative to `workspace_dir`. Absolute paths are used as-is.
+
+### File rotation
+
+Rotated files are named `<stem>.YYYY-MM-DD.<seq>.<ext>`. Rotation is triggered by both file size and natural day boundary:
+
+- **Size rotation**: when the active file reaches `max_file_size_mb`, it is renamed with the current date and a sequence number, and a new active file is created.
+- **Date rotation**: on the first write of a new day, the previous day's file is renamed with its mtime date and a sequence number.
+
+Configure the retention policy under `[observability.file_rotation]`:
+
+```toml
+[observability.file_rotation]
+max_file_size_mb = 100      # rotate when file exceeds this size (default: 100 MB)
+max_age_days = 30           # delete rotated files older than this (default: 30)
+max_rotated_files = 100     # keep at most this many rotated files (default: 100)
+```
+
+Example rotation output:
+
+```
+state/file-trace.jsonl                          ← active file
+state/file-trace.2026-05-12.1.jsonl             ← rotated by date (yesterday)
+state/file-trace.2026-05-13.1.jsonl             ← rotated by size
+state/file-trace.2026-05-13.2.jsonl             ← rotated by size again
+```
+
+### Event format
+
+Each line is a JSON object with `id`, `timestamp`, `event_type`, and a `payload` object. Example:
+
+```json
+{"id":"a1b2c3","timestamp":"2026-05-13T10:15:30+08:00","event_type":"llm.response","payload":{"duration_ms":150,"success":true,"input_tokens":100,"output_tokens":50}}
+```
+
+### Querying
+
+```bash
+# All events
+cat state/file-trace.jsonl | jq .
+
+# Failed LLM calls
+grep '"llm.response"' state/file-trace.jsonl | jq 'select(.payload.success == false)'
+
+# Tool calls sorted by duration
+grep '"tool.call"' state/file-trace.jsonl | jq -s 'sort_by(.payload.duration_ms) | reverse'
+```
+
+### Durability
+
+Writes are `sync_data()`-flushed by default (`sync_on_write = true` internally). This ensures events survive process crashes at the cost of throughput. The file observer also supports an explicit `flush()` that drains all in-flight writes before returning — used during graceful shutdown to guarantee no events are lost.
+
 ## Receipts audit log
 
 Separate from the general logs, tool receipts are written to:
