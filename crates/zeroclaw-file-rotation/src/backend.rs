@@ -132,9 +132,24 @@ pub(crate) async fn run_backend(
     let mut state = BackendState { path, config };
     let mut rx = rx;
 
-    while let Some(cmd) = rx.recv().await {
-        if !state.handle(cmd).await {
-            break;
+    loop {
+        let cmd = rx.recv().await;
+        match cmd {
+            Some(WriteCommand::Shutdown { ack }) => {
+                // Drain all remaining Append/Flush commands before shutting down,
+                // so no in-flight writes are lost.
+                while let Ok(pending) = rx.try_recv() {
+                    state.handle(pending).await;
+                }
+                let _ = ack.send(());
+                break;
+            }
+            Some(cmd) => {
+                if !state.handle(cmd).await {
+                    break;
+                }
+            }
+            None => break,
         }
     }
 }
