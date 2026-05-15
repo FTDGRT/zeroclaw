@@ -32,12 +32,12 @@ allow_override = false
 # input = 5.0
 # output = 15.0
 
-# Observability backend: "none" | "log" | "verbose" | "prometheus" | "otel" | "file"
+# Observability backend: "none" | "log" | "verbose" | "prometheus" | "otel" | "file" (upcoming)
 # [observability]
 # backend = "none"
-# file_path = "state/file-trace.jsonl"
+# file_path = "state/file-trace.jsonl"            # (upcoming — not yet parsed by zeroclaw-config)
 #
-# [observability.file_rotation]
+# [observability.file_rotation]                    # (upcoming — not yet parsed by zeroclaw-config)
 # max_file_size_mb = 100
 # max_age_days = 30
 # max_rotated_files = 100

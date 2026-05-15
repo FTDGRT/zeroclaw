@@ -76,33 +76,31 @@ pub async fn cleanup_rotated_files(
     let mut stats = CleanupStats::default();
 
     // Phase 1: Delete files older than max_age_days
-    entries.retain(|entry| {
+    let mut retained = Vec::with_capacity(entries.len());
+    for entry in entries {
         if entry.date < cutoff {
-            let size = entry.size;
-            let path = entry.path.clone();
-            // Best-effort delete; log but don't fail
-            match std::fs::remove_file(&path) {
+            match tokio::fs::remove_file(&entry.path).await {
                 Ok(()) => {
                     stats.files_deleted += 1;
-                    stats.bytes_freed += size;
-                    false
+                    stats.bytes_freed += entry.size;
                 }
                 Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "Failed to delete aged rotated file");
-                    true
+                    tracing::warn!(path = %entry.path.display(), error = %e, "Failed to delete aged rotated file");
+                    retained.push(entry);
                 }
             }
         } else {
-            true
+            retained.push(entry);
         }
-    });
+    }
+    entries = retained;
 
     // Phase 2: If still over max_rotated_files, delete oldest
     entries.sort_by_key(|e| (e.date, e.seq));
     let excess = entries.len().saturating_sub(config.max_rotated_files);
     if excess > 0 {
         for entry in entries.iter().take(excess) {
-            match std::fs::remove_file(&entry.path) {
+            match tokio::fs::remove_file(&entry.path).await {
                 Ok(()) => {
                     stats.files_deleted += 1;
                     stats.bytes_freed += entry.size;

@@ -549,10 +549,11 @@ async fn write_to_readonly_directory_data_not_persisted() {
 
     let path = readonly_dir.join("test.jsonl");
 
-    // new() may succeed (it only creates the dir parent which already exists),
-    // but writes will fail silently in the backend task
+    // Best-effort writer: new() succeeds (parent dir already exists), but the
+    // backend cannot write to the read-only directory. append()/shutdown()
+    // return Ok because the writer is best-effort — I/O failures are logged
+    // as warnings and not surfaced to callers.
     if let Ok(writer) = RotatingFileWriter::new(path.clone(), small_config()).await {
-        // The append will succeed (buffered in channel) but data won't reach disk
         let _ = writer.append(r#"{"should":"fail"}"#.to_string()).await;
         let _ = writer.shutdown().await;
     }

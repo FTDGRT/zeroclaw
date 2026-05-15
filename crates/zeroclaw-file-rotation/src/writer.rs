@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -12,6 +13,7 @@ use crate::error::{Result, RotationError};
 /// so the caller is never blocked on disk I/O.
 pub struct RotatingFileWriter {
     tx: mpsc::Sender<WriteCommand>,
+    closed: AtomicBool,
     #[allow(dead_code)]
     handle: JoinHandle<()>,
 }
@@ -36,14 +38,23 @@ impl RotatingFileWriter {
             backend::run_backend(rx, path, cfg).await;
         });
 
-        Ok(Self { tx, handle })
+        Ok(Self {
+            tx,
+            closed: AtomicBool::new(false),
+            handle,
+        })
     }
 
     /// Append a single line to the active file.
     ///
-    /// The line is sent to the background task; this method returns once
-    /// the command is buffered, not necessarily once it is on disk.
+    /// Fire-and-forget: the line is buffered in the channel and will be
+    /// processed asynchronously. This is a best-effort writer — write failures
+    /// (disk full, permission denied) in the backend are logged as warnings
+    /// but not surfaced to the caller.
     pub async fn append(&self, line: String) -> Result<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(RotationError::ChannelClosed);
+        }
         self.tx
             .send(WriteCommand::Append { line })
             .await
@@ -52,9 +63,11 @@ impl RotatingFileWriter {
 
     /// Gracefully shut down the writer.
     ///
-    /// Sends a shutdown command and waits for the background task to
-    /// flush all pending writes and exit.
+    /// Sends a shutdown command and waits for the background task to drain
+    /// all pending writes and exit. This is a best-effort writer: writes that
+    /// fail during drain are logged as warnings but not reported as errors.
     pub async fn shutdown(&self) -> Result<()> {
+        self.closed.store(true, Ordering::Relaxed);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(WriteCommand::Shutdown { ack: ack_tx })
@@ -67,10 +80,14 @@ impl RotatingFileWriter {
     ///
     /// Sends a flush command through the channel and waits for the backend
     /// task to acknowledge it. Because the channel is FIFO, the ack is only
-    /// sent after all prior `Append` commands have been processed, so the
-    /// caller can be certain that every line submitted before `flush()` is
-    /// on disk when this method returns.
+    /// sent after all prior `Append` commands have been *processed* by the
+    /// backend task. This guarantees ordering, not durability: a best-effort
+    /// writer logs individual write failures (disk full, permission denied)
+    /// as warnings but does not propagate them to the caller.
     pub async fn flush(&self) -> Result<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(RotationError::ChannelClosed);
+        }
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(WriteCommand::Flush { ack: ack_tx })

@@ -133,7 +133,9 @@ Spans you'll see:
 
 Pair with Jaeger or Tempo for distributed tracing if you run multiple ZeroClaw instances or are instrumenting downstream services.
 
-## File trace backend
+## File trace backend (upcoming)
+
+> **Not yet wired into the runtime.** The `zeroclaw-file-rotation` crate is available as a workspace dependency, but the `backend = "file"` observer path, `file_path` config field, and `[observability.file_rotation]` schema are not yet connected to `zeroclaw-config` or `zeroclaw-runtime`. The configuration and event format below reflect the crate's public API and will be enabled in a follow-up PR that adds the file observer backend and wires the `RuntimeTraceLogger` through `RotatingFileWriter`.
 
 The `file` observability backend writes structured JSONL events to a rotating file on disk. This is useful for environments without an external metrics/tracing stack — you get a persistent, greppable record of every agent lifecycle event.
 
@@ -195,7 +197,7 @@ grep '"tool.call"' state/file-trace.jsonl | jq -s 'sort_by(.payload.duration_ms)
 
 ### Durability
 
-Writes are `sync_data()`-flushed by default (`sync_on_write = true` internally). This ensures events survive process crashes at the cost of throughput. The file observer also supports an explicit `flush()` that drains all in-flight writes before returning — used during graceful shutdown to guarantee no events are lost.
+The writer is **best-effort**: `sync_data()` is called after each write by default (`sync_on_write = true`), but write failures (disk full, permission denied, failed rotation) are logged as warnings and do not propagate to callers. `flush()` and `shutdown()` guarantee that all in-flight commands have been *processed* by the backend task — they do not guarantee that every write reached disk successfully. For observability data this trade-off is appropriate: a transient I/O error should not halt the agent loop.
 
 ## Receipts audit log
 
