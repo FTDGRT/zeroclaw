@@ -88,6 +88,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
@@ -437,22 +438,25 @@ impl InFlightTaskCompletion {
 
 fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     // Include thread_ts for per-topic memory isolation in forum groups
-    match &msg.thread_ts {
+    let raw = match &msg.thread_ts {
         Some(tid) => format!("{}_{}_{}_{}", msg.channel, tid, msg.sender, msg.id),
         None => format!("{}_{}_{}", msg.channel, msg.sender, msg.id),
-    }
+    };
+    sanitize_session_key(&raw)
 }
 
 pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
-    // channels) and thread_ts for per-topic isolation in forum groups.
-    match &msg.thread_ts {
+    // Sanitize so the runtime HashMap key matches `SessionStore::list_sessions`
+    // after a restart; otherwise hydration loads sessions under the on-disk
+    // (sanitized) name while lookup keeps producing the un-sanitized form.
+    let raw = match &msg.thread_ts {
         Some(tid) => format!(
             "{}_{}_{}_{}",
             msg.channel, msg.reply_target, tid, msg.sender
         ),
         None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
-    }
+    };
+    sanitize_session_key(&raw)
 }
 
 fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
@@ -2067,14 +2071,16 @@ fn is_group_reply_target(reply_target: &str) -> bool {
     reply_target.contains("@g.us") || reply_target.starts_with("group:")
 }
 
-fn sender_memory_session_ids<'a>(
-    msg: &'a zeroclaw_api::channel::ChannelMessage,
-    history_key: &'a str,
-) -> Vec<Option<&'a str>> {
+fn sender_memory_session_ids(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    history_key: &str,
+) -> Vec<String> {
+    // Match the sanitized form persisted by memory backend migrations.
+    let sanitized_sender = sanitize_session_key(&msg.sender);
     if is_group_reply_target(&msg.reply_target) {
-        vec![Some(&msg.sender)]
+        vec![sanitized_sender]
     } else {
-        vec![Some(history_key), Some(&msg.sender)]
+        vec![history_key.to_string(), sanitized_sender]
     }
 }
 
@@ -2994,11 +3000,15 @@ async fn process_channel_message(
 
     let mem_recall_start = Instant::now();
     let sender_session_ids = sender_memory_session_ids(&msg, &history_key);
+    let sender_session_id_refs: Vec<Option<&str>> = sender_session_ids
+        .iter()
+        .map(|s| Some(s.as_str()))
+        .collect();
     let sender_memory_fut = build_memory_context_for_sessions(
         ctx.memory.as_ref(),
         &msg.content,
         ctx.min_relevance_score,
-        sender_session_ids.as_slice(),
+        sender_session_id_refs.as_slice(),
     );
 
     let (sender_memory, group_memory) = if is_group_chat {
@@ -10742,8 +10752,8 @@ BTC is currently around $65,000 based on latest tool output."#
         };
 
         let key = conversation_history_key(&msg);
-        assert!(key.contains("$root:server"));
-        assert!(!key.contains("$reply:server"));
+        assert!(key.contains("_root_server"));
+        assert!(!key.contains("_reply_server"));
     }
 
     #[test]
@@ -10868,7 +10878,10 @@ BTC is currently around $65,000 based on latest tool output."#
         .unwrap();
 
         let session_ids = sender_memory_session_ids(&msg, &history_key);
-        let context = build_memory_context_for_sessions(&mem, "quartz", 0.0, &session_ids).await;
+        let session_id_refs: Vec<Option<&str>> =
+            session_ids.iter().map(|s| Some(s.as_str())).collect();
+        let context =
+            build_memory_context_for_sessions(&mem, "quartz", 0.0, &session_id_refs).await;
 
         assert!(
             context.contains("Project codename is quartz"),
@@ -10916,10 +10929,14 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let group_b_sender_session_ids =
             sender_memory_session_ids(&group_b_msg, &group_b_history_key);
-        assert_eq!(group_b_sender_session_ids, vec![Some("U123")]);
+        assert_eq!(group_b_sender_session_ids, vec!["U123".to_string()]);
 
+        let group_b_sender_session_id_refs: Vec<Option<&str>> = group_b_sender_session_ids
+            .iter()
+            .map(|s| Some(s.as_str()))
+            .collect();
         let sender_context =
-            build_memory_context_for_sessions(&mem, "quartz", 0.0, &group_b_sender_session_ids)
+            build_memory_context_for_sessions(&mem, "quartz", 0.0, &group_b_sender_session_id_refs)
                 .await;
         let group_context =
             build_memory_context(&mem, "quartz", 0.0, Some(&group_b_history_key)).await;
@@ -10937,6 +10954,50 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             source_group_context.contains("Group alpha codename is quartz"),
             "source group scope should still recall its own autosaved memory, got: {source_group_context}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_session_ids_match_migrated_matrix_sender_rows() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let raw_sender = "@alice:server";
+        let sanitized_sender = sanitize_session_key(raw_sender);
+        assert_eq!(sanitized_sender, "_alice_server");
+
+        mem.store(
+            "alice_fact",
+            "Alice favors filtered coffee",
+            MemoryCategory::Conversation,
+            Some(sanitized_sender.as_str()),
+        )
+        .await
+        .unwrap();
+
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "evt_1".into(),
+            sender: raw_sender.into(),
+            reply_target: "!room:server".into(),
+            content: "what coffee does alice prefer?".into(),
+            channel: "matrix".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let history_key = conversation_history_key(&msg);
+        let session_ids = sender_memory_session_ids(&msg, &history_key);
+        assert!(
+            session_ids.contains(&sanitized_sender),
+            "sender session ids must include sanitized sender, got: {session_ids:?}"
+        );
+        let session_id_refs: Vec<Option<&str>> =
+            session_ids.iter().map(|s| Some(s.as_str())).collect();
+        let context =
+            build_memory_context_for_sessions(&mem, "coffee", 0.0, &session_id_refs).await;
+        assert!(
+            context.contains("Alice favors filtered coffee"),
+            "sender recall must find migrated row stored under sanitized sender, got: {context}"
         );
     }
 
