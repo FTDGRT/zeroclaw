@@ -49,7 +49,6 @@ async fn concurrent_writes_no_data_loss() {
         handles.push(tokio::spawn(async move {
             for i in 0..lines_per_task {
                 w.append(format!(r#"{{"task":{task_id},"line":{i}}}"#))
-                    .await
                     .unwrap();
             }
         }));
@@ -95,7 +94,7 @@ async fn concurrent_writes_per_task_ordering() {
     let w = writer.clone();
     tokio::spawn(async move {
         for i in 0..num_lines {
-            w.append(format!(r#"{{"seq":{i}}}"#)).await.unwrap();
+            w.append(format!(r#"{{"seq":{i}}}"#)).unwrap();
         }
     })
     .await
@@ -132,10 +131,7 @@ async fn date_rotation_rotates_old_file() {
 
     let writer = RotatingFileWriter::new(path.clone(), config).await.unwrap();
 
-    writer
-        .append(r#"{"new":"data"}"#.to_string())
-        .await
-        .unwrap();
+    writer.append(r#"{"new":"data"}"#.to_string()).unwrap();
     writer.shutdown().await.unwrap();
 
     // Old file should have been rotated to a dated name
@@ -177,7 +173,7 @@ async fn append_after_shutdown_returns_channel_closed() {
 
     writer.shutdown().await.unwrap();
 
-    let result = writer.append("should fail".to_string()).await;
+    let result = writer.append("should fail".to_string());
     assert!(
         result.is_err(),
         "Append after shutdown should return an error"
@@ -205,10 +201,7 @@ async fn drop_without_shutdown_no_panic() {
 
     {
         let writer = RotatingFileWriter::new(path.clone(), config).await.unwrap();
-        writer
-            .append(r#"{"might":"be lost"}"#.to_string())
-            .await
-            .unwrap();
+        writer.append(r#"{"might":"be lost"}"#.to_string()).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         // Drop without calling shutdown
     }
@@ -237,7 +230,6 @@ async fn size_rotation_sequence_increments() {
     for i in 0..30 {
         writer
             .append(format!("line-{i:03} padding-to-exceed-threshold"))
-            .await
             .unwrap();
     }
 
@@ -334,10 +326,7 @@ async fn writes_to_nonexistent_directory() {
         .await
         .unwrap();
 
-    writer
-        .append(r#"{"deep":"path"}"#.to_string())
-        .await
-        .unwrap();
+    writer.append(r#"{"deep":"path"}"#.to_string()).unwrap();
     writer.shutdown().await.unwrap();
 
     assert!(path.exists());
@@ -360,11 +349,8 @@ async fn empty_string_append_writes_newline() {
 
     let writer = RotatingFileWriter::new(path.clone(), config).await.unwrap();
 
-    writer.append(String::new()).await.unwrap();
-    writer
-        .append(r#"{"after":"empty"}"#.to_string())
-        .await
-        .unwrap();
+    writer.append(String::new()).unwrap();
+    writer.append(r#"{"after":"empty"}"#.to_string()).unwrap();
     writer.shutdown().await.unwrap();
 
     let contents = std::fs::read_to_string(&path).unwrap();
@@ -391,10 +377,7 @@ async fn file_permissions_applied() {
 
     let writer = RotatingFileWriter::new(path.clone(), config).await.unwrap();
 
-    writer
-        .append(r#"{"perm":"test"}"#.to_string())
-        .await
-        .unwrap();
+    writer.append(r#"{"perm":"test"}"#.to_string()).unwrap();
     writer.shutdown().await.unwrap();
 
     use std::os::unix::fs::PermissionsExt;
@@ -422,11 +405,15 @@ async fn rapid_burst_full_rotation_cycle() {
 
     let writer = RotatingFileWriter::new(path.clone(), config).await.unwrap();
 
+    let mut channel_full_count = 0u32;
     for i in 0..500 {
-        writer
-            .append(format!(r#"{{"i":{i},"padding":"x"}}"#))
-            .await
-            .unwrap();
+        match writer.append(format!(r#"{{"i":{i},"padding":"x"}}"#)) {
+            Ok(()) => {}
+            Err(zeroclaw_file_rotation::RotationError::ChannelFull) => {
+                channel_full_count += 1;
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
     }
 
     writer.shutdown().await.unwrap();
@@ -443,9 +430,14 @@ async fn rapid_burst_full_rotation_cycle() {
         })
         .sum();
 
-    assert_eq!(
-        total_lines, 500,
-        "All 500 lines must be present, no data loss"
+    let ok_count = 500 - channel_full_count as usize;
+    assert!(
+        total_lines <= ok_count,
+        "Lines on disk ({total_lines}) cannot exceed successful appends ({ok_count})"
+    );
+    assert!(
+        total_lines > 0,
+        "Best-effort writer must persist at least some lines"
     );
 }
 
@@ -507,14 +499,8 @@ async fn multiple_writers_same_directory() {
         .await
         .unwrap();
 
-    writer_a
-        .append(r#"{"service":"a"}"#.to_string())
-        .await
-        .unwrap();
-    writer_b
-        .append(r#"{"service":"b"}"#.to_string())
-        .await
-        .unwrap();
+    writer_a.append(r#"{"service":"a"}"#.to_string()).unwrap();
+    writer_b.append(r#"{"service":"b"}"#.to_string()).unwrap();
 
     writer_a.shutdown().await.unwrap();
     writer_b.shutdown().await.unwrap();
@@ -554,7 +540,7 @@ async fn write_to_readonly_directory_data_not_persisted() {
     // return Ok because the writer is best-effort — I/O failures are logged
     // as warnings and not surfaced to callers.
     if let Ok(writer) = RotatingFileWriter::new(path.clone(), small_config()).await {
-        let _ = writer.append(r#"{"should":"fail"}"#.to_string()).await;
+        let _ = writer.append(r#"{"should":"fail"}"#.to_string());
         let _ = writer.shutdown().await;
     }
 
@@ -629,7 +615,7 @@ async fn sync_on_write_data_persists() {
     let writer = RotatingFileWriter::new(path.clone(), config).await.unwrap();
 
     for i in 0..10 {
-        writer.append(format!(r#"{{"sync":{i}}}"#)).await.unwrap();
+        writer.append(format!(r#"{{"sync":{i}}}"#)).unwrap();
     }
 
     writer.shutdown().await.unwrap();
@@ -679,10 +665,7 @@ async fn date_rotation_uses_mtime_date_in_filename() {
     let yesterday_str = yesterday_date.format("%Y-%m-%d").to_string();
 
     let writer = RotatingFileWriter::new(path.clone(), config).await.unwrap();
-    writer
-        .append(r#"{"new":"data"}"#.to_string())
-        .await
-        .unwrap();
+    writer.append(r#"{"new":"data"}"#.to_string()).unwrap();
     writer.shutdown().await.unwrap();
 
     // Verify rotated file name contains yesterday's date
@@ -728,7 +711,6 @@ async fn size_rotation_uses_current_date_in_filename() {
     for i in 0..20 {
         writer
             .append(format!("size-test-{i:03} padding-to-exceed-threshold"))
-            .await
             .unwrap();
     }
     writer.shutdown().await.unwrap();
@@ -786,14 +768,12 @@ async fn date_then_size_rotation_combined() {
     // First write triggers date rotation (file mtime is yesterday)
     writer
         .append(r#"{"trigger":"date-rotation"}"#.to_string())
-        .await
         .unwrap();
 
     // Write enough to trigger size rotation on the new active file
     for i in 0..10 {
         writer
             .append(format!("fill-{i:03} padding-to-trigger-size-rotation"))
-            .await
             .unwrap();
     }
     writer.shutdown().await.unwrap();
@@ -845,7 +825,6 @@ async fn sequence_increments_across_dates() {
     for i in 0..20 {
         writer
             .append(format!("seq-test-{i:03}-padding-data-here"))
-            .await
             .unwrap();
     }
     writer.shutdown().await.unwrap();
@@ -892,17 +871,11 @@ async fn double_date_rotation_idempotent() {
     let writer = RotatingFileWriter::new(path.clone(), config).await.unwrap();
 
     // First write triggers date rotation
-    writer
-        .append(r#"{"second":"write"}"#.to_string())
-        .await
-        .unwrap();
+    writer.append(r#"{"second":"write"}"#.to_string()).unwrap();
 
     // Second write should NOT trigger another date rotation
     // (active file now has today's mtime)
-    writer
-        .append(r#"{"third":"write"}"#.to_string())
-        .await
-        .unwrap();
+    writer.append(r#"{"third":"write"}"#.to_string()).unwrap();
 
     writer.shutdown().await.unwrap();
 
@@ -930,4 +903,147 @@ async fn double_date_rotation_idempotent() {
     // Rotated file should contain old data
     let rotated_contents = std::fs::read_to_string(rotated[0].path()).unwrap();
     assert!(rotated_contents.contains(r#"{"first":"write"}"#));
+}
+
+// ── 24. Concurrent tasks preserve per-task FIFO ordering ─────────────
+
+#[tokio::test]
+async fn append_concurrent_tasks_per_task_fifo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("per_task_fifo.jsonl");
+    let config = RotationConfig {
+        max_file_size_bytes: 10 * 1024 * 1024,
+        sync_on_write: false,
+        ..Default::default()
+    };
+
+    let writer = Arc::new(RotatingFileWriter::new(path.clone(), config).await.unwrap());
+
+    let num_threads = 8;
+    let lines_per_thread = 100;
+    let mut handles = Vec::new();
+
+    for tid in 0..num_threads {
+        let w = writer.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..lines_per_thread {
+                // ChannelFull/ChannelClosed are acceptable under contention —
+                // we only verify that *written* lines maintain per-thread FIFO order.
+                let _ = w.append(format!(r#"{{"t":{tid},"i":{i}}}"#));
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    writer.shutdown().await.unwrap();
+
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+    assert!(!lines.is_empty(), "some lines must have been written");
+
+    // Verify per-thread ordering: for each thread, the "i" values must be
+    // strictly increasing (FIFO). Lines may be missing due to ChannelFull,
+    // but the ones that were written must be in order.
+    let mut per_thread: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
+    for line in &lines {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let t = v["t"].as_u64().unwrap();
+        let i = v["i"].as_u64().unwrap();
+        per_thread.entry(t).or_default().push(i);
+    }
+
+    for (tid, seq) in &per_thread {
+        for window in seq.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "thread {tid}: events out of order: {seq:?}"
+            );
+        }
+    }
+}
+
+// ── 25. append() works from a plain OS thread (no tokio runtime) ─────
+
+#[tokio::test]
+async fn append_from_non_tokio_thread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("os_thread.jsonl");
+    let config = RotationConfig {
+        max_file_size_bytes: 10 * 1024 * 1024,
+        sync_on_write: false,
+        ..Default::default()
+    };
+
+    let writer = Arc::new(RotatingFileWriter::new(path.clone(), config).await.unwrap());
+
+    let w = writer.clone();
+    std::thread::spawn(move || {
+        for i in 0..10 {
+            w.append(format!("os-thread-{i}")).unwrap();
+        }
+    })
+    .join()
+    .unwrap();
+
+    writer.shutdown().await.unwrap();
+
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 10);
+    for (i, line) in lines.iter().enumerate() {
+        assert_eq!(*line, format!("os-thread-{i}"));
+    }
+}
+
+// ── 26. Channel full returns error, not panic; writer still usable ───
+
+#[tokio::test]
+async fn append_channel_full_returns_error_not_panic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("chanfull.jsonl");
+
+    let config = RotationConfig {
+        max_file_size_bytes: 1024 * 1024,
+        sync_on_write: true,
+        ..Default::default()
+    };
+
+    let writer = RotatingFileWriter::new(path.clone(), config).await.unwrap();
+
+    // Hammer 10000 appends — some may get ChannelFull if the backend falls behind
+    let mut got_full = false;
+    for i in 0..10000 {
+        match writer.append(format!("hammer-{i}")) {
+            Ok(()) => {}
+            Err(zeroclaw_file_rotation::RotationError::ChannelFull) => {
+                got_full = true;
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    // Shutdown drains the channel — the writer must not panic or hang after ChannelFull
+    writer.shutdown().await.unwrap();
+
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        contents.lines().count() > 0,
+        "some lines must have been written"
+    );
+
+    // Verify that at least the first appended line is present, confirming the
+    // writer was functional before any ChannelFull occurred.
+    assert!(
+        contents.contains("hammer-0"),
+        "first append must have succeeded"
+    );
+
+    if got_full {
+        eprintln!("ChannelFull was observed — error variant works");
+    } else {
+        eprintln!("ChannelFull not observed (backend fast enough) — still valid");
+    }
 }

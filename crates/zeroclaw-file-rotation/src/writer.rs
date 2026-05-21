@@ -47,18 +47,20 @@ impl RotatingFileWriter {
 
     /// Append a single line to the active file.
     ///
-    /// Fire-and-forget: the line is buffered in the channel and will be
-    /// processed asynchronously. This is a best-effort writer — write failures
-    /// (disk full, permission denied) in the backend are logged as warnings
-    /// but not surfaced to the caller.
-    pub async fn append(&self, line: String) -> Result<()> {
+    /// Synchronous: the line is pushed into the channel immediately via `try_send`.
+    /// This eliminates scheduling reordering that occurred with `tokio::spawn`.
+    /// If the channel is full, returns `Err(ChannelFull)` — the event is dropped.
+    /// If the channel is closed, returns `Err(ChannelClosed)`.
+    pub fn append(&self, line: String) -> Result<()> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(RotationError::ChannelClosed);
         }
         self.tx
-            .send(WriteCommand::Append { line })
-            .await
-            .map_err(|_| RotationError::ChannelClosed)
+            .try_send(WriteCommand::Append { line })
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => RotationError::ChannelFull,
+                mpsc::error::TrySendError::Closed(_) => RotationError::ChannelClosed,
+            })
     }
 
     /// Gracefully shut down the writer.
@@ -119,7 +121,6 @@ mod tests {
 
         writer
             .append(r#"{"id":"1","event":"test"}"#.to_string())
-            .await
             .unwrap();
         writer.shutdown().await.unwrap();
 
@@ -150,7 +151,6 @@ mod tests {
         for i in 0..20 {
             writer
                 .append(format!("line-{:03} padding-to-exceed-threshold", i))
-                .await
                 .unwrap();
         }
 
@@ -198,7 +198,7 @@ mod tests {
         .unwrap();
 
         for i in 0..50 {
-            writer.append(format!("line-{i}")).await.unwrap();
+            writer.append(format!("line-{i}")).unwrap();
         }
         writer.flush().await.unwrap();
 
@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(contents.lines().count(), 50, "all 50 lines must be flushed");
 
         // Writer should still be usable after flush
-        writer.append("after-flush".to_string()).await.unwrap();
+        writer.append("after-flush".to_string()).unwrap();
         writer.shutdown().await.unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -234,14 +234,14 @@ mod tests {
         .await
         .unwrap();
 
-        writer.append("before-flush".to_string()).await.unwrap();
+        writer.append("before-flush".to_string()).unwrap();
         writer.flush().await.unwrap();
 
         // Writer must still accept appends after flush
-        writer.append("after-flush".to_string()).await.unwrap();
+        writer.append("after-flush".to_string()).unwrap();
         writer.flush().await.unwrap();
 
-        writer.append("final".to_string()).await.unwrap();
+        writer.append("final".to_string()).unwrap();
         writer.shutdown().await.unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -264,12 +264,68 @@ mod tests {
         .await
         .unwrap();
 
-        writer.append("line-1".to_string()).await.unwrap();
+        writer.append("line-1".to_string()).unwrap();
         writer.flush().await.unwrap();
-        writer.append("line-2".to_string()).await.unwrap();
+        writer.append("line-2".to_string()).unwrap();
         writer.shutdown().await.unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents.lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn append_preserves_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("order.jsonl");
+        let writer = RotatingFileWriter::new(
+            path.clone(),
+            RotationConfig {
+                max_file_size_bytes: 1024 * 1024,
+                sync_on_write: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        for i in 0..100 {
+            writer.append(format!("line-{i:03}")).unwrap();
+        }
+        writer.shutdown().await.unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 100, "all 100 lines must be present");
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(*line, format!("line-{i:03}"), "line {i} out of order");
+        }
+    }
+
+    #[tokio::test]
+    async fn append_rapid_then_shutdown_no_data_loss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rapid.jsonl");
+        let writer = RotatingFileWriter::new(
+            path.clone(),
+            RotationConfig {
+                max_file_size_bytes: 1024 * 1024,
+                sync_on_write: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        for i in 0..500 {
+            writer.append(format!("rapid-{i:03}")).unwrap();
+        }
+        writer.shutdown().await.unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 500, "all 500 lines must be present");
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(*line, format!("rapid-{i:03}"), "line {i} out of order");
+        }
     }
 }

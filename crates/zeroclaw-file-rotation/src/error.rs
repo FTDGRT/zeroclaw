@@ -12,6 +12,9 @@ pub enum RotationError {
     #[error("write channel closed")]
     ChannelClosed,
 
+    #[error("write channel full")]
+    ChannelFull,
+
     #[error("shutdown timeout")]
     ShutdownTimeout,
 }

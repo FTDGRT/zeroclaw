@@ -13296,12 +13296,13 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-file-rotation"
-version = "0.7.5"
+version = "0.8.0-beta-1"
 dependencies = [
  "anyhow",
  "chrono",
  "filetime",
  "libc",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
