@@ -85,7 +85,12 @@ pub async fn cleanup_rotated_files(
                     stats.bytes_freed += entry.size;
                 }
                 Err(e) => {
-                    tracing::warn!(path = %entry.path.display(), error = %e, "Failed to delete aged rotated file");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"path": entry.path.display().to_string(), "error": e.to_string()})),
+                        "Failed to delete aged rotated file"
+                    );
                     retained.push(entry);
                 }
             }
@@ -106,16 +111,22 @@ pub async fn cleanup_rotated_files(
                     stats.bytes_freed += entry.size;
                 }
                 Err(e) => {
-                    tracing::warn!(path = %entry.path.display(), error = %e, "Failed to delete excess rotated file");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"path": entry.path.display().to_string(), "error": e.to_string()})),
+                        "Failed to delete excess rotated file"
+                    );
                 }
             }
         }
     }
 
     if stats.files_deleted > 0 {
-        tracing::info!(
-            files_deleted = stats.files_deleted,
-            bytes_freed = stats.bytes_freed,
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"files_deleted": stats.files_deleted, "bytes_freed": stats.bytes_freed})),
             "Cleaned up rotated files"
         );
     }

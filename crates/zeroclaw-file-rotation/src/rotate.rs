@@ -86,9 +86,10 @@ pub async fn rotate_file(active_path: &Path, date: chrono::NaiveDate) -> Result<
         }
     }
 
-    tracing::debug!(
-        active = %active_path.display(),
-        rotated = %rotated_path.display(),
+    ::zeroclaw_log::record!(
+        DEBUG,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({"active": active_path.display().to_string(), "rotated": rotated_path.display().to_string()})),
         "Rotated file"
     );
 

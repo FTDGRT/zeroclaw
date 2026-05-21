@@ -33,7 +33,12 @@ impl BackendState {
         match cmd {
             WriteCommand::Append { line } => {
                 if let Err(e) = self.append_line(&line).await {
-                    tracing::warn!(error = %e, "Failed to append to rotated file");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                        "Failed to append to rotated file"
+                    );
                 }
                 true
             }
@@ -118,7 +123,12 @@ impl BackendState {
 
     async fn run_cleanup(&self, now: &chrono::DateTime<Local>) {
         if let Err(e) = cleanup_rotated_files(&self.path, &self.config, now).await {
-            tracing::warn!(error = %e, "File rotation cleanup failed");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "File rotation cleanup failed"
+            );
         }
     }
 }
