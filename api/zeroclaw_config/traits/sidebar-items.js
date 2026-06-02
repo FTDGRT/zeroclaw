@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MASKED_SECRET"],"enum":["Answer","MapKeyKind","PropKind"],"fn":["is_masked_secret"],"struct":["ChannelInfo","IntegrationDescriptor","MapKeySection","NestedOptionEntry","PropFieldInfo","SecretFieldInfo","SelectItem"],"trait":["ChannelConfig","HasPropKind","MaskSecrets","OnboardUi","SecretField"]};
