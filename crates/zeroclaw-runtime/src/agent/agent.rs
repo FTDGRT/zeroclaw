@@ -4,6 +4,7 @@ use crate::agent::dispatcher::{
 use crate::agent::eval::AutoClassifyExt;
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalRequirement, ApprovalResponse};
+use crate::observability::content_processing::ContentProcessor;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
@@ -90,6 +91,8 @@ pub struct Agent {
     /// Avoids re-reading the same image file on every turn/tool-iteration
     /// when the multimodal pipeline re-walks the full conversation history.
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
+    /// Processes LLM I/O content for observability output (redaction, truncation).
+    content_processor: ContentProcessor,
 }
 
 impl Drop for Agent {
@@ -205,6 +208,7 @@ pub struct AgentBuilder {
     approval_manager: Option<Arc<ApprovalManager>>,
     agent_alias: Option<String>,
     exclude_memory: bool,
+    content_processor: Option<ContentProcessor>,
 }
 
 impl Default for AgentBuilder {
@@ -247,6 +251,7 @@ impl AgentBuilder {
             approval_manager: None,
             agent_alias: None,
             exclude_memory: false,
+            content_processor: None,
         }
     }
 
@@ -432,6 +437,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn content_processor(mut self, processor: ContentProcessor) -> Self {
+        self.content_processor = Some(processor);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self.tools.ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -584,6 +594,11 @@ impl AgentBuilder {
             channel_handles: AgentChannelHandles::default(),
             exclude_memory,
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
+            content_processor: self.content_processor.unwrap_or_else(|| {
+                ContentProcessor::from_observability(
+                    &zeroclaw_config::schema::ObservabilityConfig::default(),
+                )
+            }),
         })
     }
 }
@@ -639,6 +654,14 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.history.clear();
+    }
+
+    fn turn_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    fn duration_ms(start: Instant) -> u64 {
+        u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     fn encode_response_cache_transcript(messages: &[ChatMessage]) -> String {
@@ -999,6 +1022,7 @@ impl Agent {
 
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
+        ::zeroclaw_log::set_observer_bridge(Arc::clone(&observer));
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         // Per-agent workspace becomes the SecurityPolicy boundary
@@ -1371,6 +1395,7 @@ impl Agent {
                 None
             })
             .approval_manager(Some(Arc::new(approval_manager)))
+            .content_processor(ContentProcessor::from_observability(&config.observability))
             .build()?;
 
         // Wire per-tool channel-map handles into the agent so callers (e.g.
@@ -1542,7 +1567,7 @@ impl Agent {
         Ok(prepared.messages)
     }
 
-    async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
+    async fn execute_tool_call(&self, call: &ParsedToolCall, turn_id: &str) -> ToolExecutionResult {
         let start = Instant::now();
 
         // ── Hook: before_tool_call (modifying) ──────────────────
@@ -1699,22 +1724,82 @@ impl Agent {
         let args_json = tool_args.to_string();
         let tool_call_id = call.tool_call_id.clone();
 
-        // Emit invoke log — visible in the TUI Logs pane.
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
-                .with_category(::zeroclaw_log::EventCategory::Tool)
-                .with_attrs(::serde_json::json!({
-                    "tool": tool_name,
-                    "tool_call_id": tool_call_id,
-                    "input": args_json,
-                })),
-            format!("tool call: {tool_name}")
-        );
+        // Emit tool_call_start record with tool name in a local scope span.
+        // We drop the guard immediately after the record! to avoid holding
+        // a !Send guard across .await points.
+        {
+            let _tool_scope = ::zeroclaw_log::__private::tracing::info_span!(
+                target: "zeroclaw_log_internal_scope",
+                "zeroclaw_scope",
+                tool = %tool_name,
+            )
+            .entered();
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::ToolCallStart)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_attrs(::serde_json::json!({
+                        "tool_call_id": tool_call_id,
+                        "arguments": args_json,
+                        "turn_id": turn_id,
+                    })),
+                "tool_call_start"
+            );
+        }
 
         // First try to find tool in static registry, then in activated MCP tools.
-        let (result, success) =
-            if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
+        let (result, success) = if let Some(tool) =
+            self.tools.iter().find(|t| t.name() == tool_name)
+        {
+            match tool.execute(tool_args.clone()).await {
+                Ok(r) => {
+                    let (outcome_text, ok) = if r.success {
+                        (r.output, true)
+                    } else {
+                        (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+                    };
+                    {
+                        let _s = ::zeroclaw_log::__private::tracing::info_span!(target: "zeroclaw_log_internal_scope", "zeroclaw_scope", tool = %tool_name).entered();
+                        ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::ToolCallResult)
+                                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                                    .with_outcome(if ok { ::zeroclaw_log::EventOutcome::Success } else { ::zeroclaw_log::EventOutcome::Failure })
+                                    .with_duration(Self::duration_ms(start))
+                                    .with_attrs(::serde_json::json!({
+                                        "tool_call_id": tool_call_id,
+                                        "result": self.content_processor.process_tool_result(&outcome_text).unwrap_or_default(),
+                                        "turn_id": turn_id,
+                                    })),
+                                "tool_call_result"
+                            );
+                    }
+                    (outcome_text, ok)
+                }
+                Err(e) => {
+                    let err_text = format!("Error executing {}: {e}", tool_name);
+                    {
+                        let _s = ::zeroclaw_log::__private::tracing::info_span!(target: "zeroclaw_log_internal_scope", "zeroclaw_scope", tool = %tool_name).entered();
+                        ::zeroclaw_log::record!(
+                                ERROR,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::ToolCallResult)
+                                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_duration(Self::duration_ms(start))
+                                    .with_attrs(::serde_json::json!({
+                                        "tool_call_id": tool_call_id,
+                                        "result": self.content_processor.process_tool_result(&err_text).unwrap_or_default(),
+                                        "turn_id": turn_id,
+                                    })),
+                                "tool_call_result"
+                            );
+                    }
+                    (err_text, false)
+                }
+            }
+        } else if let Some(activated_arc) = self.activated_tools.as_ref() {
+            let activated_opt = activated_arc.lock().unwrap().get_resolved(&tool_name);
+            if let Some(tool) = activated_opt {
                 match tool.execute(tool_args.clone()).await {
                     Ok(r) => {
                         let (outcome_text, ok) = if r.success {
@@ -1722,68 +1807,51 @@ impl Agent {
                         } else {
                             (format!("Error: {}", r.error.unwrap_or(r.output)), false)
                         };
-                        self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: tool_name.clone(),
-                            tool_call_id: tool_call_id.clone(),
-                            duration: start.elapsed(),
-                            success: ok,
-                            arguments: Some(args_json.clone()),
-                            result: Some(super::loop_::scrub_credentials(&outcome_text)),
-                        });
+                        {
+                            let _s = ::zeroclaw_log::__private::tracing::info_span!(target: "zeroclaw_log_internal_scope", "zeroclaw_scope", tool = %tool_name).entered();
+                            ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::ToolCallResult)
+                                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                                        .with_outcome(if ok { ::zeroclaw_log::EventOutcome::Success } else { ::zeroclaw_log::EventOutcome::Failure })
+                                        .with_duration(Self::duration_ms(start))
+                                        .with_attrs(::serde_json::json!({
+                                        "tool_call_id": tool_call_id,
+                                        "result": self.content_processor.process_tool_result(&outcome_text).unwrap_or_default(),
+                                        "turn_id": turn_id,
+                                    })),
+                                "tool_call_result"
+                                );
+                        }
                         (outcome_text, ok)
                     }
                     Err(e) => {
                         let err_text = format!("Error executing {}: {e}", tool_name);
-                        self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: tool_name.clone(),
-                            tool_call_id: tool_call_id.clone(),
-                            duration: start.elapsed(),
-                            success: false,
-                            arguments: Some(args_json.clone()),
-                            result: Some(super::loop_::scrub_credentials(&err_text)),
-                        });
+                        {
+                            let _s = ::zeroclaw_log::__private::tracing::info_span!(target: "zeroclaw_log_internal_scope", "zeroclaw_scope", tool = %tool_name).entered();
+                            ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::ToolCallResult)
+                                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_duration(Self::duration_ms(start))
+                                        .with_attrs(::serde_json::json!({
+                                            "tool_call_id": tool_call_id,
+                                            "result": self.content_processor.process_tool_result(&err_text).unwrap_or_default(),
+                                            "turn_id": turn_id,
+                                        })),
+                                    "tool_call_result"
+                                );
+                        }
                         (err_text, false)
                     }
                 }
-            } else if let Some(activated_arc) = self.activated_tools.as_ref() {
-                let activated_opt = activated_arc.lock().unwrap().get_resolved(&tool_name);
-                if let Some(tool) = activated_opt {
-                    match tool.execute(tool_args.clone()).await {
-                        Ok(r) => {
-                            let (outcome_text, ok) = if r.success {
-                                (r.output, true)
-                            } else {
-                                (format!("Error: {}", r.error.unwrap_or(r.output)), false)
-                            };
-                            self.observer.record_event(&ObserverEvent::ToolCall {
-                                tool: tool_name.clone(),
-                                tool_call_id: tool_call_id.clone(),
-                                duration: start.elapsed(),
-                                success: ok,
-                                arguments: Some(args_json.clone()),
-                                result: Some(super::loop_::scrub_credentials(&outcome_text)),
-                            });
-                            (outcome_text, ok)
-                        }
-                        Err(e) => {
-                            let err_text = format!("Error executing {}: {e}", tool_name);
-                            self.observer.record_event(&ObserverEvent::ToolCall {
-                                tool: tool_name.clone(),
-                                tool_call_id: tool_call_id.clone(),
-                                duration: start.elapsed(),
-                                success: false,
-                                arguments: Some(args_json.clone()),
-                                result: Some(super::loop_::scrub_credentials(&err_text)),
-                            });
-                            (err_text, false)
-                        }
-                    }
-                } else {
-                    (format!("Unknown tool: {}", tool_name), false)
-                }
             } else {
                 (format!("Unknown tool: {}", tool_name), false)
-            };
+            }
+        } else {
+            (format!("Unknown tool: {}", tool_name), false)
+        };
 
         let duration = start.elapsed();
 
@@ -1840,7 +1908,11 @@ impl Agent {
         }
     }
 
-    async fn execute_tools(&self, calls: &[ParsedToolCall]) -> Vec<ToolExecutionResult> {
+    async fn execute_tools(
+        &self,
+        calls: &[ParsedToolCall],
+        turn_id: &str,
+    ) -> Vec<ToolExecutionResult> {
         let approval_required = self.approval_manager.as_deref().is_some_and(|mgr| {
             calls
                 .iter()
@@ -1849,14 +1921,14 @@ impl Agent {
         if !self.config.resolved.parallel_tools || approval_required {
             let mut results = Vec::with_capacity(calls.len());
             for call in calls {
-                results.push(self.execute_tool_call(call).await);
+                results.push(self.execute_tool_call(call, turn_id).await);
             }
             return results;
         }
 
         let futs: Vec<_> = calls
             .iter()
-            .map(|call| self.execute_tool_call(call))
+            .map(|call| self.execute_tool_call(call, turn_id))
             .collect();
         futures_util::future::join_all(futs).await
     }
@@ -1960,6 +2032,20 @@ impl Agent {
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
         let effective_model = self.classify_model(user_message);
+        let turn_id = Self::turn_id();
+        let turn_started_at = Instant::now();
+        let user_msg_content = self.content_processor.process_user_message(user_message);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::AgentStart)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({
+                    "turn_id": turn_id,
+                    "model": self.model_name,
+                    "model_provider": self.model_provider_name,
+                })),
+            "agent_start"
+        );
 
         for _ in 0..self.config.resolved.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -2007,12 +2093,19 @@ impl Agent {
             }
 
             let llm_started_at = Instant::now();
-            self.observer.record_event(&ObserverEvent::LlmRequest {
-                model_provider: self.model_provider_name.clone(),
-                model: effective_model.clone(),
-                messages_count: messages.len(),
-            });
-
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::LlmRequest)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_attrs(::serde_json::json!({
+                        "messages_count": messages.len(),
+                        "user_message": user_msg_content,
+                        "turn_id": turn_id,
+                        "model": self.model_name,
+                        "model_provider": self.model_provider_name,
+                    })),
+                "llm_request"
+            );
             let response = match self
                 .model_provider
                 .chat(
@@ -2036,28 +2129,65 @@ impl Agent {
                         .as_ref()
                         .map(|u| (u.input_tokens, u.output_tokens))
                         .unwrap_or((None, None));
-                    self.observer.record_event(&ObserverEvent::LlmResponse {
-                        model_provider: self.model_provider_name.clone(),
-                        model: effective_model.clone(),
-                        duration: llm_started_at.elapsed(),
-                        success: true,
-                        error_message: None,
-                        input_tokens: resp_input_tokens,
-                        output_tokens: resp_output_tokens,
-                    });
+                    let resp_content = self
+                        .content_processor
+                        .process_response_content(resp.text_or_empty().as_ref());
+                    let _duration = llm_started_at.elapsed();
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::LlmResponse
+                        )
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                        .with_duration(Self::duration_ms(llm_started_at))
+                        .with_attrs(::serde_json::json!({
+                            "input_tokens": resp_input_tokens,
+                            "output_tokens": resp_output_tokens,
+                            "response_content": resp_content,
+                            "turn_id": turn_id,
+                            "model": self.model_name,
+                            "model_provider": self.model_provider_name,
+                        })),
+                        "llm_response"
+                    );
                     resp
                 }
                 Err(err) => {
                     let safe_error = zeroclaw_providers::sanitize_api_error(&err.to_string());
-                    self.observer.record_event(&ObserverEvent::LlmResponse {
-                        model_provider: self.model_provider_name.clone(),
-                        model: effective_model.clone(),
-                        duration: llm_started_at.elapsed(),
-                        success: false,
-                        error_message: Some(safe_error),
-                        input_tokens: None,
-                        output_tokens: None,
-                    });
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::LlmResponse
+                        )
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_duration(Self::duration_ms(llm_started_at))
+                        .with_attrs(::serde_json::json!({
+                            "error": safe_error,
+                            "turn_id": turn_id,
+                            "model": self.model_name,
+                            "model_provider": self.model_provider_name,
+                        })),
+                        "llm_response"
+                    );
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::AgentEnd
+                        )
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_duration(Self::duration_ms(turn_started_at))
+                        .with_attrs(::serde_json::json!({
+                            "turn_id": turn_id,
+                            "error": "llm_error",
+                        })),
+                        "agent_end"
+                    );
                     return Err(err);
                 }
             };
@@ -2086,7 +2216,16 @@ impl Agent {
                         final_text.clone(),
                     )));
                 self.trim_history();
-
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::AgentEnd)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_duration(Self::duration_ms(turn_started_at))
+                        .with_attrs(::serde_json::json!({
+                            "turn_id": turn_id,
+                        })),
+                    "agent_end"
+                );
                 return Ok(final_text);
             }
 
@@ -2101,12 +2240,24 @@ impl Agent {
                 reasoning_content: response.reasoning_content.clone(),
             });
 
-            let results = self.execute_tools(&calls).await;
+            let results = self.execute_tools(&calls, &turn_id).await;
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();
         }
 
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::AgentEnd)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_duration(Self::duration_ms(turn_started_at))
+                .with_attrs(::serde_json::json!({
+                    "turn_id": turn_id,
+                    "error": "max_tool_iterations",
+                })),
+            "agent_end"
+        );
         anyhow::bail!(
             "Agent exceeded maximum tool iterations ({})",
             self.config.resolved.max_tool_iterations
@@ -2207,7 +2358,22 @@ impl Agent {
 
         let effective_model = self.classify_model(user_message);
         let turn_started_at = std::time::Instant::now();
+        let turn_id = Self::turn_id();
+        let mut total_input_tokens: Option<u64> = None;
+        let mut total_output_tokens: Option<u64> = None;
+        let user_msg_content = self.content_processor.process_user_message(user_message);
         let mut committed_response = String::new();
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::AgentStart)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({
+                    "turn_id": turn_id,
+                    "model": self.model_name,
+                    "model_provider": self.model_provider_name,
+                })),
+            "agent_start"
+        );
 
         // ── Turn loop ──────────────────────────────────────────────────
         for _ in 0..self.config.resolved.max_tool_iterations {
@@ -2220,6 +2386,18 @@ impl Agent {
                     "[interrupted by user]".to_string(),
                     &mut new_msgs,
                     &mut committed_response,
+                );
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::AgentEnd)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_duration(Self::duration_ms(turn_started_at))
+                        .with_attrs(::serde_json::json!({
+                            "turn_id": turn_id,
+                            "error": "cancelled_by_user",
+                        })),
+                    "agent_end"
                 );
                 return Err(StreamedTurnError {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
@@ -2237,6 +2415,21 @@ impl Agent {
             let prepared_messages = match self.prepare_provider_messages(&messages).await {
                 Ok(messages) => messages,
                 Err(error) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::AgentEnd
+                        )
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_duration(Self::duration_ms(turn_started_at))
+                        .with_attrs(::serde_json::json!({
+                            "turn_id": turn_id,
+                            "error": "prepare_messages_failed",
+                        })),
+                        "agent_end"
+                    );
                     return Err(StreamedTurnError {
                         error,
                         committed_response,
@@ -2261,13 +2454,19 @@ impl Agent {
                     self.history.push(cached_msg);
                     self.trim_history();
                     self.observer.record_event(&ObserverEvent::TurnComplete);
-                    self.observer.record_event(&ObserverEvent::AgentEnd {
-                        model_provider: self.model_provider_name.clone(),
-                        model: effective_model.clone(),
-                        duration: turn_started_at.elapsed(),
-                        tokens_used: None,
-                        cost_usd: None,
-                    });
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::AgentEnd
+                        )
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_duration(Self::duration_ms(turn_started_at))
+                        .with_attrs(::serde_json::json!({
+                            "turn_id": turn_id,
+                        })),
+                        "agent_end"
+                    );
                     committed_response.push_str(&cached);
                     return Ok(StreamedTurnSuccess {
                         response: committed_response,
@@ -2307,11 +2506,19 @@ impl Agent {
             use futures_util::StreamExt;
 
             let llm_started_at = Instant::now();
-            self.observer.record_event(&ObserverEvent::LlmRequest {
-                model_provider: self.model_provider_name.clone(),
-                model: effective_model.clone(),
-                messages_count: messages.len(),
-            });
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::LlmRequest)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_attrs(::serde_json::json!({
+                        "messages_count": messages.len(),
+                        "user_message": user_msg_content,
+                        "turn_id": turn_id,
+                        "model": self.model_name,
+                        "model_provider": self.model_provider_name,
+                    })),
+                "llm_request"
+            );
 
             let stream_opts = zeroclaw_providers::traits::StreamOptions::new(
                 self.model_provider.supports_streaming(),
@@ -2456,6 +2663,58 @@ impl Agent {
                         zeroclaw_providers::traits::StreamEvent::Final => break,
                     },
                     Err(error) => {
+                        if got_stream || !committed_response.is_empty() {
+                            if !streamed_text.is_empty() {
+                                let partial = Self::marked_partial_response(
+                                    &streamed_text,
+                                    "[stream interrupted]",
+                                );
+                                self.append_streamed_assistant_message_to_history(
+                                    partial,
+                                    &mut new_msgs,
+                                    &mut committed_response,
+                                );
+                            }
+                            let safe_error =
+                                zeroclaw_providers::sanitize_api_error(&error.to_string());
+                            ::zeroclaw_log::record!(
+                                ERROR,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::LlmResponse
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Agent)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_duration(Self::duration_ms(llm_started_at))
+                                .with_attrs(::serde_json::json!({
+                                    "error": safe_error,
+                                    "turn_id": turn_id,
+                                    "model": self.model_name,
+                                    "model_provider": self.model_provider_name,
+                                })),
+                                "llm_response"
+                            );
+                            ::zeroclaw_log::record!(
+                                ERROR,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::AgentEnd
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Agent)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_duration(Self::duration_ms(turn_started_at))
+                                .with_attrs(::serde_json::json!({
+                                    "turn_id": turn_id,
+                                    "error": "stream_error",
+                                })),
+                                "agent_end"
+                            );
+                            return Err(StreamedTurnError {
+                                error: anyhow::Error::msg(error.to_string()),
+                                committed_response,
+                                new_messages: new_msgs,
+                            });
+                        }
                         stream_error = Some(error.to_string());
                         break;
                     }
@@ -2475,15 +2734,32 @@ impl Agent {
                     &mut new_msgs,
                     &mut committed_response,
                 );
-                self.observer.record_event(&ObserverEvent::LlmResponse {
-                    model_provider: self.model_provider_name.clone(),
-                    model: effective_model.clone(),
-                    duration: llm_started_at.elapsed(),
-                    success: false,
-                    error_message: Some("request cancelled by user".into()),
-                    input_tokens: None,
-                    output_tokens: None,
-                });
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::LlmResponse)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_duration(Self::duration_ms(llm_started_at))
+                        .with_attrs(::serde_json::json!({
+                            "error": "request cancelled by user",
+                            "turn_id": turn_id,
+                            "model": self.model_name,
+                            "model_provider": self.model_provider_name,
+                        })),
+                    "llm_response"
+                );
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::AgentEnd)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_duration(Self::duration_ms(turn_started_at))
+                        .with_attrs(::serde_json::json!({
+                            "turn_id": turn_id,
+                            "error": "cancelled_by_user",
+                        })),
+                    "agent_end"
+                );
                 return Err(StreamedTurnError {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
                     committed_response,
@@ -2504,15 +2780,32 @@ impl Agent {
                 let safe_error = zeroclaw_providers::sanitize_api_error(
                     stream_error.as_deref().unwrap_or_default(),
                 );
-                self.observer.record_event(&ObserverEvent::LlmResponse {
-                    model_provider: self.model_provider_name.clone(),
-                    model: effective_model.clone(),
-                    duration: llm_started_at.elapsed(),
-                    success: false,
-                    error_message: Some(safe_error),
-                    input_tokens: None,
-                    output_tokens: None,
-                });
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::LlmResponse)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_duration(Self::duration_ms(llm_started_at))
+                        .with_attrs(::serde_json::json!({
+                            "error": safe_error,
+                            "turn_id": turn_id,
+                            "model": self.model_name,
+                            "model_provider": self.model_provider_name,
+                        })),
+                    "llm_response"
+                );
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::AgentEnd)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_duration(Self::duration_ms(turn_started_at))
+                        .with_attrs(::serde_json::json!({
+                            "turn_id": turn_id,
+                            "error": "stream_error",
+                        })),
+                    "agent_end"
+                );
                 return Err(StreamedTurnError {
                     error: anyhow::Error::msg(stream_error.unwrap_or_default()),
                     committed_response,
@@ -2585,15 +2878,32 @@ impl Agent {
                                 &mut new_msgs,
                                 &mut committed_response,
                             );
-                            self.observer.record_event(&ObserverEvent::LlmResponse {
-                                model_provider: self.model_provider_name.clone(),
-                                model: effective_model.clone(),
-                                duration: llm_started_at.elapsed(),
-                                success: false,
-                                error_message: Some("request cancelled by user".into()),
-                                input_tokens: None,
-                                output_tokens: None,
-                            });
+                            ::zeroclaw_log::record!(
+                                ERROR,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::LlmResponse)
+                                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_duration(Self::duration_ms(llm_started_at))
+                                    .with_attrs(::serde_json::json!({
+                                        "error": "request cancelled by user",
+                                        "turn_id": turn_id,
+                                        "model": self.model_name,
+                                        "model_provider": self.model_provider_name,
+                                    })),
+                                "llm_response"
+                            );
+                            ::zeroclaw_log::record!(
+                                ERROR,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::AgentEnd)
+                                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_duration(Self::duration_ms(turn_started_at))
+                                    .with_attrs(::serde_json::json!({
+                                        "turn_id": turn_id,
+                                        "error": "cancelled_by_user",
+                                    })),
+                                "agent_end"
+                            );
                             return Err(StreamedTurnError {
                                 error: crate::agent::loop_::ToolLoopCancelled.into(),
                                 committed_response,
@@ -2609,15 +2919,38 @@ impl Agent {
                     Ok(resp) => resp,
                     Err(error) => {
                         let safe_error = zeroclaw_providers::sanitize_api_error(&error.to_string());
-                        self.observer.record_event(&ObserverEvent::LlmResponse {
-                            model_provider: self.model_provider_name.clone(),
-                            model: effective_model.clone(),
-                            duration: llm_started_at.elapsed(),
-                            success: false,
-                            error_message: Some(safe_error),
-                            input_tokens: None,
-                            output_tokens: None,
-                        });
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::LlmResponse
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_duration(Self::duration_ms(llm_started_at))
+                            .with_attrs(::serde_json::json!({
+                                "error": safe_error,
+                                "turn_id": turn_id,
+                                "model": self.model_name,
+                                "model_provider": self.model_provider_name,
+                            })),
+                            "llm_response"
+                        );
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::AgentEnd
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_duration(Self::duration_ms(turn_started_at))
+                            .with_attrs(::serde_json::json!({
+                                "turn_id": turn_id,
+                                "error": "llm_error",
+                            })),
+                            "agent_end"
+                        );
                         if got_stream && !streamed_text.is_empty() {
                             let partial = Self::marked_partial_response(
                                 &streamed_text,
@@ -2643,15 +2976,31 @@ impl Agent {
                 .as_ref()
                 .map(|u| (u.input_tokens, u.output_tokens))
                 .unwrap_or((None, None));
-            self.observer.record_event(&ObserverEvent::LlmResponse {
-                model_provider: self.model_provider_name.clone(),
-                model: effective_model.clone(),
-                duration: llm_started_at.elapsed(),
-                success: true,
-                error_message: None,
-                input_tokens: resp_input_tokens,
-                output_tokens: resp_output_tokens,
-            });
+            if let Some(i) = resp_input_tokens {
+                total_input_tokens = Some(total_input_tokens.unwrap_or(0).saturating_add(i));
+            }
+            if let Some(o) = resp_output_tokens {
+                total_output_tokens = Some(total_output_tokens.unwrap_or(0).saturating_add(o));
+            }
+            let resp_content = self
+                .content_processor
+                .process_response_content(response.text_or_empty().as_ref());
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::LlmResponse)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_duration(Self::duration_ms(llm_started_at))
+                    .with_attrs(::serde_json::json!({
+                        "input_tokens": resp_input_tokens,
+                        "output_tokens": resp_output_tokens,
+                        "response_content": resp_content,
+                        "turn_id": turn_id,
+                        "model": self.model_name,
+                        "model_provider": self.model_provider_name,
+                    })),
+                "llm_response"
+            );
 
             // Forward per-call token usage so the WS gateway (and any other
             // consumer) can include aggregated usage in the final done frame
@@ -2733,13 +3082,19 @@ impl Agent {
                 committed_response.push_str(&final_text);
                 self.trim_history();
                 self.observer.record_event(&ObserverEvent::TurnComplete);
-                self.observer.record_event(&ObserverEvent::AgentEnd {
-                    model_provider: self.model_provider_name.clone(),
-                    model: effective_model.clone(),
-                    duration: turn_started_at.elapsed(),
-                    tokens_used: None,
-                    cost_usd: None,
-                });
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::AgentEnd)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_duration(Self::duration_ms(turn_started_at))
+                        .with_attrs(::serde_json::json!({
+                            "input_tokens": total_input_tokens,
+                            "output_tokens": total_output_tokens,
+                            "cost_usd": null,
+                            "turn_id": turn_id,
+                        })),
+                    "agent_end"
+                );
                 return Ok(StreamedTurnSuccess {
                     response: committed_response,
                     new_messages: new_msgs,
@@ -2840,10 +3195,10 @@ impl Agent {
                                     new_messages: new_msgs,
                                 });
                             }
-                            mut r = self.execute_tools(single) => r.pop().expect("one call yields one result"),
+                            mut r = self.execute_tools(single, &turn_id) => r.pop().expect("one call yields one result"),
                         }
                     } else {
-                        self.execute_tools(single)
+                        self.execute_tools(single, &turn_id)
                             .await
                             .pop()
                             .expect("one call yields one result")
@@ -2900,10 +3255,10 @@ impl Agent {
                                 new_messages: new_msgs,
                             });
                         }
-                        results = self.execute_tools(&calls) => results,
+                        results = self.execute_tools(&calls, &turn_id) => results,
                     }
                 } else {
-                    self.execute_tools(&calls).await
+                    self.execute_tools(&calls, &turn_id).await
                 };
 
                 for result in &results {
@@ -2930,6 +3285,18 @@ impl Agent {
             self.trim_history();
         }
 
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::AgentEnd)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_duration(Self::duration_ms(turn_started_at))
+                .with_attrs(::serde_json::json!({
+                    "turn_id": turn_id,
+                    "error": "max_tool_iterations",
+                })),
+            "agent_end"
+        );
         Err(StreamedTurnError {
             error: anyhow::Error::msg(format!(
                 "Agent exceeded maximum tool iterations ({})",
@@ -3031,10 +3398,16 @@ pub async fn run(
             ),
         };
 
-    agent.observer.record_event(&ObserverEvent::AgentStart {
-        model_provider: provider_name.clone(),
-        model: model_name.clone(),
-    });
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::AgentStart)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_attrs(::serde_json::json!({
+                "model_provider": provider_name,
+                "model": model_name,
+            })),
+        "agent_start"
+    );
 
     if let Some(msg) = message {
         let response = agent.run_single(&msg).await?;
@@ -3043,13 +3416,17 @@ pub async fn run(
         agent.run_interactive().await?;
     }
 
-    agent.observer.record_event(&ObserverEvent::AgentEnd {
-        model_provider: provider_name,
-        model: model_name,
-        duration: start.elapsed(),
-        tokens_used: None,
-        cost_usd: None,
-    });
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::AgentEnd)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_duration(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .with_attrs(::serde_json::json!({
+                "model_provider": provider_name,
+                "model": model_name,
+            })),
+        "agent_end"
+    );
 
     Ok(())
 }
@@ -3336,25 +3713,6 @@ mod tests {
         fn alias(&self) -> &str {
             "StreamingSteeringModelProvider"
         }
-    }
-
-    #[derive(Default)]
-    struct CapturingObserver {
-        events: parking_lot::Mutex<Vec<ObserverEvent>>,
-    }
-
-    impl Observer for CapturingObserver {
-        fn record_event(&self, event: &ObserverEvent) {
-            self.events.lock().push(event.clone());
-        }
-        fn record_metric(&self, _metric: &ObserverMetric) {}
-        fn name(&self) -> &str {
-            "capturing"
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-        fn flush(&self) {}
     }
 
     struct MultimodalCaptureProvider {
@@ -3758,11 +4116,14 @@ mod tests {
         agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "echo".into(),
-                arguments: serde_json::json!({"message": "hi"}),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "echo".into(),
+                    arguments: serde_json::json!({"message": "hi"}),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "",
+            )
             .await;
 
         assert!(result.success);
@@ -3816,11 +4177,14 @@ mod tests {
         agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "echo".into(),
-                arguments: serde_json::json!({"message": "hi"}),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "echo".into(),
+                    arguments: serde_json::json!({"message": "hi"}),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "",
+            )
             .await;
 
         assert!(!result.success);
@@ -3875,14 +4239,17 @@ mod tests {
         agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "shell".into(),
-                arguments: serde_json::json!({
-                    "command": "touch should-not-run",
-                    "approved": true
-                }),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "touch should-not-run",
+                        "approved": true
+                    }),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "",
+            )
             .await;
 
         assert!(!result.success);
@@ -3938,14 +4305,17 @@ mod tests {
         agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "shell".into(),
-                arguments: serde_json::json!({
-                    "command": "touch should-run-after-human-approval",
-                    "approved": false
-                }),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "touch should-run-after-human-approval",
+                        "approved": false
+                    }),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "",
+            )
             .await;
 
         assert!(result.success);
@@ -4006,24 +4376,30 @@ mod tests {
         agent.channel_handles().register_channel("acp", channel);
 
         let first_result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "shell".into(),
-                arguments: serde_json::json!({
-                    "command": "touch should-run-after-always-approval",
-                    "approved": false
-                }),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "touch should-run-after-always-approval",
+                        "approved": false
+                    }),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "",
+            )
             .await;
         let second_result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "shell".into(),
-                arguments: serde_json::json!({
-                    "command": "touch should-run-from-allowlist",
-                    "approved": false
-                }),
-                tool_call_id: Some("tc2".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "touch should-run-from-allowlist",
+                        "approved": false
+                    }),
+                    tool_call_id: Some("tc2".into()),
+                },
+                "",
+            )
             .await;
 
         assert!(first_result.success);
@@ -4070,14 +4446,17 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "cron_add".into(),
-                arguments: serde_json::json!({
-                    "command": "echo should-not-be-model-approved",
-                    "approved": true
-                }),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "cron_add".into(),
+                    arguments: serde_json::json!({
+                        "command": "echo should-not-be-model-approved",
+                        "approved": true
+                    }),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "",
+            )
             .await;
 
         assert!(result.success);
@@ -6278,13 +6657,11 @@ mod tests {
             fail_after_delta_on_call: Some(1),
             delay_chat_on_call: None,
         });
-        let capturing = Arc::new(CapturingObserver::default());
-        let observer: Arc<dyn Observer> = capturing.clone();
         let mut agent = Agent::builder()
             .model_provider(model_provider)
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
-            .observer(observer)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
@@ -6302,59 +6679,6 @@ mod tests {
             "unexpected committed_response: {}",
             err.committed_response
         );
-
-        let events = capturing.events.lock();
-        let request = events
-            .iter()
-            .find(|e| matches!(e, ObserverEvent::LlmRequest { .. }))
-            .expect("LlmRequest should have been recorded");
-        let response = events
-            .iter()
-            .find(|e| matches!(e, ObserverEvent::LlmResponse { .. }))
-            .expect("LlmResponse should have been recorded");
-
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| matches!(e, ObserverEvent::LlmRequest { .. }))
-                .count(),
-            1,
-            "exactly one LlmRequest expected"
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| matches!(e, ObserverEvent::LlmResponse { .. }))
-                .count(),
-            1,
-            "exactly one LlmResponse expected"
-        );
-
-        let (
-            ObserverEvent::LlmRequest {
-                model_provider: req_provider,
-                model: req_model,
-                ..
-            },
-            ObserverEvent::LlmResponse {
-                model_provider: resp_provider,
-                model: resp_model,
-                success,
-                error_message,
-                ..
-            },
-        ) = (request, response)
-        else {
-            panic!("matched event variants should be LlmRequest and LlmResponse");
-        };
-
-        assert!(!success, "LlmResponse on stream error must be a failure");
-        assert!(
-            error_message.as_deref().is_some_and(|m| !m.is_empty()),
-            "failure LlmResponse must carry a non-empty error_message"
-        );
-        assert_eq!(req_provider, resp_provider, "provider should match");
-        assert_eq!(req_model, resp_model, "model should match");
     }
 
     #[tokio::test]
@@ -6376,13 +6700,11 @@ mod tests {
             fail_after_delta_on_call: None,
             delay_chat_on_call: None,
         });
-        let capturing = Arc::new(CapturingObserver::default());
-        let observer: Arc<dyn Observer> = capturing.clone();
         let mut agent = Agent::builder()
             .model_provider(model_provider)
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
-            .observer(observer)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
@@ -6414,60 +6736,6 @@ mod tests {
             "cancelled turn should carry the cancellation error: {}",
             err.error
         );
-
-        let events = capturing.events.lock();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| matches!(e, ObserverEvent::LlmRequest { .. }))
-                .count(),
-            1,
-            "exactly one LlmRequest expected"
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| matches!(e, ObserverEvent::LlmResponse { .. }))
-                .count(),
-            1,
-            "exactly one LlmResponse expected"
-        );
-
-        let request = events
-            .iter()
-            .find(|e| matches!(e, ObserverEvent::LlmRequest { .. }))
-            .expect("LlmRequest should have been recorded");
-        let response = events
-            .iter()
-            .find(|e| matches!(e, ObserverEvent::LlmResponse { .. }))
-            .expect("LlmResponse should have been recorded");
-
-        let (
-            ObserverEvent::LlmRequest {
-                model_provider: req_provider,
-                model: req_model,
-                ..
-            },
-            ObserverEvent::LlmResponse {
-                model_provider: resp_provider,
-                model: resp_model,
-                success,
-                error_message,
-                ..
-            },
-        ) = (request, response)
-        else {
-            panic!("matched event variants should be LlmRequest and LlmResponse");
-        };
-
-        assert!(!success, "cancellation LlmResponse must be a failure");
-        assert_eq!(
-            error_message.as_deref(),
-            Some("request cancelled by user"),
-            "cancellation LlmResponse must carry the fixed cancel message"
-        );
-        assert_eq!(req_provider, resp_provider, "provider should match");
-        assert_eq!(req_model, resp_model, "model should match");
     }
 
     // ── Skill tool registration & excluded_tools filtering ──────────

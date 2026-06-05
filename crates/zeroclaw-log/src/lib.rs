@@ -44,7 +44,7 @@ pub use broadcast::{
     subscribe, subscribe_or_install,
 };
 pub use chain::display_chain;
-pub use config::{LogConfig, ResolvedPolicy, StoragePolicy, ToolIoPolicy};
+pub use config::{LlmIoPolicy, LogConfig, ResolvedPolicy, StoragePolicy, ToolIoPolicy};
 pub use event::{
     ATTRIBUTION_FIELDS, Action, COMPOSITE_PREFIXES, Event, EventCategory, EventOutcome, LogEvent,
     Severity, ZeroclawAttribution, is_attribution_field, severity_text_from_number,

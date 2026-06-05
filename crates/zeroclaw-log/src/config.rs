@@ -18,6 +18,8 @@ pub struct LogConfig {
     pub log_tool_io: String,
     pub log_tool_io_truncate_bytes: usize,
     pub log_tool_io_denylist: Vec<String>,
+    pub log_llm_io: String,
+    pub log_llm_io_max_chars: usize,
 }
 
 impl Default for LogConfig {
@@ -29,6 +31,8 @@ impl Default for LogConfig {
             log_tool_io: "redacted".into(),
             log_tool_io_truncate_bytes: 40960,
             log_tool_io_denylist: Vec::new(),
+            log_llm_io: "off".into(),
+            log_llm_io_max_chars: 200,
         }
     }
 }
@@ -85,6 +89,28 @@ impl ToolIoPolicy {
     }
 }
 
+/// LLM input/output capture policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmIoPolicy {
+    Off,
+    Redacted,
+    Full,
+}
+
+impl LlmIoPolicy {
+    pub fn from_raw(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "full" => Self::Full,
+            "redacted" => Self::Redacted,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn captures_io(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 /// Resolved policy bundle the writer + tool-io capturers read at runtime.
 #[derive(Debug, Clone)]
 pub struct ResolvedPolicy {
@@ -132,6 +158,14 @@ mod tests {
 
     fn make_config() -> LogConfig {
         LogConfig::default()
+    }
+
+    #[test]
+    fn llm_io_policy_defaults_to_off() {
+        assert_eq!(LlmIoPolicy::from_raw(""), LlmIoPolicy::Off);
+        assert_eq!(LlmIoPolicy::from_raw("off"), LlmIoPolicy::Off);
+        assert_eq!(LlmIoPolicy::from_raw("redacted"), LlmIoPolicy::Redacted);
+        assert_eq!(LlmIoPolicy::from_raw("full"), LlmIoPolicy::Full);
     }
 
     #[test]

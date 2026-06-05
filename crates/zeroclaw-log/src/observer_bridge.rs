@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use parking_lot::RwLock;
-use zeroclaw_api::observability_traits::{Observer, ObserverEvent};
+use zeroclaw_api::observability_traits::{Observer, ObserverEvent, TurnTokenUsage};
 
 use crate::event::LogEvent;
 
@@ -58,34 +58,105 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
     let model_provider = attribution
         .get(&type_field("model_provider"))
         .or_else(|| attribution.get("model_provider"))
+        .or_else(|| {
+            event
+                .attributes
+                .get("model_provider")
+                .and_then(serde_json::Value::as_str)
+        })
         .unwrap_or_default()
         .to_string();
-    let model = attribution.get("model").unwrap_or_default().to_string();
+    let model = attribution
+        .get("model")
+        .or_else(|| {
+            event
+                .attributes
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or_default()
+        .to_string();
     let tool = attribution.get("tool").unwrap_or_default().to_string();
-    let channel = attribution.get("channel").unwrap_or_default().to_string();
+    let channel = attribution
+        .get("channel")
+        .or_else(|| attribution.get("channel_type"))
+        .unwrap_or_default()
+        .to_string();
     let duration = attribution
         .duration_ms
         .map(Duration::from_millis)
         .unwrap_or_default();
     let success = matches!(event.event.outcome.as_str(), "success");
 
+    let agent_alias = attribution
+        .get("agent_alias")
+        .or_else(|| {
+            event
+                .attributes
+                .get("agent_alias")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or_default()
+        .to_string();
+    let turn_id = event
+        .attributes
+        .get("turn_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let channel_opt = if channel.is_empty() {
+        None
+    } else {
+        Some(channel.clone())
+    };
+    let agent_alias_opt = if agent_alias.is_empty() {
+        None
+    } else {
+        Some(agent_alias)
+    };
+    let turn_id_opt = if turn_id.is_empty() {
+        None
+    } else {
+        Some(turn_id)
+    };
+
     match action {
         "agent_start" => Some(ObserverEvent::AgentStart {
             model_provider,
             model,
+            channel: channel_opt.clone(),
+            agent_alias: agent_alias_opt.clone(),
+            turn_id: turn_id_opt.clone(),
         }),
         "agent_end" => Some(ObserverEvent::AgentEnd {
             model_provider,
             model,
             duration,
-            tokens_used: event
-                .attributes
-                .get("tokens_used")
-                .and_then(serde_json::Value::as_u64),
+            tokens_used: {
+                let input = event
+                    .attributes
+                    .get("input_tokens")
+                    .and_then(serde_json::Value::as_u64);
+                let output = event
+                    .attributes
+                    .get("output_tokens")
+                    .and_then(serde_json::Value::as_u64);
+                match (input, output) {
+                    (Some(input_tokens), Some(output_tokens)) => Some(TurnTokenUsage {
+                        input_tokens,
+                        output_tokens,
+                    }),
+                    _ => None,
+                }
+            },
             cost_usd: event
                 .attributes
                 .get("cost_usd")
                 .and_then(serde_json::Value::as_f64),
+            channel: channel_opt.clone(),
+            agent_alias: agent_alias_opt.clone(),
+            turn_id: turn_id_opt.clone(),
         }),
         "llm_request" => Some(ObserverEvent::LlmRequest {
             model_provider,
@@ -95,6 +166,14 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
                 .get("messages_count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or_default() as usize,
+            user_message: event
+                .attributes
+                .get("user_message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            channel: channel_opt.clone(),
+            agent_alias: agent_alias_opt.clone(),
+            turn_id: turn_id_opt.clone(),
         }),
         "llm_response" => Some(ObserverEvent::LlmResponse {
             model_provider,
@@ -114,19 +193,53 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
                 .attributes
                 .get("output_tokens")
                 .and_then(serde_json::Value::as_u64),
+            response_content: event
+                .attributes
+                .get("response_content")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            channel: channel_opt.clone(),
+            agent_alias: agent_alias_opt.clone(),
+            turn_id: turn_id_opt.clone(),
         }),
         "tool_call_start" => Some(ObserverEvent::ToolCallStart {
             tool,
-            tool_call_id: None,
-            arguments: None,
+            tool_call_id: event
+                .attributes
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            arguments: event
+                .attributes
+                .get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            channel: channel_opt.clone(),
+            agent_alias: agent_alias_opt.clone(),
+            turn_id: turn_id_opt.clone(),
         }),
-        "tool_call" | "tool_call_result" => Some(ObserverEvent::ToolCall {
+        "tool_call_result" => Some(ObserverEvent::ToolCall {
             tool,
-            tool_call_id: None,
+            tool_call_id: event
+                .attributes
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
             duration,
             success,
-            arguments: None,
-            result: None,
+            arguments: event
+                .attributes
+                .get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            result: event
+                .attributes
+                .get("result")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            channel: channel_opt.clone(),
+            agent_alias: agent_alias_opt.clone(),
+            turn_id: turn_id_opt.clone(),
         }),
         "channel_message_inbound" => Some(ObserverEvent::ChannelMessage {
             channel,
@@ -178,6 +291,53 @@ mod tests {
     static BRIDGE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
+    fn projects_llm_request_with_attribution() {
+        let _guard = BRIDGE_LOCK.lock();
+        clear_observer_bridge();
+        let observer = Arc::new(CapturingObserver::default());
+        set_observer_bridge(observer.clone());
+
+        let mut event = LogEvent::new(Severity::Info, "llm_request", EventCategory::Agent);
+        event
+            .zeroclaw
+            .set_composite("model_provider", "anthropic.default");
+        event.zeroclaw.set("model", "claude-sonnet-4-6");
+        event.zeroclaw.set("agent_alias", "clamps");
+        event.zeroclaw.set_composite("channel", "ws.default");
+        event.attributes = serde_json::json!({
+            "messages_count": 2,
+            "user_message": "hello",
+            "turn_id": "turn-1"
+        });
+
+        forward(&event);
+
+        let projected = observer.events.lock().unwrap();
+        assert_eq!(projected.len(), 1);
+        match &projected[0] {
+            ObserverEvent::LlmRequest {
+                model_provider,
+                model,
+                user_message,
+                channel,
+                agent_alias,
+                turn_id,
+                ..
+            } => {
+                assert_eq!(model_provider, "anthropic");
+                assert_eq!(model, "claude-sonnet-4-6");
+                assert_eq!(user_message.as_deref(), Some("hello"));
+                assert_eq!(channel.as_deref(), Some("ws.default"));
+                assert_eq!(agent_alias.as_deref(), Some("clamps"));
+                assert_eq!(turn_id.as_deref(), Some("turn-1"));
+            }
+            other => panic!("expected LlmRequest, got {other:?}"),
+        }
+
+        clear_observer_bridge();
+    }
+
+    #[test]
     fn projects_llm_request() {
         let _guard = BRIDGE_LOCK.lock();
         clear_observer_bridge();
@@ -200,6 +360,7 @@ mod tests {
                 model_provider,
                 model,
                 messages_count,
+                ..
             } => {
                 assert_eq!(model_provider, "anthropic");
                 assert_eq!(model, "claude-sonnet-4-6");
@@ -218,7 +379,7 @@ mod tests {
         let observer = Arc::new(CapturingObserver::default());
         set_observer_bridge(observer.clone());
 
-        let mut event = LogEvent::new(Severity::Info, "tool_call", EventCategory::Tool);
+        let mut event = LogEvent::new(Severity::Info, "tool_call_result", EventCategory::Tool);
         event.zeroclaw.set("tool", "shell");
         event.zeroclaw.duration_ms = Some(120);
         event.set_outcome(EventOutcome::Success);
@@ -239,6 +400,41 @@ mod tests {
                 assert!(*success);
             }
             other => panic!("expected ToolCall, got {other:?}"),
+        }
+
+        clear_observer_bridge();
+    }
+
+    #[test]
+    fn projects_tool_call_start() {
+        let _guard = BRIDGE_LOCK.lock();
+        clear_observer_bridge();
+        let observer = Arc::new(CapturingObserver::default());
+        set_observer_bridge(observer.clone());
+
+        let mut event = LogEvent::new(Severity::Info, "tool_call_start", EventCategory::Tool);
+        event.zeroclaw.set("tool", "bash");
+        event.attributes = serde_json::json!({
+            "tool_call_id": "call-123",
+            "arguments": r#"{"cmd":"ls"}"#
+        });
+
+        forward(&event);
+
+        let projected = observer.events.lock().unwrap();
+        assert_eq!(projected.len(), 1);
+        match &projected[0] {
+            ObserverEvent::ToolCallStart {
+                tool,
+                tool_call_id,
+                arguments,
+                ..
+            } => {
+                assert_eq!(tool, "bash");
+                assert_eq!(tool_call_id.as_deref(), Some("call-123"));
+                assert!(arguments.as_deref().is_some());
+            }
+            other => panic!("expected ToolCallStart, got {other:?}"),
         }
 
         clear_observer_bridge();

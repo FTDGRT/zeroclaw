@@ -9058,6 +9058,18 @@ pub struct ObservabilityConfig {
     /// secret reads). Empty by default.
     #[serde(default)]
     pub log_tool_io_denylist: Vec<String>,
+
+    /// LLM I/O capture policy: "off" | "redacted" | "full".
+    /// - `off` (default): no LLM input/output content is captured.
+    /// - `redacted`: content is leak-scanned and truncated before capture.
+    /// - `full`: full content, still leak-scanned.
+    #[serde(default = "default_log_llm_io")]
+    pub log_llm_io: String,
+
+    /// Truncate captured LLM input/output at this many characters when
+    /// `log_llm_io = "redacted"`.
+    #[serde(default = "default_log_llm_io_max_chars")]
+    pub log_llm_io_max_chars: usize,
 }
 
 impl Default for ObservabilityConfig {
@@ -9073,6 +9085,8 @@ impl Default for ObservabilityConfig {
             log_tool_io: default_log_tool_io(),
             log_tool_io_truncate_bytes: default_log_tool_io_truncate_bytes(),
             log_tool_io_denylist: Vec::new(),
+            log_llm_io: default_log_llm_io(),
+            log_llm_io_max_chars: default_log_llm_io_max_chars(),
         }
     }
 }
@@ -9095,6 +9109,14 @@ fn default_log_tool_io() -> String {
 
 fn default_log_tool_io_truncate_bytes() -> usize {
     40960
+}
+
+fn default_log_llm_io() -> String {
+    "off".to_string()
+}
+
+fn default_log_llm_io_max_chars() -> usize {
+    200
 }
 
 // ── Hooks ────────────────────────────────────────────────────────
@@ -16722,6 +16744,8 @@ enabled = true
         assert_eq!(o.log_tool_io, "redacted");
         assert_eq!(o.log_tool_io_truncate_bytes, 40960);
         assert!(o.log_tool_io_denylist.is_empty());
+        assert_eq!(o.log_llm_io, "off");
+        assert_eq!(o.log_llm_io_max_chars, 200);
     }
 
     #[test]

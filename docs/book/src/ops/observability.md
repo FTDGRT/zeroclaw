@@ -35,6 +35,13 @@ log_tool_io_truncate_bytes = 8192
 # regardless of `log_tool_io`. For tools whose I/O is intrinsically sensitive.
 log_tool_io_denylist = []
 
+# LLM input/output capture policy.
+# "off"      — only model_provider/model/messages_count; no text content.
+# "redacted" — text is leak-scanned and truncated at `log_llm_io_max_chars`.
+# "full"     — text is leak-scanned; no truncation.
+log_llm_io = "off"
+log_llm_io_max_chars = 10000
+
 # OTel / Prometheus backend (independent of the JSONL log).
 backend = "none"            # "none" | "log" | "verbose" | "prometheus" | "otel"
 otel_endpoint = "http://localhost:4318"

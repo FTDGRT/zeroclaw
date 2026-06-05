@@ -1,5 +1,11 @@
 use std::time::Duration;
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TurnTokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 /// Discrete events emitted by the agent runtime for observability.
 ///
 /// Each variant represents a lifecycle event that observers can record,
@@ -12,6 +18,9 @@ pub enum ObserverEvent {
     AgentStart {
         model_provider: String,
         model: String,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A request is about to be sent to an LLM model_provider.
     ///
@@ -21,6 +30,10 @@ pub enum ObserverEvent {
         model_provider: String,
         model: String,
         messages_count: usize,
+        user_message: Option<String>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// Result of a single LLM model_provider call.
     LlmResponse {
@@ -31,6 +44,10 @@ pub enum ObserverEvent {
         error_message: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        response_content: Option<String>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// The agent session has finished.
     ///
@@ -39,8 +56,11 @@ pub enum ObserverEvent {
         model_provider: String,
         model: String,
         duration: Duration,
-        tokens_used: Option<u64>,
+        tokens_used: Option<TurnTokenUsage>,
         cost_usd: Option<f64>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A tool call is about to be executed.
     ToolCallStart {
@@ -56,6 +76,9 @@ pub enum ObserverEvent {
         /// Full JSON arguments the agent passed to the tool. `None` when
         /// arguments are unavailable at the call site.
         arguments: Option<String>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A tool call has completed with a success/failure outcome.
     ToolCall {
@@ -77,6 +100,9 @@ pub enum ObserverEvent {
         /// in trace viewers. Credentials are scrubbed before this field is
         /// emitted.
         result: Option<String>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
@@ -286,6 +312,9 @@ mod tests {
             success: true,
             arguments: Some(r#"{"command":"date"}"#.into()),
             result: Some("Mon Apr 22 12:00:00 UTC 2026\n".into()),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
 

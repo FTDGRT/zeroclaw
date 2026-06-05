@@ -189,6 +189,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
             zeroclaw_runtime::observability::ObserverEvent::AgentStart {
                 model_provider,
                 model,
+                ..
             } => {
                 serde_json::json!({
                     "type": "agent_start",
@@ -203,15 +204,21 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 duration,
                 tokens_used,
                 cost_usd,
-            } => serde_json::json!({
-                "type": "agent_end",
-                "model_provider": model_provider,
-                "model": model,
-                "duration_ms": duration.as_millis(),
-                "tokens_used": tokens_used,
-                "cost_usd": cost_usd,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }),
+                ..
+            } => {
+                let tokens_total = tokens_used
+                    .as_ref()
+                    .map(|usage| usage.input_tokens.saturating_add(usage.output_tokens));
+                serde_json::json!({
+                    "type": "agent_end",
+                    "model_provider": model_provider,
+                    "model": model,
+                    "duration_ms": duration.as_millis(),
+                    "tokens_used": tokens_total,
+                    "cost_usd": cost_usd,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                })
+            }
             _ => return, // Skip events we don't broadcast
         };
 
@@ -235,6 +242,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::observability_traits::TurnTokenUsage;
     use zeroclaw_runtime::observability::{Observer, ObserverEvent};
 
     fn make_broadcast() -> (
@@ -259,6 +267,9 @@ mod tests {
             success: true,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         let value = rx.try_recv().expect("event should be broadcast");
@@ -279,6 +290,9 @@ mod tests {
             tool: "mcp_filesystem__read_file".into(),
             tool_call_id: None,
             arguments: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         let value = rx.try_recv().expect("event should be broadcast");
@@ -347,6 +361,9 @@ mod tests {
             success: true,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         let value = rx

@@ -1,3 +1,4 @@
+pub mod content_processing;
 pub mod dora;
 pub mod log;
 pub mod multi;

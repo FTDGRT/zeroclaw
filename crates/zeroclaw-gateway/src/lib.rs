@@ -74,6 +74,7 @@ use uuid::Uuid;
     feature = "channel-whatsapp-cloud"
 ))]
 use zeroclaw_api::channel::{Channel, SendMessage};
+use zeroclaw_api::observability_traits::TurnTokenUsage;
 use zeroclaw_api::tool::ToolSpec;
 #[cfg(feature = "channel-email")]
 use zeroclaw_channels::gmail_push::GmailPushChannel;
@@ -2400,6 +2401,9 @@ async fn handle_webhook(
         &zeroclaw_runtime::observability::ObserverEvent::AgentStart {
             model_provider: provider_label.clone(),
             model: model_label.clone(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         },
     );
     state.observer.record_event(
@@ -2407,6 +2411,10 @@ async fn handle_webhook(
             model_provider: provider_label.clone(),
             model: model_label.clone(),
             messages_count: 1,
+            user_message: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         },
     );
 
@@ -2424,9 +2432,22 @@ async fn handle_webhook(
             // /api/cost and costs.jsonl via the same scope.
             let tokens_used = input_tokens
                 .zip(output_tokens)
-                .map(|(i, o)| i + o)
-                .or(input_tokens)
-                .or(output_tokens);
+                .map(|(i, o)| TurnTokenUsage {
+                    input_tokens: i,
+                    output_tokens: o,
+                })
+                .or_else(|| {
+                    input_tokens.map(|i| TurnTokenUsage {
+                        input_tokens: i,
+                        output_tokens: 0,
+                    })
+                })
+                .or_else(|| {
+                    output_tokens.map(|o| TurnTokenUsage {
+                        input_tokens: 0,
+                        output_tokens: o,
+                    })
+                });
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
                     model_provider: provider_label.clone(),
@@ -2436,6 +2457,10 @@ async fn handle_webhook(
                     error_message: None,
                     input_tokens: None,
                     output_tokens: None,
+                    response_content: None,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
             state.observer.record_metric(
@@ -2448,6 +2473,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used,
                     cost_usd,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
 
@@ -2467,6 +2495,10 @@ async fn handle_webhook(
                     error_message: Some(sanitized.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    response_content: None,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
             state.observer.record_metric(
@@ -2485,6 +2517,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used: None,
                     cost_usd: None,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
 

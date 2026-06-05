@@ -20,6 +20,8 @@ fn to_log_config(config: &zeroclaw_config::schema::ObservabilityConfig) -> zeroc
         log_tool_io: config.log_tool_io.clone(),
         log_tool_io_truncate_bytes: config.log_tool_io_truncate_bytes,
         log_tool_io_denylist: config.log_tool_io_denylist.clone(),
+        log_llm_io: config.log_llm_io.clone(),
+        log_llm_io_max_chars: config.log_llm_io_max_chars,
     }
 }
 

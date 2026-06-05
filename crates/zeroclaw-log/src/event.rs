@@ -441,6 +441,12 @@ pub enum Action {
     Migrate,
     Validate,
     Note,
+    AgentStart,
+    AgentEnd,
+    LlmRequest,
+    LlmResponse,
+    ToolCallStart,
+    ToolCallResult,
 }
 
 impl Action {

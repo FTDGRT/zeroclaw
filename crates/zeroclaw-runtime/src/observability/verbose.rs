@@ -26,6 +26,7 @@ impl Observer for VerboseObserver {
                 model_provider,
                 model,
                 messages_count,
+                ..
             } => {
                 eprintln!("> Thinking");
                 eprintln!(
@@ -87,6 +88,10 @@ mod tests {
             model_provider: "openrouter".into(),
             model: "claude".into(),
             messages_count: 3,
+            user_message: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "openrouter".into(),
@@ -96,11 +101,18 @@ mod tests {
             error_message: None,
             input_tokens: Some(50),
             output_tokens: Some(25),
+            response_content: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),
             tool_call_id: None,
             arguments: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
@@ -109,6 +121,9 @@ mod tests {
             success: true,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
     }

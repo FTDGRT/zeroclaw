@@ -4164,6 +4164,9 @@ async fn process_channel_message_body(
                         ctx.observer.record_event(&ObserverEvent::AgentStart {
                             model_provider: route.model_provider.clone(),
                             model: route.model.clone(),
+                            channel: None,
+                            agent_alias: None,
+                            turn_id: None,
                         });
 
                         continue;
@@ -14135,6 +14138,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 tool: "file_write".to_string(),
                 tool_call_id: None,
                 arguments: Some(payload),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
             },
         );
 

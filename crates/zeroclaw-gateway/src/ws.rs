@@ -486,6 +486,7 @@ async fn handle_socket(
                         &pending_approvals,
                         &content,
                         &session_key,
+                        &agent_alias,
                     )
                     .await;
                 }
@@ -627,6 +628,7 @@ async fn handle_socket(
                     &pending_approvals,
                     &content,
                     &session_key,
+                    &agent_alias,
                 )
                 .await;
             }
@@ -764,6 +766,7 @@ async fn process_chat_message(
     pending_approvals: &PendingApprovals,
     content: &str,
     session_key: &str,
+    _agent_alias: &str,
 ) {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
