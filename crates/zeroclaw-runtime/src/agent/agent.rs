@@ -648,6 +648,18 @@ impl Agent {
         AgentBuilder::new()
     }
 
+    fn new_turn_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    fn observer_agent_alias(&self) -> Option<String> {
+        if self.agent_alias.is_empty() {
+            None
+        } else {
+            Some(self.agent_alias.clone())
+        }
+    }
+
     pub fn history(&self) -> &[ConversationMessage] {
         &self.history
     }
@@ -1631,7 +1643,7 @@ impl Agent {
         Ok(prepared.messages)
     }
 
-    async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
+    async fn execute_tool_call(&self, call: &ParsedToolCall, turn_id: &str) -> ToolExecutionResult {
         let start = Instant::now();
 
         // ── Hook: before_tool_call (modifying) ──────────────────
@@ -1818,6 +1830,9 @@ impl Agent {
                             success: ok,
                             arguments: Some(args_json.clone()),
                             result: Some(super::loop_::scrub_credentials(&outcome_text)),
+                            channel: None,
+                            agent_alias: self.observer_agent_alias(),
+                            turn_id: Some(turn_id.to_string()),
                         });
                         (outcome_text, ok)
                     }
@@ -1830,6 +1845,9 @@ impl Agent {
                             success: false,
                             arguments: Some(args_json.clone()),
                             result: Some(super::loop_::scrub_credentials(&err_text)),
+                            channel: None,
+                            agent_alias: self.observer_agent_alias(),
+                            turn_id: Some(turn_id.to_string()),
                         });
                         (err_text, false)
                     }
@@ -1851,6 +1869,9 @@ impl Agent {
                                 success: ok,
                                 arguments: Some(args_json.clone()),
                                 result: Some(super::loop_::scrub_credentials(&outcome_text)),
+                                channel: None,
+                                agent_alias: self.observer_agent_alias(),
+                                turn_id: Some(turn_id.to_string()),
                             });
                             (outcome_text, ok)
                         }
@@ -1863,6 +1884,9 @@ impl Agent {
                                 success: false,
                                 arguments: Some(args_json.clone()),
                                 result: Some(super::loop_::scrub_credentials(&err_text)),
+                                channel: None,
+                                agent_alias: self.observer_agent_alias(),
+                                turn_id: Some(turn_id.to_string()),
                             });
                             (err_text, false)
                         }
@@ -1929,7 +1953,11 @@ impl Agent {
         }
     }
 
-    async fn execute_tools(&self, calls: &[ParsedToolCall]) -> Vec<ToolExecutionResult> {
+    async fn execute_tools(
+        &self,
+        calls: &[ParsedToolCall],
+        turn_id: &str,
+    ) -> Vec<ToolExecutionResult> {
         let approval_required = self.approval_manager.as_deref().is_some_and(|mgr| {
             calls
                 .iter()
@@ -1938,14 +1966,14 @@ impl Agent {
         if !self.config.resolved.parallel_tools || approval_required {
             let mut results = Vec::with_capacity(calls.len());
             for call in calls {
-                results.push(self.execute_tool_call(call).await);
+                results.push(self.execute_tool_call(call, turn_id).await);
             }
             return results;
         }
 
         let futs: Vec<_> = calls
             .iter()
-            .map(|call| self.execute_tool_call(call))
+            .map(|call| self.execute_tool_call(call, turn_id))
             .collect();
         futures_util::future::join_all(futs).await
     }
@@ -2050,6 +2078,20 @@ impl Agent {
 
         let effective_model = self.classify_model(user_message);
 
+        let turn_id = Self::new_turn_id();
+        let turn_started_at = Instant::now();
+        let mut total_input_tokens: u64 = 0;
+        let mut total_output_tokens: u64 = 0;
+        let mut saw_usage = false;
+
+        self.observer.record_event(&ObserverEvent::AgentStart {
+            model_provider: self.model_provider_name.clone(),
+            model: effective_model.clone(),
+            channel: None,
+            agent_alias: self.observer_agent_alias(),
+            turn_id: Some(turn_id.clone()),
+        });
+
         for _ in 0..self.config.resolved.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let prepared_messages = self.prepare_provider_messages(&messages).await?;
@@ -2100,6 +2142,9 @@ impl Agent {
                 model_provider: self.model_provider_name.clone(),
                 model: effective_model.clone(),
                 messages_count: messages.len(),
+                channel: None,
+                agent_alias: self.observer_agent_alias(),
+                turn_id: Some(turn_id.clone()),
             });
 
             let response = match self
@@ -2125,6 +2170,14 @@ impl Agent {
                         .as_ref()
                         .map(|u| (u.input_tokens, u.output_tokens))
                         .unwrap_or((None, None));
+                    if let Some(input) = resp_input_tokens {
+                        total_input_tokens = total_input_tokens.saturating_add(input);
+                        saw_usage = true;
+                    }
+                    if let Some(output) = resp_output_tokens {
+                        total_output_tokens = total_output_tokens.saturating_add(output);
+                        saw_usage = true;
+                    }
                     self.observer.record_event(&ObserverEvent::LlmResponse {
                         model_provider: self.model_provider_name.clone(),
                         model: effective_model.clone(),
@@ -2133,6 +2186,9 @@ impl Agent {
                         error_message: None,
                         input_tokens: resp_input_tokens,
                         output_tokens: resp_output_tokens,
+                        channel: None,
+                        agent_alias: self.observer_agent_alias(),
+                        turn_id: Some(turn_id.clone()),
                     });
                     resp
                 }
@@ -2146,6 +2202,24 @@ impl Agent {
                         error_message: Some(safe_error),
                         input_tokens: None,
                         output_tokens: None,
+                        channel: None,
+                        agent_alias: self.observer_agent_alias(),
+                        turn_id: Some(turn_id.clone()),
+                    });
+                    self.observer.record_event(&ObserverEvent::AgentEnd {
+                        model_provider: self.model_provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: turn_started_at.elapsed(),
+                        tokens_used: saw_usage.then_some(
+                            zeroclaw_api::observability_traits::TurnTokenUsage {
+                                input_tokens: total_input_tokens,
+                                output_tokens: total_output_tokens,
+                            },
+                        ),
+                        cost_usd: None,
+                        channel: None,
+                        agent_alias: self.observer_agent_alias(),
+                        turn_id: Some(turn_id.clone()),
                     });
                     return Err(err);
                 }
@@ -2176,6 +2250,22 @@ impl Agent {
                     )));
                 self.trim_history();
 
+                self.observer.record_event(&ObserverEvent::AgentEnd {
+                    model_provider: self.model_provider_name.clone(),
+                    model: effective_model.clone(),
+                    duration: turn_started_at.elapsed(),
+                    tokens_used: saw_usage.then_some(
+                        zeroclaw_api::observability_traits::TurnTokenUsage {
+                            input_tokens: total_input_tokens,
+                            output_tokens: total_output_tokens,
+                        },
+                    ),
+                    cost_usd: None,
+                    channel: None,
+                    agent_alias: self.observer_agent_alias(),
+                    turn_id: Some(turn_id.clone()),
+                });
+
                 return Ok(final_text);
             }
 
@@ -2190,11 +2280,25 @@ impl Agent {
                 reasoning_content: response.reasoning_content.clone(),
             });
 
-            let results = self.execute_tools(&calls).await;
+            let results = self.execute_tools(&calls, &turn_id).await;
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();
         }
+
+        self.observer.record_event(&ObserverEvent::AgentEnd {
+            model_provider: self.model_provider_name.clone(),
+            model: effective_model.clone(),
+            duration: turn_started_at.elapsed(),
+            tokens_used: saw_usage.then_some(zeroclaw_api::observability_traits::TurnTokenUsage {
+                input_tokens: total_input_tokens,
+                output_tokens: total_output_tokens,
+            }),
+            cost_usd: None,
+            channel: None,
+            agent_alias: self.observer_agent_alias(),
+            turn_id: Some(turn_id.clone()),
+        });
 
         anyhow::bail!(
             "Agent exceeded maximum tool iterations ({})",
@@ -2296,7 +2400,19 @@ impl Agent {
 
         let effective_model = self.classify_model(user_message);
         let turn_started_at = std::time::Instant::now();
+        let turn_id = Self::new_turn_id();
+        let mut total_input_tokens: u64 = 0;
+        let mut total_output_tokens: u64 = 0;
+        let mut saw_usage = false;
         let mut committed_response = String::new();
+
+        self.observer.record_event(&ObserverEvent::AgentStart {
+            model_provider: self.model_provider_name.clone(),
+            model: effective_model.clone(),
+            channel: None,
+            agent_alias: self.observer_agent_alias(),
+            turn_id: Some(turn_id.clone()),
+        });
 
         // ── Turn loop ──────────────────────────────────────────────────
         for _ in 0..self.config.resolved.max_tool_iterations {
@@ -2310,6 +2426,16 @@ impl Agent {
                     &mut new_msgs,
                     &mut committed_response,
                 );
+                self.observer.record_event(&ObserverEvent::AgentEnd {
+                    model_provider: self.model_provider_name.clone(),
+                    model: effective_model.clone(),
+                    duration: turn_started_at.elapsed(),
+                    tokens_used: None,
+                    cost_usd: None,
+                    channel: None,
+                    agent_alias: self.observer_agent_alias(),
+                    turn_id: Some(turn_id.clone()),
+                });
                 return Err(StreamedTurnError {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
                     committed_response,
@@ -2326,6 +2452,16 @@ impl Agent {
             let prepared_messages = match self.prepare_provider_messages(&messages).await {
                 Ok(messages) => messages,
                 Err(error) => {
+                    self.observer.record_event(&ObserverEvent::AgentEnd {
+                        model_provider: self.model_provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: turn_started_at.elapsed(),
+                        tokens_used: None,
+                        cost_usd: None,
+                        channel: None,
+                        agent_alias: self.observer_agent_alias(),
+                        turn_id: Some(turn_id.clone()),
+                    });
                     return Err(StreamedTurnError {
                         error,
                         committed_response,
@@ -2356,6 +2492,9 @@ impl Agent {
                         duration: turn_started_at.elapsed(),
                         tokens_used: None,
                         cost_usd: None,
+                        channel: None,
+                        agent_alias: self.observer_agent_alias(),
+                        turn_id: Some(turn_id.clone()),
                     });
                     committed_response.push_str(&cached);
                     return Ok(StreamedTurnSuccess {
@@ -2400,6 +2539,9 @@ impl Agent {
                 model_provider: self.model_provider_name.clone(),
                 model: effective_model.clone(),
                 messages_count: messages.len(),
+                channel: None,
+                agent_alias: self.observer_agent_alias(),
+                turn_id: Some(turn_id.clone()),
             });
 
             let stream_opts = zeroclaw_providers::traits::StreamOptions::new(
@@ -2572,6 +2714,19 @@ impl Agent {
                     error_message: Some("request cancelled by user".into()),
                     input_tokens: None,
                     output_tokens: None,
+                    channel: None,
+                    agent_alias: self.observer_agent_alias(),
+                    turn_id: Some(turn_id.clone()),
+                });
+                self.observer.record_event(&ObserverEvent::AgentEnd {
+                    model_provider: self.model_provider_name.clone(),
+                    model: effective_model.clone(),
+                    duration: turn_started_at.elapsed(),
+                    tokens_used: None,
+                    cost_usd: None,
+                    channel: None,
+                    agent_alias: self.observer_agent_alias(),
+                    turn_id: Some(turn_id.clone()),
                 });
                 return Err(StreamedTurnError {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
@@ -2601,6 +2756,19 @@ impl Agent {
                     error_message: Some(safe_error),
                     input_tokens: None,
                     output_tokens: None,
+                    channel: None,
+                    agent_alias: self.observer_agent_alias(),
+                    turn_id: Some(turn_id.clone()),
+                });
+                self.observer.record_event(&ObserverEvent::AgentEnd {
+                    model_provider: self.model_provider_name.clone(),
+                    model: effective_model.clone(),
+                    duration: turn_started_at.elapsed(),
+                    tokens_used: None,
+                    cost_usd: None,
+                    channel: None,
+                    agent_alias: self.observer_agent_alias(),
+                    turn_id: Some(turn_id.clone()),
                 });
                 return Err(StreamedTurnError {
                     error: anyhow::Error::msg(stream_error.unwrap_or_default()),
@@ -2682,6 +2850,19 @@ impl Agent {
                                 error_message: Some("request cancelled by user".into()),
                                 input_tokens: None,
                                 output_tokens: None,
+                                channel: None,
+                                agent_alias: self.observer_agent_alias(),
+                                turn_id: Some(turn_id.clone()),
+                            });
+                            self.observer.record_event(&ObserverEvent::AgentEnd {
+                                model_provider: self.model_provider_name.clone(),
+                                model: effective_model.clone(),
+                                duration: turn_started_at.elapsed(),
+                                tokens_used: None,
+                                cost_usd: None,
+                                channel: None,
+                                agent_alias: self.observer_agent_alias(),
+                                turn_id: Some(turn_id.clone()),
                             });
                             return Err(StreamedTurnError {
                                 error: crate::agent::loop_::ToolLoopCancelled.into(),
@@ -2706,6 +2887,19 @@ impl Agent {
                             error_message: Some(safe_error),
                             input_tokens: None,
                             output_tokens: None,
+                            channel: None,
+                            agent_alias: self.observer_agent_alias(),
+                            turn_id: Some(turn_id.clone()),
+                        });
+                        self.observer.record_event(&ObserverEvent::AgentEnd {
+                            model_provider: self.model_provider_name.clone(),
+                            model: effective_model.clone(),
+                            duration: turn_started_at.elapsed(),
+                            tokens_used: None,
+                            cost_usd: None,
+                            channel: None,
+                            agent_alias: self.observer_agent_alias(),
+                            turn_id: Some(turn_id.clone()),
                         });
                         if got_stream && !streamed_text.is_empty() {
                             let partial = Self::marked_partial_response(
@@ -2732,6 +2926,14 @@ impl Agent {
                 .as_ref()
                 .map(|u| (u.input_tokens, u.output_tokens))
                 .unwrap_or((None, None));
+            if let Some(input) = resp_input_tokens {
+                total_input_tokens = total_input_tokens.saturating_add(input);
+                saw_usage = true;
+            }
+            if let Some(output) = resp_output_tokens {
+                total_output_tokens = total_output_tokens.saturating_add(output);
+                saw_usage = true;
+            }
             self.observer.record_event(&ObserverEvent::LlmResponse {
                 model_provider: self.model_provider_name.clone(),
                 model: effective_model.clone(),
@@ -2740,6 +2942,9 @@ impl Agent {
                 error_message: None,
                 input_tokens: resp_input_tokens,
                 output_tokens: resp_output_tokens,
+                channel: None,
+                agent_alias: self.observer_agent_alias(),
+                turn_id: Some(turn_id.clone()),
             });
 
             // Forward per-call token usage so the WS gateway (and any other
@@ -2826,8 +3031,16 @@ impl Agent {
                     model_provider: self.model_provider_name.clone(),
                     model: effective_model.clone(),
                     duration: turn_started_at.elapsed(),
-                    tokens_used: None,
+                    tokens_used: saw_usage.then_some(
+                        zeroclaw_api::observability_traits::TurnTokenUsage {
+                            input_tokens: total_input_tokens,
+                            output_tokens: total_output_tokens,
+                        },
+                    ),
                     cost_usd: None,
+                    channel: None,
+                    agent_alias: self.observer_agent_alias(),
+                    turn_id: Some(turn_id.clone()),
                 });
                 return Ok(StreamedTurnSuccess {
                     response: committed_response,
@@ -2929,10 +3142,10 @@ impl Agent {
                                     new_messages: new_msgs,
                                 });
                             }
-                            mut r = self.execute_tools(single) => r.pop().expect("one call yields one result"),
+                            mut r = self.execute_tools(single, &turn_id) => r.pop().expect("one call yields one result"),
                         }
                     } else {
-                        self.execute_tools(single)
+                        self.execute_tools(single, &turn_id)
                             .await
                             .pop()
                             .expect("one call yields one result")
@@ -2989,10 +3202,10 @@ impl Agent {
                                 new_messages: new_msgs,
                             });
                         }
-                        results = self.execute_tools(&calls) => results,
+                        results = self.execute_tools(&calls, &turn_id) => results,
                     }
                 } else {
-                    self.execute_tools(&calls).await
+                    self.execute_tools(&calls, &turn_id).await
                 };
 
                 for result in &results {
@@ -3018,6 +3231,20 @@ impl Agent {
             self.history.push(formatted);
             self.trim_history();
         }
+
+        self.observer.record_event(&ObserverEvent::AgentEnd {
+            model_provider: self.model_provider_name.clone(),
+            model: effective_model.clone(),
+            duration: turn_started_at.elapsed(),
+            tokens_used: saw_usage.then_some(zeroclaw_api::observability_traits::TurnTokenUsage {
+                input_tokens: total_input_tokens,
+                output_tokens: total_output_tokens,
+            }),
+            cost_usd: None,
+            channel: None,
+            agent_alias: self.observer_agent_alias(),
+            turn_id: Some(turn_id.clone()),
+        });
 
         Err(StreamedTurnError {
             error: anyhow::Error::msg(format!(
@@ -3123,6 +3350,9 @@ pub async fn run(
     agent.observer.record_event(&ObserverEvent::AgentStart {
         model_provider: provider_name.clone(),
         model: model_name.clone(),
+        channel: None,
+        agent_alias: None,
+        turn_id: None,
     });
 
     if let Some(msg) = message {
@@ -3138,6 +3368,9 @@ pub async fn run(
         duration: start.elapsed(),
         tokens_used: None,
         cost_usd: None,
+        channel: None,
+        agent_alias: None,
+        turn_id: None,
     });
 
     Ok(())
@@ -3871,11 +4104,14 @@ mod tests {
         agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "echo".into(),
-                arguments: serde_json::json!({"message": "hi"}),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "echo".into(),
+                    arguments: serde_json::json!({"message": "hi"}),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "test-turn",
+            )
             .await;
 
         assert!(result.success);
@@ -3929,11 +4165,14 @@ mod tests {
         agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "echo".into(),
-                arguments: serde_json::json!({"message": "hi"}),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "echo".into(),
+                    arguments: serde_json::json!({"message": "hi"}),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "test-turn",
+            )
             .await;
 
         assert!(!result.success);
@@ -3988,14 +4227,17 @@ mod tests {
         agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "shell".into(),
-                arguments: serde_json::json!({
-                    "command": "touch should-not-run",
-                    "approved": true
-                }),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "touch should-not-run",
+                        "approved": true
+                    }),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "test-turn",
+            )
             .await;
 
         assert!(!result.success);
@@ -4051,14 +4293,17 @@ mod tests {
         agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "shell".into(),
-                arguments: serde_json::json!({
-                    "command": "touch should-run-after-human-approval",
-                    "approved": false
-                }),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "touch should-run-after-human-approval",
+                        "approved": false
+                    }),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "test-turn",
+            )
             .await;
 
         assert!(result.success);
@@ -4119,24 +4364,30 @@ mod tests {
         agent.channel_handles().register_channel("acp", channel);
 
         let first_result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "shell".into(),
-                arguments: serde_json::json!({
-                    "command": "touch should-run-after-always-approval",
-                    "approved": false
-                }),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "touch should-run-after-always-approval",
+                        "approved": false
+                    }),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "test-turn",
+            )
             .await;
         let second_result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "shell".into(),
-                arguments: serde_json::json!({
-                    "command": "touch should-run-from-allowlist",
-                    "approved": false
-                }),
-                tool_call_id: Some("tc2".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "shell".into(),
+                    arguments: serde_json::json!({
+                        "command": "touch should-run-from-allowlist",
+                        "approved": false
+                    }),
+                    tool_call_id: Some("tc2".into()),
+                },
+                "test-turn",
+            )
             .await;
 
         assert!(first_result.success);
@@ -4183,14 +4434,17 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         let result = agent
-            .execute_tool_call(&ParsedToolCall {
-                name: "cron_add".into(),
-                arguments: serde_json::json!({
-                    "command": "echo should-not-be-model-approved",
-                    "approved": true
-                }),
-                tool_call_id: Some("tc1".into()),
-            })
+            .execute_tool_call(
+                &ParsedToolCall {
+                    name: "cron_add".into(),
+                    arguments: serde_json::json!({
+                        "command": "echo should-not-be-model-approved",
+                        "approved": true
+                    }),
+                    tool_call_id: Some("tc1".into()),
+                },
+                "test-turn",
+            )
             .await;
 
         assert!(result.success);
@@ -7181,6 +7435,60 @@ mod tests {
         assert_eq!(
             names,
             &["file_read", "web_fetch", "ops__deploy", "ops__rollback"]
+        );
+    }
+
+    fn observer_event_turn_id(event: &ObserverEvent) -> Option<&str> {
+        match event {
+            ObserverEvent::AgentStart { turn_id, .. }
+            | ObserverEvent::LlmRequest { turn_id, .. }
+            | ObserverEvent::LlmResponse { turn_id, .. }
+            | ObserverEvent::AgentEnd { turn_id, .. }
+            | ObserverEvent::ToolCall { turn_id, .. } => turn_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_events_share_consistent_turn_id() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        });
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let _ = agent.turn("test").await.expect("turn should succeed");
+
+        let events = capturing.events.lock();
+        let turn_ids: Vec<&str> = events.iter().filter_map(observer_event_turn_id).collect();
+        assert!(!turn_ids.is_empty(), "turn events should carry turn_id");
+        let first = turn_ids[0];
+        assert!(
+            turn_ids.iter().all(|turn_id| *turn_id == first),
+            "all turn_ids should be consistent"
         );
     }
 }
