@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["Section"],"fn":["run","section_for_path"],"mod":["field_visibility","ui"],"struct":["FieldDefault","Flags"],"type":["Target"]};
