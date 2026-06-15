@@ -37,7 +37,7 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-ed87d4d2.js";
+            window.path_to_searchindex_js = "../searchindex-dae946b9.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-fe037fc1.js"></script>
@@ -323,7 +323,7 @@
 <li>The tool checks two guards in order:
 <ul>
 <li><strong>Depth-1 cap.</strong> If the calling run was itself a SubAgent (<code>AgentRunOverrides.is_subagent == true</code>), refuse with <code>"spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)"</code>. SubAgents cannot recurse.</li>
-<li><strong><code>risk_profile.allowed_tools</code> gate.</strong> If the parent’s <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code> does not list <code>spawn_subagent</code>, or <code>excluded_tools</code> lists it, refuse with a message naming the parent alias.</li>
+<li><strong>Risk-profile tool gate.</strong> If the parent’s <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code> is non-empty and does not list <code>spawn_subagent</code>, or <code>excluded_tools</code> lists it, refuse with a message naming the parent alias.</li>
 </ul>
 </li>
 <li>The tool calls <code>SubAgentSpawn::for_agent</code> + <code>build</code>. Failures (unknown parent alias, escalating override) surface as <code>ToolResult { success: false, error: "subagent spawn failed: ..." }</code>.</li>
@@ -367,7 +367,7 @@
 </ol>
 <h2 id="how-a-user-makes-one-fire"><a class="header" href="#how-a-user-makes-one-fire">How a user makes one fire</a></h2>
 <p>You don’t call these tools yourself; the bot does, from inside its turn. As a user, you influence the bot’s choice with how you phrase the request. There is no special command, no slash-syntax, and no JSON the user types. Whether the model picks <code>spawn_subagent</code> or <code>delegate</code> depends on its system prompt, the tool’s <code>description</code> text (visible to the model), and the user’s wording. <strong>Phrasing influences; it does not force.</strong></p>
-<p>What CAN be made deterministic is <strong>availability</strong>: tools that aren’t in the parent agent’s registry can’t be picked. That gate lives in <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code>. If the alias listed for the parent agent’s <code>risk_profile</code> doesn’t include <code>spawn_subagent</code>, the model never sees it. Same for <code>delegate</code>. Restart the daemon after editing the config.</p>
+<p>What CAN be made deterministic is <strong>availability</strong>: tools that aren’t in the parent agent’s registry can’t be picked. The risk-profile gate lives in <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code> and <code>[risk_profiles.&lt;alias&gt;].excluded_tools</code>. A non-empty <code>allowed_tools</code> list must include <code>spawn_subagent</code> or <code>delegate</code> for the model to see that tool; an empty <code>allowed_tools</code> list leaves tool availability unrestricted unless <code>excluded_tools</code> names the tool. Restart the daemon after editing the config.</p>
 <p>What’s verifiable end-to-end:</p>
 <ol>
 <li>The literal output strings the tool returns to the model on each path (success, refusal, failure). Quoted verbatim below, sourced from <code>tools/spawn_subagent.rs</code> and <code>tools/delegate.rs</code>.</li>
@@ -384,7 +384,7 @@
 <ol>
 <li>Empty/missing <code>prompt</code> argument: <code>Missing or empty 'prompt' parameter</code></li>
 <li>Caller is itself a SubAgent (depth-1 cap): <code>spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)</code></li>
-<li>Parent’s <code>risk_profile.allowed_tools</code> excludes <code>spawn_subagent</code>: <code>spawn_subagent: refused — agent '&lt;parent_alias&gt;' risk_profile does not list spawn_subagent in allowed_tools</code></li>
+<li>Parent’s risk-profile tool gate excludes <code>spawn_subagent</code>: <code>spawn_subagent: refused — agent '&lt;parent_alias&gt;' risk_profile does not list spawn_subagent in allowed_tools</code></li>
 <li>Unknown parent alias / spawn build error: <code>subagent spawn failed: &lt;wrapped error&gt;</code></li>
 <li>Child run returned an error: <code>subagent run failed: &lt;wrapped error&gt;</code></li>
 </ol>
@@ -419,6 +419,15 @@
 <p>The advertised roster (the <code>agent</code> parameter’s enum in the tool schema) lists exactly this reachable set, and only when <code>delegation_policy.mode = "allow"</code>. Disabled agents (<code>enabled = false</code>) are never reachable, whether as same-profile peers or explicit <code>delegates</code> entries.</p>
 <p>In agentic delegation the sub-agent’s tools are drawn from the caller’s already-policy-filtered registry, intersected with the target’s own <code>allowed_tools</code>. An <strong>empty</strong> <code>allowed_tools</code> on the target means “inherit”: the sub-agent runs with the caller’s full delegatable registry rather than being rejected. A non-empty list intersects with that registry. Either way the caller’s registry is the ceiling: a cross-profile target whose risk profile names a tool the caller was never granted does not receive it. This is the invariant that keeps <code>ensure_no_escalation_beyond</code> (which does not itself diff tool allowlists) sufficient, since the target can never exceed the caller’s tool surface.</p>
 <p>Depth is capped per the parent’s <code>runtime_profile.max_delegation_depth</code>. Set it to <code>1</code> to allow the top agent a single delegation hop with no further sub-delegation.</p>
+<h4 id="agentic-target-tool-policy"><a class="header" href="#agentic-target-tool-policy">Agentic target tool policy</a></h4>
+<p>If the target agent’s <code>[runtime_profiles.&lt;target&gt;].agentic = true</code>, <code>delegate</code> builds the target sub-loop’s tool registry from the parent’s available tools. The target risk profile then filters that inherited registry:</p>
+<ol>
+<li>A configured empty <code>[risk_profiles.&lt;target_profile&gt;].allowed_tools</code> list leaves the inherited parent registry unrestricted.</li>
+<li>A non-empty <code>allowed_tools</code> list keeps only exact matching tool names.</li>
+<li><code>[risk_profiles.&lt;target_profile&gt;].excluded_tools</code> always subtracts from the result.</li>
+<li><code>delegate</code> is always removed from the child registry so agentic delegation cannot recurse through another <code>delegate</code> call.</li>
+</ol>
+<p>This policy lives on the target, not the caller. Same-profile peers use the shared risk profile, while explicit cross-profile delegates use the target’s risk profile after the non-escalation check. A missing target risk profile refuses before the sub-loop starts; a configured profile that filters the inherited registry down to zero executable tools refuses with the output strings below.</p>
 <h3 id="delegate-output-strings-the-model-sees"><a class="header" href="#delegate-output-strings-the-model-sees"><code>delegate</code>: output strings the model sees</a></h3>
 <p>Exact, sourced from <code>crates/zeroclaw-runtime/src/tools/delegate.rs</code>.</p>
 <ol>
@@ -436,6 +445,15 @@ The result file lives at <code>&lt;workspace&gt;/delegate_results/&lt;uuid&gt;.j
 <li>Unknown target agent: error is <code>Unknown agent '&lt;target&gt;'. Available agents: &lt;comma-separated list&gt;</code>.</li>
 <li>Depth exceeded (controlled by the parent’s <code>runtime_profile.max_delegation_depth</code>, default 3): error is <code>Delegation depth limit reached (&lt;depth&gt;/&lt;max&gt;).</code></li>
 <li>Unknown action: error is <code>Unknown action '&lt;value&gt;'. Use delegate/check_result/list_results/cancel_task.</code></li>
+<li>Agentic target with a missing target risk profile: error is <code>Agent '&lt;target&gt;' is agentic but risk_profile '&lt;target_profile&gt;' is not configured</code>.</li>
+<li>Agentic target with no executable child tools: error begins with <code>Agent '&lt;target&gt;' has no executable tools</code>, then names the filtering case:
+<ul>
+<li><code>available from parent registry</code> when no allowlist or denylist applies but no non-<code>delegate</code> parent tools are available.</li>
+<li><code>after filtering allowlist (&lt;comma-separated names&gt;)</code> when a non-empty <code>allowed_tools</code> list leaves no executable tools.</li>
+<li><code>after filtering denylist (&lt;comma-separated names&gt;)</code> when <code>excluded_tools</code> removes every inherited executable tool.</li>
+<li><code>after filtering allowlist (&lt;comma-separated names&gt;) and denylist (&lt;comma-separated names&gt;)</code> when both gates combine to leave no executable tools.</li>
+</ul>
+</li>
 </ol>
 <h3 id="delegate-how-to-verify-it-actually-fired"><a class="header" href="#delegate-how-to-verify-it-actually-fired"><code>delegate</code>: how to verify it actually fired</a></h3>
 <p><code>delegate</code> does not emit a dedicated tracing span today. The signal is the <strong>target</strong> agent’s loop appearing in the log, which inherits whatever scope the parent’s tool-call dispatch was inside. Background-mode spawns are easier to verify out-of-band: the result file <code>&lt;workspace&gt;/delegate_results/&lt;uuid&gt;.json</code> exists on disk and carries the target agent’s <code>status</code> + <code>output</code> fields; <code>cat</code> or <code>jq</code> works without touching the log at all.</p>
@@ -458,7 +476,7 @@ The result file lives at <code>&lt;workspace&gt;/delegate_results/&lt;uuid&gt;.j
 <tr><td><strong>Spawn depth</strong></td><td>Hard cap at 1</td><td>Up to <code>runtime_profile.max_delegation_depth</code> (default 3)</td></tr>
 <tr><td><strong>Background mode</strong></td><td>Not supported</td><td><code>background: true</code> returns a <code>task_id</code></td></tr>
 <tr><td><strong>Parallel fan-out</strong></td><td>No built-in argument; multiple calls in one turn run concurrently when <code>parallel_tools = true</code></td><td><code>parallel: [...]</code> runs multiple targets concurrently</td></tr>
-<tr><td><strong>Gating</strong></td><td><code>risk_profile.allowed_tools</code> must list <code>spawn_subagent</code></td><td><code>allowed_tools</code> must list <code>delegate</code>, caller’s <code>delegation_policy mode = "allow"</code>, and the target is in the caller’s reachable set (same-profile peer or explicit <code>delegates</code> entry)</td></tr>
+<tr><td><strong>Gating</strong></td><td>Non-empty <code>risk_profile.allowed_tools</code> must list <code>spawn_subagent</code>; <code>excluded_tools</code> must not list it</td><td>The caller’s non-empty <code>risk_profile.allowed_tools</code> must list <code>delegate</code>; <code>excluded_tools</code> must not list it; caller’s <code>delegation_policy mode = "allow"</code>; and the target is in the caller’s reachable set (same-profile peer or explicit <code>delegates</code> entry)</td></tr>
 <tr><td><strong>Use when</strong></td><td>Internal subtask that should stay within the same identity</td><td>Want a different specialist (different model, different alias) to handle the task, on the same trust tier or an explicitly-allowed stricter/cross-profile one</td></tr>
 </tbody>
 </table>

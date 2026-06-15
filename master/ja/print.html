@@ -38,7 +38,7 @@
             const path_to_root = "";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "searchindex-189fd2cb.js";
+            window.path_to_searchindex_js = "searchindex-0472d35f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-35fdbf2d.js"></script>
@@ -7223,7 +7223,7 @@ web/dist directory.
 <li>ツールは2つのガードを順番にチェックします:
 <ul>
 <li><strong>深さ1の上限。</strong> 呼び出し元の実行自体がSubAgentであった場合（<code>AgentRunOverrides.is_subagent == true</code>）、<code>"spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)"</code>を返して拒否します。SubAgentは再帰できません。</li>
-<li><strong><code>risk_profile.allowed_tools</code> ゲート。</strong> 親の <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code> に <code>spawn_subagent</code> が含まれていない場合、または <code>excluded_tools</code> に含まれている場合は、親のエイリアス名を示すメッセージとともに拒否します。</li>
+<li><strong>Risk-profile tool gate.</strong> If the parent’s <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code> is non-empty and does not list <code>spawn_subagent</code>, or <code>excluded_tools</code> lists it, refuse with a message naming the parent alias.</li>
 </ul>
 </li>
 <li>ツールは <code>SubAgentSpawn::for_agent</code> と <code>build</code> を呼び出します。失敗（不明な親エイリアス、エスカレートするオーバーライド）は <code>ToolResult { success: false, error: "subagent spawn failed: ..." }</code> として返されます。</li>
@@ -7266,7 +7266,7 @@ web/dist directory.
 </ol>
 <h2 id="ユーザーが発火させる方法"><a class="header" href="#ユーザーが発火させる方法">ユーザーが発火させる方法</a></h2>
 <p>これらのツールを自分で呼び出すことはありません。ボットがそのターン内で呼び出します。ユーザーとしては、リクエストの言い回しによってボットの選択に影響を与えます。特別なコマンドも、スラッシュ構文も、ユーザーが入力する JSON もありません。モデルが <code>spawn_subagent</code> を選ぶか <code>delegate</code> を選ぶかは、システムプロンプト、ツールの <code>description</code> テキスト（モデルから見えるもの）、そしてユーザーの言い回しによって決まります。<strong>言い回しは影響を与えるものであり、強制するものではありません。</strong></p>
-<p>決定論的にできるのは<strong>可用性</strong>です。親エージェントのレジストリにないツールは選択できません。そのゲートは <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code> にあります。親エージェントの <code>risk_profile</code> に記載されたエイリアスに <code>spawn_subagent</code> が含まれていなければ、モデルがそれを見ることはありません。<code>delegate</code> についても同様です。設定を編集した後はデーモンを再起動してください。</p>
+<p>What CAN be made deterministic is <strong>availability</strong>: tools that aren’t in the parent agent’s registry can’t be picked. The risk-profile gate lives in <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code> and <code>[risk_profiles.&lt;alias&gt;].excluded_tools</code>. A non-empty <code>allowed_tools</code> list must include <code>spawn_subagent</code> or <code>delegate</code> for the model to see that tool; an empty <code>allowed_tools</code> list leaves tool availability unrestricted unless <code>excluded_tools</code> names the tool. Restart the daemon after editing the config.</p>
 <p>検証可能なエンドツーエンドの範囲:</p>
 <ol>
 <li>ツールが各パス（成功、拒否、失敗）でモデルに返すリテラル出力文字列。以下に逐語的に引用、<code>tools/spawn_subagent.rs</code> および <code>tools/delegate.rs</code> から取得。</li>
@@ -7283,7 +7283,7 @@ web/dist directory.
 <ol>
 <li>空または欠落した <code>prompt</code> 引数: <code>Missing or empty 'prompt' parameter</code></li>
 <li>呼び出し元自体が SubAgent の場合 (深さ 1 の上限): <code>spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)</code></li>
-<li>親の <code>risk_profile.allowed_tools</code> が <code>spawn_subagent</code> を除外しています: <code>spawn_subagent: refused — agent '&lt;parent_alias&gt;' risk_profile does not list spawn_subagent in allowed_tools</code></li>
+<li>Parent’s risk-profile tool gate excludes <code>spawn_subagent</code>: <code>spawn_subagent: refused — agent '&lt;parent_alias&gt;' risk_profile does not list spawn_subagent in allowed_tools</code></li>
 <li>不明な親エイリアス / spawn ビルドエラー: <code>subagent spawn failed: &lt;wrapped error&gt;</code></li>
 <li>子の実行がエラーを返しました: <code>subagent run failed: &lt;wrapped error&gt;</code></li>
 </ol>
@@ -7318,6 +7318,15 @@ When the target is outside that set the refusal is:</li>
 <p>The advertised roster (the <code>agent</code> parameter’s enum in the tool schema) lists exactly this reachable set, and only when <code>delegation_policy.mode = "allow"</code>. Disabled agents (<code>enabled = false</code>) are never reachable, whether as same-profile peers or explicit <code>delegates</code> entries.</p>
 <p>In agentic delegation the sub-agent’s tools are drawn from the caller’s already-policy-filtered registry, intersected with the target’s own <code>allowed_tools</code>. An <strong>empty</strong> <code>allowed_tools</code> on the target means “inherit”: the sub-agent runs with the caller’s full delegatable registry rather than being rejected. A non-empty list intersects with that registry. Either way the caller’s registry is the ceiling: a cross-profile target whose risk profile names a tool the caller was never granted does not receive it. This is the invariant that keeps <code>ensure_no_escalation_beyond</code> (which does not itself diff tool allowlists) sufficient, since the target can never exceed the caller’s tool surface.</p>
 <p>Depth is capped per the parent’s <code>runtime_profile.max_delegation_depth</code>. Set it to <code>1</code> to allow the top agent a single delegation hop with no further sub-delegation.</p>
+<h4 id="agentic-target-tool-policy"><a class="header" href="#agentic-target-tool-policy">Agentic target tool policy</a></h4>
+<p>If the target agent’s <code>[runtime_profiles.&lt;target&gt;].agentic = true</code>, <code>delegate</code> builds the target sub-loop’s tool registry from the parent’s available tools. The target risk profile then filters that inherited registry:</p>
+<ol>
+<li>A configured empty <code>[risk_profiles.&lt;target_profile&gt;].allowed_tools</code> list leaves the inherited parent registry unrestricted.</li>
+<li>A non-empty <code>allowed_tools</code> list keeps only exact matching tool names.</li>
+<li><code>[risk_profiles.&lt;target_profile&gt;].excluded_tools</code> always subtracts from the result.</li>
+<li><code>delegate</code> is always removed from the child registry so agentic delegation cannot recurse through another <code>delegate</code> call.</li>
+</ol>
+<p>This policy lives on the target, not the caller. Same-profile peers use the shared risk profile, while explicit cross-profile delegates use the target’s risk profile after the non-escalation check. A missing target risk profile refuses before the sub-loop starts; a configured profile that filters the inherited registry down to zero executable tools refuses with the output strings below.</p>
 <h3 id="delegate-モデルが参照する出力文字列"><a class="header" href="#delegate-モデルが参照する出力文字列"><code>delegate</code>: モデルが参照する出力文字列</a></h3>
 <p>正確、ソースは <code>crates/zeroclaw-runtime/src/tools/delegate.rs</code> です。</p>
 <ol>
@@ -7353,6 +7362,18 @@ Use action='check_result' with task_id='&lt;uuid&gt;' to retrieve the result.
 <li>
 <p>Unknown action: エラーは <code>Unknown action '&lt;value&gt;'. Use delegate/check_result/list_results/cancel_task.</code> です。</p>
 </li>
+<li>
+<p>Agentic target with a missing target risk profile: error is <code>Agent '&lt;target&gt;' is agentic but risk_profile '&lt;target_profile&gt;' is not configured</code>.</p>
+</li>
+<li>
+<p>Agentic target with no executable child tools: error begins with <code>Agent '&lt;target&gt;' has no executable tools</code>, then names the filtering case:</p>
+<ul>
+<li><code>available from parent registry</code> when no allowlist or denylist applies but no non-<code>delegate</code> parent tools are available.</li>
+<li><code>after filtering allowlist (&lt;comma-separated names&gt;)</code> when a non-empty <code>allowed_tools</code> list leaves no executable tools.</li>
+<li><code>after filtering denylist (&lt;comma-separated names&gt;)</code> when <code>excluded_tools</code> removes every inherited executable tool.</li>
+<li><code>after filtering allowlist (&lt;comma-separated names&gt;) and denylist (&lt;comma-separated names&gt;)</code> when both gates combine to leave no executable tools.</li>
+</ul>
+</li>
 </ol>
 <h3 id="delegate-実際に発火したかを確認する方法"><a class="header" href="#delegate-実際に発火したかを確認する方法"><code>delegate</code>: 実際に発火したかを確認する方法</a></h3>
 <p><code>delegate</code> は現在、専用のトレーシングスパンを出力しません。シグナルとなるのは、ログ上に現れる<strong>ターゲット</strong>エージェントのループであり、これは親のツール呼び出しディスパッチが属していたスコープを継承します。バックグラウンドモードのスポーンは帯域外で検証する方が簡単です。結果ファイル <code>&lt;workspace&gt;/delegate_results/&lt;uuid&gt;.json</code> がディスク上に存在し、ターゲットエージェントの <code>status</code> + <code>output</code> フィールドを保持します。<code>cat</code> や <code>jq</code> を使えば、ログにまったく触れることなく確認できます。</p>
@@ -7375,7 +7396,7 @@ Use action='check_result' with task_id='&lt;uuid&gt;' to retrieve the result.
 <tr><td><strong>スポーン深度</strong></td><td>1での上限制限</td><td>最大 <code>runtime_profile.max_delegation_depth</code>（デフォルト 3）</td></tr>
 <tr><td><strong>バックグラウンドモード</strong></td><td>非対応</td><td><code>background: true</code> は <code>task_id</code> を返します</td></tr>
 <tr><td><strong>並列ファンアウト</strong></td><td>組み込み引数なし。<code>parallel_tools = true</code> の場合、1ターン内の複数呼び出しは並行して実行されます</td><td><code>parallel: [...]</code> は複数のターゲットを並行して実行します</td></tr>
-<tr><td><strong>ゲーティング</strong></td><td><code>risk_profile.allowed_tools</code> には <code>spawn_subagent</code> を列挙する必要があります</td><td><code>allowed_tools</code> must list <code>delegate</code>, caller’s <code>delegation_policy mode = "allow"</code>, and the target is in the caller’s reachable set (same-profile peer or explicit <code>delegates</code> entry)</td></tr>
+<tr><td><strong>ゲーティング</strong></td><td>Non-empty <code>risk_profile.allowed_tools</code> must list <code>spawn_subagent</code>; <code>excluded_tools</code> must not list it</td><td>The caller’s non-empty <code>risk_profile.allowed_tools</code> must list <code>delegate</code>; <code>excluded_tools</code> must not list it; caller’s <code>delegation_policy mode = "allow"</code>; and the target is in the caller’s reachable set (same-profile peer or explicit <code>delegates</code> entry)</td></tr>
 <tr><td><strong>使用する場面</strong></td><td>同一のアイデンティティ内に留まるべき内部サブタスク</td><td>Want a different specialist (different model, different alias) to handle the task, on the same trust tier or an explicitly-allowed stricter/cross-profile one</td></tr>
 </tbody>
 </table>

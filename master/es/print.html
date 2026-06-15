@@ -38,7 +38,7 @@
             const path_to_root = "";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "searchindex-1a17e275.js";
+            window.path_to_searchindex_js = "searchindex-a71202cd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a6bafbbc.js"></script>
@@ -7223,7 +7223,7 @@ web/dist directory.
 <li>La herramienta comprueba dos guardas en orden:
 <ul>
 <li><strong>Límite de profundidad 1.</strong> Si la ejecución que realiza la llamada era en sí misma un SubAgent (<code>AgentRunOverrides.is_subagent == true</code>), rechaza con <code>"spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)"</code>. Los SubAgents no pueden hacer recursión.</li>
-<li><strong>Compuerta de <code>risk_profile.allowed_tools</code>.</strong> Si el <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code> del elemento principal no incluye <code>spawn_subagent</code>, o si <code>excluded_tools</code> lo incluye, rechaza la operación con un mensaje que indique el alias del elemento principal.</li>
+<li><strong>Risk-profile tool gate.</strong> If the parent’s <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code> is non-empty and does not list <code>spawn_subagent</code>, or <code>excluded_tools</code> lists it, refuse with a message naming the parent alias.</li>
 </ul>
 </li>
 <li>La herramienta llama a <code>SubAgentSpawn::for_agent</code> + <code>build</code>. Los fallos (alias de padre desconocido, anulación de escalado) se manifiestan como <code>ToolResult { success: false, error: "subagent spawn failed: ..." }</code>.</li>
@@ -7266,7 +7266,7 @@ web/dist directory.
 </ol>
 <h2 id="cómo-un-usuario-activa-uno"><a class="header" href="#cómo-un-usuario-activa-uno">Cómo un usuario activa uno</a></h2>
 <p>Tú no llamas estas herramientas directamente; lo hace el bot, desde dentro de su turno. Como usuario, influyes en la elección del bot según cómo formules la solicitud. No hay ningún comando especial, ni sintaxis de barra, ni JSON que el usuario escriba. Que el modelo elija <code>spawn_subagent</code> o <code>delegate</code> depende de su prompt del sistema, del texto de <code>description</code> de la herramienta (visible para el modelo) y de la redacción del usuario. <strong>La formulación influye; no obliga.</strong></p>
-<p>Lo que SÍ puede hacerse determinista es la <strong>disponibilidad</strong>: las herramientas que no están en el registro del agente padre no pueden seleccionarse. Esa restricción reside en <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code>. Si el alias indicado para el <code>risk_profile</code> del agente padre no incluye <code>spawn_subagent</code>, el modelo nunca lo verá. Lo mismo ocurre con <code>delegate</code>. Reinicia el daemon después de editar la configuración.</p>
+<p>What CAN be made deterministic is <strong>availability</strong>: tools that aren’t in the parent agent’s registry can’t be picked. The risk-profile gate lives in <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code> and <code>[risk_profiles.&lt;alias&gt;].excluded_tools</code>. A non-empty <code>allowed_tools</code> list must include <code>spawn_subagent</code> or <code>delegate</code> for the model to see that tool; an empty <code>allowed_tools</code> list leaves tool availability unrestricted unless <code>excluded_tools</code> names the tool. Restart the daemon after editing the config.</p>
 <p>Lo que es verificable de extremo a extremo:</p>
 <ol>
 <li>Las cadenas de salida literales que la herramienta devuelve al modelo en cada ruta (éxito, rechazo, error). Citadas textualmente a continuación, obtenidas de <code>tools/spawn_subagent.rs</code> y <code>tools/delegate.rs</code>.</li>
@@ -7283,7 +7283,7 @@ web/dist directory.
 <ol>
 <li>Argumento <code>prompt</code> vacío o ausente: <code>Missing or empty 'prompt' parameter</code></li>
 <li>Caller is itself a SubAgent (depth-1 cap): <code>spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)</code></li>
-<li>Los <code>risk_profile.allowed_tools</code> del agente padre excluyen <code>spawn_subagent</code>: <code>spawn_subagent: refused — agent '&lt;parent_alias&gt;' risk_profile does not list spawn_subagent in allowed_tools</code></li>
+<li>Parent’s risk-profile tool gate excludes <code>spawn_subagent</code>: <code>spawn_subagent: refused — agent '&lt;parent_alias&gt;' risk_profile does not list spawn_subagent in allowed_tools</code></li>
 <li>Error de alias padre desconocido / spawn build: <code>subagent spawn failed: &lt;wrapped error&gt;</code></li>
 <li>La ejecución secundaria devolvió un error: <code>subagent run failed: &lt;wrapped error&gt;</code></li>
 </ol>
@@ -7318,6 +7318,15 @@ When the target is outside that set the refusal is:</li>
 <p>The advertised roster (the <code>agent</code> parameter’s enum in the tool schema) lists exactly this reachable set, and only when <code>delegation_policy.mode = "allow"</code>. Disabled agents (<code>enabled = false</code>) are never reachable, whether as same-profile peers or explicit <code>delegates</code> entries.</p>
 <p>In agentic delegation the sub-agent’s tools are drawn from the caller’s already-policy-filtered registry, intersected with the target’s own <code>allowed_tools</code>. An <strong>empty</strong> <code>allowed_tools</code> on the target means “inherit”: the sub-agent runs with the caller’s full delegatable registry rather than being rejected. A non-empty list intersects with that registry. Either way the caller’s registry is the ceiling: a cross-profile target whose risk profile names a tool the caller was never granted does not receive it. This is the invariant that keeps <code>ensure_no_escalation_beyond</code> (which does not itself diff tool allowlists) sufficient, since the target can never exceed the caller’s tool surface.</p>
 <p>Depth is capped per the parent’s <code>runtime_profile.max_delegation_depth</code>. Set it to <code>1</code> to allow the top agent a single delegation hop with no further sub-delegation.</p>
+<h4 id="agentic-target-tool-policy"><a class="header" href="#agentic-target-tool-policy">Agentic target tool policy</a></h4>
+<p>If the target agent’s <code>[runtime_profiles.&lt;target&gt;].agentic = true</code>, <code>delegate</code> builds the target sub-loop’s tool registry from the parent’s available tools. The target risk profile then filters that inherited registry:</p>
+<ol>
+<li>A configured empty <code>[risk_profiles.&lt;target_profile&gt;].allowed_tools</code> list leaves the inherited parent registry unrestricted.</li>
+<li>A non-empty <code>allowed_tools</code> list keeps only exact matching tool names.</li>
+<li><code>[risk_profiles.&lt;target_profile&gt;].excluded_tools</code> always subtracts from the result.</li>
+<li><code>delegate</code> is always removed from the child registry so agentic delegation cannot recurse through another <code>delegate</code> call.</li>
+</ol>
+<p>This policy lives on the target, not the caller. Same-profile peers use the shared risk profile, while explicit cross-profile delegates use the target’s risk profile after the non-escalation check. A missing target risk profile refuses before the sub-loop starts; a configured profile that filters the inherited registry down to zero executable tools refuses with the output strings below.</p>
 <h3 id="delegate-cadenas-de-salida-que-el-modelo-ve"><a class="header" href="#delegate-cadenas-de-salida-que-el-modelo-ve"><code>delegate</code>: cadenas de salida que el modelo ve</a></h3>
 <p>Exacto, obtenido de <code>crates/zeroclaw-runtime/src/tools/delegate.rs</code>.</p>
 <ol>
@@ -7353,6 +7362,18 @@ Use action='check_result' with task_id='&lt;uuid&gt;' to retrieve the result.
 <li>
 <p>Acción desconocida: el error es <code>Unknown action '&lt;value&gt;'. Use delegate/check_result/list_results/cancel_task.</code></p>
 </li>
+<li>
+<p>Agentic target with a missing target risk profile: error is <code>Agent '&lt;target&gt;' is agentic but risk_profile '&lt;target_profile&gt;' is not configured</code>.</p>
+</li>
+<li>
+<p>Agentic target with no executable child tools: error begins with <code>Agent '&lt;target&gt;' has no executable tools</code>, then names the filtering case:</p>
+<ul>
+<li><code>available from parent registry</code> when no allowlist or denylist applies but no non-<code>delegate</code> parent tools are available.</li>
+<li><code>after filtering allowlist (&lt;comma-separated names&gt;)</code> when a non-empty <code>allowed_tools</code> list leaves no executable tools.</li>
+<li><code>after filtering denylist (&lt;comma-separated names&gt;)</code> when <code>excluded_tools</code> removes every inherited executable tool.</li>
+<li><code>after filtering allowlist (&lt;comma-separated names&gt;) and denylist (&lt;comma-separated names&gt;)</code> when both gates combine to leave no executable tools.</li>
+</ul>
+</li>
 </ol>
 <h3 id="delegate-cómo-verificar-que-realmente-se-ejecutó"><a class="header" href="#delegate-cómo-verificar-que-realmente-se-ejecutó"><code>delegate</code>: cómo verificar que realmente se ejecutó</a></h3>
 <p><code>delegate</code> no emite hoy un span de tracing dedicado. La señal es la aparición del bucle del agente <strong>objetivo</strong> en el log, que hereda el ámbito en el que estuviera el dispatch de la llamada a herramienta del padre. Los spawns en modo en segundo plano son más fáciles de verificar fuera de banda: el archivo de resultados <code>&lt;workspace&gt;/delegate_results/&lt;uuid&gt;.json</code> existe en disco y contiene los campos <code>status</code> + <code>output</code> del agente objetivo; <code>cat</code> o <code>jq</code> funcionan sin tocar el log en absoluto.</p>
@@ -7375,7 +7396,7 @@ Use action='check_result' with task_id='&lt;uuid&gt;' to retrieve the result.
 <tr><td><strong>Profundidad de generación</strong></td><td>Límite máximo en 1</td><td>Hasta <code>runtime_profile.max_delegation_depth</code> (predeterminado 3)</td></tr>
 <tr><td><strong>Modo en segundo plano</strong></td><td>No compatible</td><td><code>background: true</code> devuelve un <code>task_id</code></td></tr>
 <tr><td><strong>Distribución en paralelo</strong></td><td>Sin argumento integrado; las llamadas múltiples en un mismo turno se ejecutan de forma concurrente cuando <code>parallel_tools = true</code></td><td><code>parallel: [...]</code> ejecuta múltiples objetivos de forma concurrente</td></tr>
-<tr><td><strong>Restricción de acceso</strong></td><td><code>risk_profile.allowed_tools</code> debe incluir <code>spawn_subagent</code></td><td><code>allowed_tools</code> must list <code>delegate</code>, caller’s <code>delegation_policy mode = "allow"</code>, and the target is in the caller’s reachable set (same-profile peer or explicit <code>delegates</code> entry)</td></tr>
+<tr><td><strong>Restricción de acceso</strong></td><td>Non-empty <code>risk_profile.allowed_tools</code> must list <code>spawn_subagent</code>; <code>excluded_tools</code> must not list it</td><td>The caller’s non-empty <code>risk_profile.allowed_tools</code> must list <code>delegate</code>; <code>excluded_tools</code> must not list it; caller’s <code>delegation_policy mode = "allow"</code>; and the target is in the caller’s reachable set (same-profile peer or explicit <code>delegates</code> entry)</td></tr>
 <tr><td><strong>Usar cuando</strong></td><td>Subtarea interna que debe permanecer dentro de la misma identidad</td><td>Want a different specialist (different model, different alias) to handle the task, on the same trust tier or an explicitly-allowed stricter/cross-profile one</td></tr>
 </tbody>
 </table>
