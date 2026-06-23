@@ -2548,7 +2548,7 @@ impl Agent {
             if usage.input_tokens > 0 || usage.output_tokens > 0 {
                 guard.total_input_tokens = usage.input_tokens;
                 guard.total_output_tokens = usage.output_tokens;
-                guard.saw_usage = true
+                guard.saw_usage = true;
             }
 
             // Replay everything the loop appended this round into the
@@ -2714,8 +2714,6 @@ pub async fn run(
     model_override: Option<String>,
     temperature: Option<f64>,
 ) -> Result<()> {
-    let start = Instant::now();
-
     let mut effective_config = config;
     if let Some(ref p) = provider_override {
         // When a model_provider override is specified, ensure that model_provider type exists
@@ -2741,49 +2739,6 @@ pub async fn run(
     }
 
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
-
-    let (provider_name, model_name) =
-        match effective_config.resolved_model_provider_for_agent(agent_alias) {
-            Some((ty, _alias, entry)) => {
-                let model = entry
-                    .model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .map(ToString::to_string)
-                    .or_else(|| effective_config.resolve_default_model())
-                    .unwrap_or_else(|| "<unresolved>".to_string());
-                (ty.to_string(), model)
-            }
-            None => (
-                provider_override.unwrap_or_else(|| "unknown".to_string()),
-                effective_config
-                    .resolve_default_model()
-                    .unwrap_or_else(|| "<unresolved>".to_string()),
-            ),
-        };
-
-    agent.observer.record_event(&ObserverEvent::AgentStart {
-        model_provider: provider_name.clone(),
-        model: model_name.clone(),
-        channel: Some(agent.channel_name.clone()),
-        agent_alias: None,
-        turn_id: None,
-    });
-
-    let _run_guard = TurnGuard {
-        observer: Arc::clone(&agent.observer),
-        model_provider: provider_name,
-        model: model_name,
-        turn_id: None,
-        turn_started_at: start,
-        agent_alias: None,
-        channel_name: agent.channel_name.clone(),
-        total_input_tokens: 0,
-        total_output_tokens: 0,
-        saw_usage: false,
-        done: false,
-    };
 
     if let Some(msg) = message {
         let response = agent.run_single(&msg).await?;
