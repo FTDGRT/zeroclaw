@@ -837,7 +837,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
-        let meta = ctx.meta();
         let execution_result = if allow_parallel_execution && executable_calls.len() > 1 {
             let meta = ctx.meta();
             execute_tools_parallel(

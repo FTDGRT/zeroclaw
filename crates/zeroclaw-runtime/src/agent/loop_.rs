@@ -6816,6 +6816,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_aborts_repeated_prompt_required_shell_before_reprompting() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let repeated_shell_call = r#"<tool_call>
 {"name":"shell","arguments":{"command":"pwd"}}
 </tool_call>"#;
@@ -6886,6 +6887,8 @@ mod tests {
             new_messages_out: None,
             image_cache: None,
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect_err("identical prompt-required shell call should abort before another prompt");
@@ -6910,6 +6913,7 @@ mod tests {
     #[tokio::test]
     async fn run_tool_call_loop_skips_same_round_prompt_required_shell_duplicate_without_reprompting()
      {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"shell","arguments":{"command":"pwd"}}
@@ -6977,6 +6981,8 @@ mod tests {
             new_messages_out: None,
             image_cache: None,
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("same-round prompt-required duplicate should use duplicate result path");
@@ -7006,6 +7012,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_prompt_guard_ignores_same_round_dedup_exempt_tools() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let repeated_shell_call = r#"<tool_call>
 {"name":"shell","arguments":{"command":"pwd"}}
 </tool_call>"#;
@@ -7073,6 +7080,8 @@ mod tests {
             new_messages_out: None,
             image_cache: None,
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect_err("dedup-exempt prompt-required repeats should still abort before reprompting");

@@ -374,6 +374,7 @@ mod payload_capture_tests {
             pacing,
             strict_tool_parsing: false,
             channel: None,
+            agent_alias: None,
             turn_id: "trace-req-test",
         }
     }
