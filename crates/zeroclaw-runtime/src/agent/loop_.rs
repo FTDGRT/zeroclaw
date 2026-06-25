@@ -2676,11 +2676,27 @@ pub async fn run(
         }
 
         let duration = start.elapsed();
+        // Populate aggregate token usage from the cost-tracking context that
+        // scoped every `run_tool_call_loop` call above — mirroring the streamed
+        // turn path (`Agent::turn_streamed` → `TurnGuard`). The CLI path does
+        // not set the `TOOL_LOOP_TURN_USAGE` task-local, so `snapshot_turn_usage`
+        // reads the context's own accumulator, which holds the session-wide
+        // totals. Without this the CLI `AgentEnd` reported `tokens_used: None`
+        // even though usage was tracked.
+        let tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
+            let usage = ctx.snapshot_turn_usage();
+            (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
+                zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                },
+            )
+        });
         observer.record_event(&ObserverEvent::AgentEnd {
             model_provider: provider_name.to_string(),
             model: model_name.to_string(),
             duration,
-            tokens_used: None,
+            tokens_used,
             cost_usd: None,
             channel: Some(channel_name.to_string()),
             agent_alias: Some(agent_alias.to_string()),
