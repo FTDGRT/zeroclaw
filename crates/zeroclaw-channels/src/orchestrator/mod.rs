@@ -20350,6 +20350,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
+                explicitly_addressed: false,
             },
             CancellationToken::new(),
         )
@@ -21983,6 +21984,7 @@ This is an example JSON object for profile settings."#;
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
+                explicitly_addressed: false,
             },
             CancellationToken::new(),
         )
