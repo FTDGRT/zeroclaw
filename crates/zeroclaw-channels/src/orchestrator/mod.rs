@@ -203,6 +203,13 @@ impl Observer for ChannelNotifyObserver {
 type ConversationHistoryMap = Arc<Mutex<lru::LruCache<String, Vec<ChatMessage>>>>;
 /// Senders that requested `/new` or `/clear` and must force a fresh prompt on their next message.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
+/// Memory-only cross-turn conversation identity map, used ONLY when
+/// `session_store` is `None` (no durable backend). Mirrors nothing in durable
+/// mode - the backend record is the single source of truth there. Bounded by
+/// `MAX_CONVERSATION_SENDERS` so the orchestrator can't leak unbounded memory
+/// on churn. Keyed by the routing/storage `conversation_history_key`; the
+/// value is the opaque server-minted UUID (never the key itself).
+type ConversationIdMap = Arc<Mutex<lru::LruCache<String, String>>>;
 /// Maximum conversation senders kept in memory (LRU eviction beyond this).
 const MAX_CONVERSATION_SENDERS: usize = 1000;
 /// Maximum history messages to keep per sender.
@@ -453,6 +460,10 @@ struct ChannelRuntimeContext {
     max_tool_iterations: usize,
     min_relevance_score: f64,
     conversation_histories: ConversationHistoryMap,
+    /// Memory-only conversation identity map. Consulted ONLY when
+    /// `session_store` is `None`; in durable mode the backend owns the id and
+    /// this map is left empty (never mirrored) so there is one source of truth.
+    conversation_ids: ConversationIdMap,
     pending_new_sessions: PendingNewSessionSet,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
@@ -521,6 +532,68 @@ fn acquire_persist_lock(ctx: &ChannelRuntimeContext, key: &str) -> Arc<std::sync
     map.entry(key.to_string())
         .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
         .clone()
+}
+
+/// Resolve the immutable cross-turn conversation id for a routing/storage
+/// `history_key`. In durable mode (`session_store` is `Some`) the backend is
+/// the single source of truth: it resolve-or-creates the persisted UUID and
+/// we NEVER mirror it in [`ChannelRuntimeContext::conversation_ids`]. In
+/// memory-only mode the bounded [`ConversationIdMap`] holds the id; a fresh
+/// UUID is minted on first resolve and reused for the same key thereafter
+/// (until `/new`/`/clear` rotates it).
+///
+/// The returned id is the opaque attribution - it is NEVER the `history_key`
+/// or any routing/sender value. On backend failure the caller proceeds
+/// unattributed (`None`) rather than falling back to a routing value.
+fn resolve_channel_conversation_id(
+    ctx: &ChannelRuntimeContext,
+    history_key: &str,
+) -> std::io::Result<String> {
+    if let Some(store) = &ctx.session_store {
+        return store.resolve_or_create_conversation_id(history_key);
+    }
+    let mut ids = ctx
+        .conversation_ids
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(id) = ids.get(history_key).cloned() {
+        return Ok(id);
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    ids.put(history_key.to_string(), id.clone());
+    Ok(id)
+}
+
+/// Atomically rotate the conversation id for a `/new`/`/clear` request, target
+/// only - a different sender's id is never touched. In durable mode the
+/// backend clears history AND mints a fresh id in one record-scoped op
+/// (`clear_and_rotate_conversation`); the caller never composes a
+/// `delete + resolve` here. In memory-only mode the bounded map is the owner,
+/// so the entry is overwritten with a fresh UUID. Callers MUST hold the
+/// per-key persist lock (`acquire_persist_lock`) so concurrent rotations for
+/// the same sender serialize. Rollback/trim/compact do NOT call this - they
+/// leave the id stable.
+fn rotate_conversation_id(ctx: &ChannelRuntimeContext, sender_key: &str) {
+    if let Some(store) = &ctx.session_store {
+        if let Err(err) = store.clear_and_rotate_conversation(sender_key) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": format!("{}", err),
+                        "sender_key": sender_key,
+                    })),
+                "Failed to clear-and-rotate persisted session for"
+            );
+        }
+        return;
+    }
+    let fresh_id = uuid::Uuid::new_v4().to_string();
+    ctx.conversation_ids
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(sender_key.to_string(), fresh_id);
 }
 
 #[derive(Clone)]
@@ -3036,7 +3109,9 @@ async fn handle_runtime_command_if_needed(
             }
         }
         ChannelRuntimeCommand::NewSession => {
-            // Serialize per-sender persistence to prevent interleaving
+            // Serialize per-sender persistence to prevent interleaving. The
+            // persist lock also serializes the conversation-id rotation below
+            // so concurrent `/new` for the same sender can't race.
             let persist_lock = acquire_persist_lock(ctx, &sender_key);
             let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
             clear_sender_history(ctx, &sender_key);
@@ -3044,19 +3119,11 @@ async fn handle_runtime_command_if_needed(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&sender_key);
-            if let Some(ref store) = ctx.session_store
-                && let Err(e) = store.delete_session(&sender_key)
-            {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "sender_key": sender_key})
-                        ),
-                    "Failed to delete persisted session for"
-                );
-            }
+            // Atomically rotate the conversation id (target-only). In durable
+            // mode the backend clears history AND mints a fresh id in one op;
+            // in memory-only mode the bounded map is overwritten with a fresh
+            // UUID. `pending_new_sessions` stays for prompt refresh only.
+            rotate_conversation_id(ctx, &sender_key);
             mark_sender_for_new_session(ctx, &sender_key);
             channel_runtime_cli_string("channel-runtime-new-session")
         }
@@ -4858,6 +4925,31 @@ async fn process_channel_message_body(
         return;
     }
 
+    // Resolve the immutable cross-turn conversation id ONCE for this turn,
+    // after command/self-message filtering and history_key computation but
+    // before the agent turn guard opens. The same resolved value threads into
+    // the guard, the tool loop, and any model-switch retry so every event for
+    // this turn carries one stable id. The next turn re-resolves (same key ->
+    // same id unless `/new`/`/clear` rotated it). On failure we proceed
+    // unattributed (`None`) - NEVER fall back to the history_key or sender.
+    let resolved_conversation_id = match resolve_channel_conversation_id(ctx.as_ref(), &history_key)
+    {
+        Ok(id) => Some(id),
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": format!("{}", err),
+                        "history_key": history_key,
+                    })),
+                "Failed to resolve conversation id; proceeding unattributed"
+            );
+            None
+        }
+    };
+
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let mut route = get_route_selection(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
 
@@ -5567,7 +5659,7 @@ async fn process_channel_message_body(
         route.model.clone(),
         Some(msg.channel.to_string()),
         Some(ctx.agent_alias.to_string()),
-        None,
+        resolved_conversation_id.clone(),
         Some(turn_id.clone()),
     );
     let (llm_result, fallback_info) = scope_provider_fallback(async {
@@ -5658,7 +5750,7 @@ async fn process_channel_message_body(
                 agent_alias: Some(ctx.agent_alias.as_str()),
                 parent_agent_alias: None,
                 turn_id: &turn_id,
-                conversation_id: None,
+                conversation_id: resolved_conversation_id.as_deref(),
                 // Live channel-daemon SOP path: re-assemble a nested step's
                 // agent when it delegates to a different agent, so the step runs
                 // with that agent's own gated tools/policy/MCP scope rather than
@@ -11298,6 +11390,9 @@ pub async fn start_channels(
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -11866,6 +11961,9 @@ fn concurrent_persist_lock_serialization() {
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+        ))),
+        conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
         ))),
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -12527,6 +12625,9 @@ temperature = 0.3
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -13151,6 +13252,9 @@ temperature = 0.3
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -13626,6 +13730,9 @@ api_key = "anthropic-key"
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -13721,6 +13828,9 @@ api_key = "anthropic-key"
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -13838,6 +13948,9 @@ api_key = "anthropic-key"
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -13957,6 +14070,9 @@ api_key = "anthropic-key"
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -14680,6 +14796,9 @@ api_key = "anthropic-key"
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -16878,6 +16997,9 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -16961,6 +17083,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -17082,6 +17207,9 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -17194,6 +17322,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -17347,6 +17478,9 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -17468,6 +17602,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -17615,6 +17752,9 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -17743,6 +17883,9 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -17854,6 +17997,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -17987,6 +18133,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -18144,6 +18293,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -18320,6 +18472,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -18808,6 +18963,9 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -18914,6 +19072,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 12,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -19032,6 +19193,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 3,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -19402,6 +19566,9 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -19544,6 +19711,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -19703,6 +19873,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -19874,6 +20047,9 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -20019,6 +20195,9 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -20153,6 +20332,9 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -20264,6 +20446,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -20392,6 +20577,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -21169,6 +21357,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -23480,6 +23671,9 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -23653,6 +23847,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -24113,6 +24310,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -24598,6 +24798,9 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -24751,6 +24954,9 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -26600,6 +26806,9 @@ This is an example JSON object for profile settings."#;
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -26718,6 +26927,9 @@ This is an example JSON object for profile settings."#;
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -26880,6 +27092,9 @@ This is an example JSON object for profile settings."#;
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -27142,6 +27357,9 @@ This is an example JSON object for profile settings."#;
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -27295,6 +27513,9 @@ This is an example JSON object for profile settings."#;
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -27438,6 +27659,9 @@ This is an example JSON object for profile settings."#;
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -27603,6 +27827,9 @@ This is an example JSON object for profile settings."#;
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -28168,6 +28395,9 @@ This is an example JSON object for profile settings."#;
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            conversation_ids: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -30340,6 +30570,448 @@ Done."#;
                 "ordinary chat must fall through: {content:?}"
             );
         }
+    }
+
+    // ── cross-turn conversation identity (Task 4) ───────────────────────
+    //
+    // The orchestrator owns the conversation identity lifecycle: it resolves
+    // an immutable per-key UUID at the turn mint site (durable: backend record
+    // is the single source of truth; memory-only: bounded LruCache), and
+    // rotates it atomically on `/new`/`/clear`. The history_key only LOCATES
+    // the record - it must never be exported as the conversation_id.
+
+    fn fresh_id_map() -> ConversationIdMap {
+        Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+        )))
+    }
+
+    /// Build a runtime context with the given backend (`None` = memory-only).
+    /// Overrides the mutable shared maps so each test is isolated even under
+    /// parallel execution.
+    fn conversation_id_test_ctx(store: Option<Arc<dyn SessionBackend>>) -> ChannelRuntimeContext {
+        let mut ctx = (*router_test_ctx()).clone();
+        ctx.session_store = store;
+        ctx.conversation_ids = fresh_id_map();
+        ctx.conversation_histories = Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+        )));
+        ctx.pending_new_sessions = Arc::new(Mutex::new(HashSet::new()));
+        ctx.persist_locks = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        ctx
+    }
+
+    /// Durable mock returning a STABLE per-key id (not fresh-per-call) so we
+    /// can assert the orchestrator delegates to the backend and never mirrors
+    /// into the in-memory map. Real UUID convergence is covered by the
+    /// SQLite/JSONL reopen tests below.
+    struct StableIdBackend {
+        resolve_calls: AtomicUsize,
+        rotate_calls: AtomicUsize,
+        fail_resolve: AtomicBool,
+    }
+    impl StableIdBackend {
+        fn new() -> Self {
+            Self {
+                resolve_calls: AtomicUsize::new(0),
+                rotate_calls: AtomicUsize::new(0),
+                fail_resolve: AtomicBool::new(false),
+            }
+        }
+    }
+    impl SessionBackend for StableIdBackend {
+        fn load(&self, _: &str) -> Vec<ChatMessage> {
+            vec![]
+        }
+        fn append(&self, _: &str, _: &ChatMessage) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            vec![]
+        }
+        fn resolve_or_create_conversation_id(&self, key: &str) -> std::io::Result<String> {
+            self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_resolve.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected resolve failure"));
+            }
+            // Deterministic stable id so two calls for the same key converge,
+            // mirroring the backend contract (stable once written).
+            Ok(format!("stable-{key}"))
+        }
+        fn clear_and_rotate_conversation(&self, key: &str) -> std::io::Result<String> {
+            self.rotate_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("rotated-{key}"))
+        }
+    }
+
+    #[test]
+    fn channel_conversation_id_memory_only_reuses_same_key_across_turns() {
+        // Same history_key must resolve to the SAME id across turns (different
+        // turn_ids are irrelevant - the id is per-key, not per-turn).
+        let ctx = conversation_id_test_ctx(None);
+        let key = "discord.clamps_123456_alice";
+        let turn_a = uuid::Uuid::new_v4().to_string();
+        let turn_b = uuid::Uuid::new_v4().to_string();
+        assert_ne!(turn_a, turn_b, "test premise: distinct turn ids");
+
+        let id1 = resolve_channel_conversation_id(&ctx, key).unwrap();
+        let id2 = resolve_channel_conversation_id(&ctx, key).unwrap();
+        assert_eq!(id1, id2, "same key must reuse the same conversation id");
+        assert_ne!(id1, key, "conversation id must never be the history_key");
+        // A valid UUID, not a routing value.
+        assert!(
+            uuid::Uuid::parse_str(&id1).is_ok(),
+            "memory-only id must be a UUID, got {id1}"
+        );
+    }
+
+    #[test]
+    fn channel_conversation_id_memory_only_isolates_different_keys() {
+        let ctx = conversation_id_test_ctx(None);
+        let key_a = "discord.clamps_roomA_alice";
+        let key_b = "discord.clamps_roomB_bob";
+        let id_a = resolve_channel_conversation_id(&ctx, key_a).unwrap();
+        let id_b = resolve_channel_conversation_id(&ctx, key_b).unwrap();
+        assert_ne!(id_a, id_b, "different keys must get distinct ids");
+        // Re-resolving A is still stable (B's resolve didn't evict it).
+        assert_eq!(resolve_channel_conversation_id(&ctx, key_a).unwrap(), id_a);
+    }
+
+    #[test]
+    fn channel_conversation_id_does_not_leak_poisoned_routing_values() {
+        // A poisoned sender / thread_ts flows INTO the history_key; the
+        // resolved conversation_id must NOT contain any of those routing
+        // values - it is an opaque server-minted UUID.
+        let ctx = conversation_id_test_ctx(None);
+        let poisoned_sender = "evil<script>alert(1)</script>";
+        let poisoned_thread = "thread-'; DROP TABLE sessions;--";
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "m1".into(),
+            sender: poisoned_sender.into(),
+            reply_target: "room".into(),
+            content: "hi".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            timestamp: 1,
+            thread_ts: Some(poisoned_thread.into()),
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            internal_sop_event: None,
+            passive_context: false,
+            explicitly_addressed: false,
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+        };
+        let key = conversation_history_key(&msg);
+        let id = resolve_channel_conversation_id(&ctx, &key).unwrap();
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "id must be a UUID");
+        assert_ne!(id, key, "id must not equal the history_key");
+        assert!(
+            !id.contains(poisoned_sender),
+            "id must not leak the sender: {id}"
+        );
+        assert!(
+            !id.contains(poisoned_thread),
+            "id must not leak the thread_ts: {id}"
+        );
+    }
+
+    #[test]
+    fn channel_conversation_id_durable_delegates_to_backend_and_never_mirrors() {
+        // Durable mode: the backend is the single source of truth. The resolver
+        // must call the backend and NEVER write the id into the in-memory map
+        // (no double source of truth).
+        let backend = Arc::new(StableIdBackend::new());
+        let ctx = conversation_id_test_ctx(Some(Arc::clone(&backend) as Arc<dyn SessionBackend>));
+        let key = "telegram_alice";
+        let id = resolve_channel_conversation_id(&ctx, key).unwrap();
+        assert_eq!(id, format!("stable-{key}"));
+        assert_eq!(
+            backend.resolve_calls.load(Ordering::SeqCst),
+            1,
+            "resolver must delegate to the backend"
+        );
+        // The in-memory map stays empty - no mirroring in durable mode.
+        assert_eq!(
+            ctx.conversation_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            0,
+            "durable mode must not mirror the id in memory"
+        );
+        // Second resolve still hits the backend (single source of truth), not
+        // the map.
+        let id2 = resolve_channel_conversation_id(&ctx, key).unwrap();
+        assert_eq!(id, id2);
+        assert_eq!(backend.resolve_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            ctx.conversation_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn channel_conversation_id_failure_does_not_fall_back_to_key() {
+        // On backend failure the resolver returns Err; the caller proceeds
+        // unattributed (None). It must NEVER fall back to the history_key,
+        // sender, or any routing value.
+        let backend = Arc::new(StableIdBackend::new());
+        backend.fail_resolve.store(true, Ordering::SeqCst);
+        let ctx = conversation_id_test_ctx(Some(Arc::clone(&backend) as Arc<dyn SessionBackend>));
+        let key = "slack_C123_alice";
+        let res = resolve_channel_conversation_id(&ctx, key);
+        assert!(res.is_err(), "backend failure must surface as Err");
+        // No id was materialized in the map.
+        assert_eq!(
+            ctx.conversation_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            0
+        );
+        // After recovery the resolver works again and still never returns the key.
+        backend.fail_resolve.store(false, Ordering::SeqCst);
+        let id = resolve_channel_conversation_id(&ctx, key).unwrap();
+        assert_ne!(id, key);
+    }
+
+    #[test]
+    fn channel_conversation_id_new_session_rotates_target_only_memory() {
+        let ctx = Arc::new(conversation_id_test_ctx(None));
+        let key_a = "discord.clamps_room_alice";
+        let key_b = "discord.clamps_room_bob";
+        let id_a0 = resolve_channel_conversation_id(&ctx, key_a).unwrap();
+        let id_b0 = resolve_channel_conversation_id(&ctx, key_b).unwrap();
+
+        // Acquire the per-key persist lock like the real /new path, then rotate.
+        let lock = acquire_persist_lock(&ctx, key_a);
+        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        rotate_conversation_id(&ctx, key_a);
+        drop(_g);
+
+        let id_a1 = resolve_channel_conversation_id(&ctx, key_a).unwrap();
+        assert_ne!(id_a0, id_a1, "rotation must mint a fresh id");
+        assert!(
+            uuid::Uuid::parse_str(&id_a1).is_ok(),
+            "rotated id must be a UUID"
+        );
+        // B is untouched (target-only rotation).
+        assert_eq!(
+            resolve_channel_conversation_id(&ctx, key_b).unwrap(),
+            id_b0,
+            "rotation must be target-only"
+        );
+    }
+
+    #[test]
+    fn channel_conversation_id_new_session_rotates_target_only_durable() {
+        let tmp = TempDir::new().unwrap();
+        let store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        let ctx = Arc::new(conversation_id_test_ctx(Some(Arc::clone(&store))));
+        let key_a = "telegram_111_alice";
+        let key_b = "telegram_222_bob";
+        let id_a0 = resolve_channel_conversation_id(&ctx, key_a).unwrap();
+        let id_b0 = resolve_channel_conversation_id(&ctx, key_b).unwrap();
+
+        let lock = acquire_persist_lock(&ctx, key_a);
+        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        rotate_conversation_id(&ctx, key_a);
+        drop(_g);
+
+        let id_a1 = resolve_channel_conversation_id(&ctx, key_a).unwrap();
+        assert_ne!(id_a0, id_a1, "durable rotation must mint a fresh id");
+        assert_eq!(
+            resolve_channel_conversation_id(&ctx, key_b).unwrap(),
+            id_b0,
+            "rotation must be target-only"
+        );
+        // The rotated id is persisted: a brand-new backend on the same dir
+        // reads the rotated value (not the pre-rotation one).
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(
+            reopened.resolve_or_create_conversation_id(key_a).unwrap(),
+            id_a1,
+            "rotated id must be the persisted fact"
+        );
+    }
+
+    #[test]
+    fn channel_conversation_id_sqlite_reopen_returns_same_id() {
+        let tmp = TempDir::new().unwrap();
+        let store = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let key = "mattermost_team1_alice";
+        let id0 = store.resolve_or_create_conversation_id(key).unwrap();
+        // A second instance on the same dir (simulating a process restart)
+        // must read the SAME persisted id - not mint a new one.
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let id1 = reopened.resolve_or_create_conversation_id(key).unwrap();
+        assert_eq!(id0, id1, "reopen must return the same persisted id");
+        assert!(uuid::Uuid::parse_str(&id0).is_ok());
+    }
+
+    #[test]
+    fn channel_conversation_id_jsonl_reopen_returns_same_id() {
+        let tmp = TempDir::new().unwrap();
+        let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+        let key = "irc_#room_alice";
+        let id0 = store.resolve_or_create_conversation_id(key).unwrap();
+        let reopened = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+        let id1 = reopened.resolve_or_create_conversation_id(key).unwrap();
+        assert_eq!(id0, id1, "jsonl reopen must return the same persisted id");
+        assert!(uuid::Uuid::parse_str(&id0).is_ok());
+    }
+
+    #[test]
+    fn channel_conversation_id_concurrent_first_turn_one_uuid_memory() {
+        // N threads resolve the same fresh key concurrently: the mutex around
+        // the map serializes them so exactly ONE UUID wins and all see it.
+        let ctx = Arc::new(conversation_id_test_ctx(None));
+        let key = Arc::new("webhook.alpha_alice".to_string());
+        let n = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(n));
+        let mut handles = vec![];
+        for _ in 0..n {
+            let ctx = Arc::clone(&ctx);
+            let key = Arc::clone(&key);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                resolve_channel_conversation_id(&ctx, &key).unwrap()
+            }));
+        }
+        let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first = &ids[0];
+        assert!(uuid::Uuid::parse_str(first).is_ok());
+        for id in &ids {
+            assert_eq!(id, first, "all concurrent resolves must converge on one id");
+        }
+        // Exactly one entry materialized (no duplication under contention).
+        assert_eq!(
+            ctx.conversation_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn channel_conversation_id_concurrent_first_turn_one_uuid_sqlite() {
+        let tmp = TempDir::new().unwrap();
+        let store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        let ctx = Arc::new(conversation_id_test_ctx(Some(Arc::clone(&store))));
+        let key = Arc::new("discord.clamps_room_alice".to_string());
+        let n = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(n));
+        let mut handles = vec![];
+        for _ in 0..n {
+            let ctx = Arc::clone(&ctx);
+            let key = Arc::clone(&key);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                resolve_channel_conversation_id(&ctx, &key).unwrap()
+            }));
+        }
+        let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first = &ids[0];
+        for id in &ids {
+            assert_eq!(id, first, "sqlite concurrent resolves must converge");
+        }
+        // Persisted fact survives reopen.
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(
+            reopened.resolve_or_create_conversation_id(&key).unwrap(),
+            *first
+        );
+    }
+
+    #[test]
+    fn channel_conversation_id_reset_concurrency_memory() {
+        // Concurrent /new rotations must not corrupt the map or panic; the
+        // final state is exactly one fresh id for the key (target-only).
+        let ctx = Arc::new(conversation_id_test_ctx(None));
+        let key = "discord.clamps_room_alice";
+        let initial = resolve_channel_conversation_id(&ctx, key).unwrap();
+
+        let n = 6;
+        let barrier = Arc::new(std::sync::Barrier::new(n));
+        let mut handles = vec![];
+        for _ in 0..n {
+            let ctx = Arc::clone(&ctx);
+            let key = key.to_string();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                // Hold the per-key persist lock like the real /new path so
+                // rotations for the same sender serialize.
+                let lock = acquire_persist_lock(&ctx, &key);
+                let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+                rotate_conversation_id(&ctx, &key);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let after = resolve_channel_conversation_id(&ctx, key).unwrap();
+        assert_ne!(after, initial, "rotation must change the id");
+        assert!(
+            uuid::Uuid::parse_str(&after).is_ok(),
+            "final id must be a UUID"
+        );
+        assert_eq!(
+            ctx.conversation_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1,
+            "no duplicate entries after concurrent rotations"
+        );
+    }
+
+    #[test]
+    fn channel_conversation_id_reset_concurrency_sqlite() {
+        let tmp = TempDir::new().unwrap();
+        let store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        let ctx = Arc::new(conversation_id_test_ctx(Some(Arc::clone(&store))));
+        let key = "telegram_alice";
+        let initial = resolve_channel_conversation_id(&ctx, key).unwrap();
+
+        let n = 6;
+        let barrier = Arc::new(std::sync::Barrier::new(n));
+        let mut handles = vec![];
+        for _ in 0..n {
+            let ctx = Arc::clone(&ctx);
+            let key = key.to_string();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let lock = acquire_persist_lock(&ctx, &key);
+                let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+                rotate_conversation_id(&ctx, &key);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let after = resolve_channel_conversation_id(&ctx, key).unwrap();
+        assert_ne!(after, initial, "durable rotation must change the id");
+        // Persisted fact is consistent after concurrent rotations.
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(
+            reopened.resolve_or_create_conversation_id(key).unwrap(),
+            after
+        );
     }
 }
 
