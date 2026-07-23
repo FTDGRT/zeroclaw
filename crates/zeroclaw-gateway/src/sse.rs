@@ -1020,4 +1020,102 @@ mod tests {
             "the internal fail-closed marker must be stripped before delivery: {body:?}"
         );
     }
+
+    /// The caller-owned `conversation_id` is carried internally on every
+    /// turn-scoped lifecycle event but must NEVER appear in the public SSE /
+    /// broadcast JSON or the `/api/events` buffer snapshot. Guards the
+    /// Step 4 contract: transport serialization ignores the field.
+    #[test]
+    fn conversation_id_is_not_serialized_in_sse_frames() {
+        let canary = "leak-canary-conv-id";
+        let cases: Vec<ObserverEvent> = vec![
+            ObserverEvent::AgentStart {
+                model_provider: "p".into(),
+                model: "m".into(),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+                conversation_id: Some(canary.into()),
+            },
+            ObserverEvent::AgentEnd {
+                model_provider: "p".into(),
+                model: "m".into(),
+                duration: std::time::Duration::from_millis(1),
+                tokens_used: None,
+                cost_usd: None,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+                conversation_id: Some(canary.into()),
+            },
+            ObserverEvent::LlmRequest {
+                parent_agent_alias: None,
+                model_provider: "p".into(),
+                model: "m".into(),
+                messages_count: 0,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+                conversation_id: Some(canary.into()),
+            },
+            ObserverEvent::ToolCallStart {
+                parent_agent_alias: None,
+                tool: "shell".into(),
+                tool_call_id: None,
+                arguments: None,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+                conversation_id: Some(canary.into()),
+            },
+            ObserverEvent::ToolCall {
+                parent_agent_alias: None,
+                tool: "shell".into(),
+                tool_call_id: None,
+                duration: std::time::Duration::from_millis(1),
+                success: true,
+                arguments: None,
+                result: None,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+                conversation_id: Some(canary.into()),
+            },
+        ];
+
+        for ev in &cases {
+            let (obs, mut rx, buffer) = make_broadcast();
+            obs.record_event(ev);
+            let frame = rx
+                .try_recv()
+                .expect("attributed event should still be broadcast");
+            assert!(
+                frame.get("conversation_id").is_none(),
+                "conversation_id leaked into SSE broadcast JSON for {}: {frame}",
+                frame["type"]
+            );
+            assert!(
+                !frame.to_string().contains(canary),
+                "conversation id value leaked into SSE broadcast JSON for {}: {frame}",
+                frame["type"]
+            );
+            let snap = buffer.snapshot();
+            assert_eq!(
+                snap.len(),
+                1,
+                "event should be buffered for {}",
+                frame["type"]
+            );
+            assert!(
+                snap[0].get("conversation_id").is_none(),
+                "conversation_id leaked into /api/events snapshot for {}: {frame}",
+                frame["type"]
+            );
+            assert!(
+                !snap[0].to_string().contains(canary),
+                "conversation id value leaked into /api/events snapshot for {}: {frame}",
+                frame["type"]
+            );
+        }
+    }
 }

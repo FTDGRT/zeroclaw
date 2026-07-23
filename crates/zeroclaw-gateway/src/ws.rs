@@ -502,6 +502,13 @@ async fn handle_socket(
     // what lets ask_user/poll/escalate_to_human default to this conversation.
     agent.set_channel_name(WS_CHANNEL_KEY.to_string());
     agent.set_memory_session_id(Some(memory_session_id));
+    // The cross-turn conversation id is the RAW protocol session id - not the
+    // `gw_`-prefixed storage key and not the sanitized memory-session id (which
+    // a `connect` frame may override). Set once at construction; the agent
+    // threads it to every turn's guard/ToolLoop, so it is reused verbatim across
+    // multi-turn, reconnect and restore. New sessions already minted a fresh
+    // UUID above, so no extra mint is needed here.
+    agent.set_conversation_id(Some(session_id.clone()));
     let restore_trim_event = if stored_messages.is_empty() {
         None
     } else {

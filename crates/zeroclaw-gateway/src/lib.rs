@@ -2565,8 +2565,9 @@ fn record_gateway_chat_dispatch_for_test(
 pub(crate) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
-    session_id: Option<&str>,
+    memory_session_id: Option<&str>,
     agent_override: Option<&str>,
+    conversation_id: Option<&str>,
 ) -> anyhow::Result<GatewayChatOutcome> {
     if let Some(err) = needs_quickstart_for(&state.model) {
         return Err(err);
@@ -2578,7 +2579,11 @@ pub(crate) async fn run_gateway_chat_with_tools(
     // doesn't go through the cost-tracking scope.
     #[cfg(test)]
     {
+<<<<<<< HEAD
         record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
+=======
+        let _ = (memory_session_id, agent_override, conversation_id);
+>>>>>>> 2cd8358e1... feat(gateway): propagate canonical conversation IDs
         let response = state
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
@@ -2620,15 +2625,26 @@ pub(crate) async fn run_gateway_chat_with_tools(
                     config,
                     &agent_alias,
                     message,
-                    session_id,
+                    memory_session_id,
                     zeroclaw_api::ingress::TurnOrigin::Interactive,
-                    None,
+                    conversation_id,
                 ),
             ),
         ))
         .await?;
         Ok(GatewayChatOutcome { response })
     }
+}
+
+/// Mint a fresh, caller-owned conversation id for a per-request HTTP entry
+/// point (generic webhook, A2A, WhatsApp/Linq/WATI/Nextcloud). These handlers
+/// bypass the Channel orchestrator, so each request/message owns a brand-new
+/// UUID v4 that is reused only within that single request. It is deliberately
+/// NOT derived from `X-Session-Id`, a sender/thread key, the `gw_`/`a2a_`
+/// storage prefix, or the request body - those feed the separate
+/// memory-session id, not the conversation attribution.
+pub(crate) fn mint_request_conversation_id() -> String {
+    Uuid::new_v4().to_string()
 }
 
 fn resolve_gateway_chat_agent_alias(
@@ -2893,8 +2909,19 @@ async fn handle_webhook(
     // sole owner of lifecycle and LLM events. Emitting another bracket here
     // gives one webhook prompt two unrelated turn IDs.
     let started_at = Instant::now();
+    // Each webhook request owns a fresh conversation id, distinct from the
+    // memory-scoped `X-Session-Id`. The reject path above returns before this
+    // mint, so a duplicate idempotency key never produces a turn attribution.
+    let conversation_id = mint_request_conversation_id();
 
-    match run_gateway_chat_with_tools(&state, message, session_id.as_deref(), agent_override).await
+    match run_gateway_chat_with_tools(
+        &state,
+        message,
+        session_id.as_deref(),
+        agent_override,
+        Some(&conversation_id),
+    )
+    .await
     {
         Ok(GatewayChatOutcome { response, .. }) => {
             let duration = started_at.elapsed();
@@ -3177,11 +3204,15 @@ async fn process_whatsapp_message(
                 .await;
         }
 
+        // Fresh per-message conversation id; the sender-derived `session_id`
+        // above stays scoped to memory.
+        let conversation_id = mint_request_conversation_id();
         match Box::pin(run_gateway_chat_with_tools(
             state,
             &msg.content,
             Some(&session_id),
             None,
+            Some(&conversation_id),
         ))
         .await
         {
@@ -3402,11 +3433,17 @@ async fn process_linq_webhook(
         }
 
         // Call the LLM
+        let conversation_id = mint_request_conversation_id();
         match Box::pin(run_gateway_chat_with_tools(
             state,
             &msg.content,
             Some(&session_id),
+<<<<<<< HEAD
             agent_override.as_deref(),
+=======
+            None,
+            Some(&conversation_id),
+>>>>>>> 2cd8358e1... feat(gateway): propagate canonical conversation IDs
         ))
         .await
         {
@@ -3592,11 +3629,13 @@ async fn process_wati_webhook(
         }
 
         // Call the LLM
+        let conversation_id = mint_request_conversation_id();
         match Box::pin(run_gateway_chat_with_tools(
             state,
             &msg.content,
             Some(&session_id),
             None,
+            Some(&conversation_id),
         ))
         .await
         {
@@ -3791,11 +3830,15 @@ async fn process_nextcloud_talk_webhook(
                     .await;
             }
 
+            // Fresh per-message conversation id; the sender-derived
+            // `session_id` above stays scoped to memory.
+            let conversation_id = mint_request_conversation_id();
             match Box::pin(run_gateway_chat_with_tools(
                 &state,
                 &msg.content,
                 Some(&session_id),
                 None,
+                Some(&conversation_id),
             ))
             .await
             {
@@ -8654,6 +8697,347 @@ mod tests {
              persist; have {:?}",
             state.pairing.tokens()
         );
+    }
+
+    // ── cross-turn conversation attribution (Task 5) ───────────────────────
+    //
+    // The runtime already proves `Agent::set_conversation_id` threads to every
+    // attributed observer event. These tests guard the GATEWAY's choice of
+    // which value owns that slot at each entry point: WS uses the raw protocol
+    // session id (not the `gw_` storage key, not the sanitized memory id a
+    // connect frame may override); per-request HTTP mints a fresh UUID v4 that
+    // is never derived from `X-Session-Id`, a sender key, or a body.
+
+    /// Extract the caller-owned `conversation_id` from any of the nine
+    /// turn-attributed observer events. Returns `None` for events outside
+    /// that set so callers can filter to the attributed subset. Mirrors the
+    /// runtime's test helper.
+    fn attributed_conversation_id(
+        event: &zeroclaw_runtime::observability::ObserverEvent,
+    ) -> Option<Option<&str>> {
+        use zeroclaw_runtime::observability::ObserverEvent;
+        match event {
+            ObserverEvent::AgentStart {
+                conversation_id, ..
+            }
+            | ObserverEvent::AgentEnd {
+                conversation_id, ..
+            }
+            | ObserverEvent::LlmRequest {
+                conversation_id, ..
+            }
+            | ObserverEvent::LlmResponse {
+                conversation_id, ..
+            }
+            | ObserverEvent::ToolCallStart {
+                conversation_id, ..
+            }
+            | ObserverEvent::ToolCall {
+                conversation_id, ..
+            }
+            | ObserverEvent::MemoryRecall {
+                conversation_id, ..
+            }
+            | ObserverEvent::MemoryStore {
+                conversation_id, ..
+            }
+            | ObserverEvent::RagRetrieve {
+                conversation_id, ..
+            } => Some(conversation_id.as_deref()),
+            _ => None,
+        }
+    }
+
+    fn attributed_turn_id(event: &zeroclaw_runtime::observability::ObserverEvent) -> Option<&str> {
+        use zeroclaw_runtime::observability::ObserverEvent;
+        match event {
+            ObserverEvent::AgentStart { turn_id, .. }
+            | ObserverEvent::AgentEnd { turn_id, .. }
+            | ObserverEvent::LlmRequest { turn_id, .. }
+            | ObserverEvent::LlmResponse { turn_id, .. }
+            | ObserverEvent::ToolCallStart { turn_id, .. }
+            | ObserverEvent::ToolCall { turn_id, .. }
+            | ObserverEvent::MemoryRecall { turn_id, .. }
+            | ObserverEvent::MemoryStore { turn_id, .. }
+            | ObserverEvent::RagRetrieve { turn_id, .. } => turn_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Minimal agent for the WS contract tests. Built WITHOUT conversation or
+    /// memory-session ids so the test can exercise the same post-build mutator
+    /// sequence `handle_socket` uses (`set_channel_name` / `set_memory_session_id`
+    /// / `set_conversation_id`). The mock model provider returns `"ok"` via the
+    /// default `chat()` -> `chat_with_system` chain, so a no-tool turn completes
+    /// in one LLM call.
+    fn build_minimal_ws_agent(capturing: Arc<CapturingObserver>) -> zeroclaw_runtime::agent::Agent {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let model_provider: Box<dyn ModelProvider> = Box::new(MockModelProvider::default());
+        let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = capturing;
+        zeroclaw_runtime::agent::Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(
+                zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher,
+            ))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("ws-test-agent".into())
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    #[test]
+    fn mint_request_conversation_id_is_fresh_uuid_v4() {
+        let a = mint_request_conversation_id();
+        let b = mint_request_conversation_id();
+        assert_ne!(a, b, "each request must mint a distinct conversation id");
+        let parsed_a =
+            uuid::Uuid::parse_str(&a).expect("conversation id must be a valid UUID: {a}");
+        let parsed_b =
+            uuid::Uuid::parse_str(&b).expect("conversation id must be a valid UUID: {b}");
+        assert_eq!(
+            parsed_a.get_version(),
+            Some(uuid::Version::Random),
+            "conversation id must be UUID v4: {a}"
+        );
+        assert_eq!(
+            parsed_b.get_version(),
+            Some(uuid::Version::Random),
+            "conversation id must be UUID v4: {b}"
+        );
+        // Must NOT carry the storage/channel prefixes or resemble a
+        // sender/thread-derived key - those feed the separate memory-session id.
+        for id in [a.as_str(), b.as_str()] {
+            assert!(!id.starts_with("gw_"), "gw_ storage prefix leaked: {id}");
+            assert!(!id.starts_with("a2a_"), "a2a_ channel prefix leaked: {id}");
+            assert!(!id.contains(':'), "sender/thread key shape leaked: {id}");
+        }
+    }
+
+    /// WS sets the conversation id to the RAW protocol session id and reuses it
+    /// across turns. The `gw_`-prefixed storage key and the connect-frame
+    /// memory override must never be attributed as the conversation id.
+    #[tokio::test]
+    async fn ws_conversation_id_is_raw_session_not_storage_or_memory() {
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut agent = build_minimal_ws_agent(capturing.clone());
+
+        // Mimic ws.rs handle_socket's derivation (ws.rs:315-318, 483-485).
+        let raw_session_id = Uuid::new_v4().to_string();
+        let session_key = format!("gw_{raw_session_id}"); // storage only (GW_SESSION_PREFIX)
+        let memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&raw_session_id);
+        // A UUID is already alnum + '-', so sanitize is a no-op here:
+        // memory_session_id starts EQUAL to the raw session id. The
+        // discriminator is the connect override below - if handle_socket had
+        // attributed memory_session_id (instead of the raw id) as the
+        // conversation id, the override would change the attribution.
+
+        agent.set_channel_name("wss".to_string());
+        agent.set_memory_session_id(Some(memory_session_id.clone()));
+        agent.set_conversation_id(Some(raw_session_id.clone()));
+
+        let _ = agent
+            .turn("first")
+            .await
+            .expect("first turn should succeed");
+
+        // A connect frame may OVERRIDE memory_session_id (ws.rs:388-399). The
+        // conversation id is the raw session id and must NOT follow it.
+        let override_memory =
+            zeroclaw_api::session_keys::sanitize_session_key("client-supplied-override");
+        assert_ne!(override_memory, memory_session_id);
+        agent.set_memory_session_id(Some(override_memory.clone()));
+        let _ = agent
+            .turn("second")
+            .await
+            .expect("second turn should succeed");
+
+        let events = capturing.events.lock();
+        let conv_ids: Vec<Option<&str>> = events
+            .iter()
+            .filter_map(attributed_conversation_id)
+            .collect();
+        assert!(
+            !conv_ids.is_empty(),
+            "expected attributed events carrying conversation_id"
+        );
+        assert!(
+            conv_ids
+                .iter()
+                .all(|id| *id == Some(raw_session_id.as_str())),
+            "every attributed event must carry the RAW session id (reused across both turns): {conv_ids:?}"
+        );
+        assert!(
+            !conv_ids.contains(&Some(session_key.as_str())),
+            "the gw_-prefixed storage key must never be attributed: {conv_ids:?}"
+        );
+        // The connect override changed memory_session_id but NOT the
+        // conversation id - this is the guard that handle_socket uses the raw
+        // session id rather than the (overrideable) memory-session id.
+        assert!(
+            !conv_ids.contains(&Some(override_memory.as_str())),
+            "the connect-frame memory override must not leak into the conversation id: {conv_ids:?}"
+        );
+
+        // Multi-turn reuse: same conversation id, but a fresh turn_id per turn.
+        let turn_ids: Vec<String> = events
+            .iter()
+            .filter_map(attributed_turn_id)
+            .map(str::to_string)
+            .collect();
+        let unique_turn_ids: std::collections::HashSet<&str> =
+            turn_ids.iter().map(String::as_str).collect();
+        assert!(
+            unique_turn_ids.len() >= 2,
+            "two turns must produce at least two distinct turn_ids, got {unique_turn_ids:?}"
+        );
+    }
+
+    /// A new WS session mints a fresh UUID; two concurrent agents must not cross
+    /// conversation ids.
+    #[tokio::test]
+    async fn ws_new_session_isolates_conversation_id() {
+        let cap_a = Arc::new(CapturingObserver::default());
+        let cap_b = Arc::new(CapturingObserver::default());
+        let mut agent_a = build_minimal_ws_agent(cap_a.clone());
+        let mut agent_b = build_minimal_ws_agent(cap_b.clone());
+
+        let raw_a = Uuid::new_v4().to_string();
+        let raw_b = Uuid::new_v4().to_string();
+        assert_ne!(raw_a, raw_b, "two new sessions must mint distinct ids");
+
+        agent_a.set_conversation_id(Some(raw_a.clone()));
+        agent_b.set_conversation_id(Some(raw_b.clone()));
+
+        let (a, b) = tokio::join!(agent_a.turn("a"), agent_b.turn("b"));
+        let _ = a.expect("agent A turn should succeed");
+        let _ = b.expect("agent B turn should succeed");
+
+        for (cap, expected, other, label) in [
+            (cap_a.clone(), raw_a.as_str(), raw_b.as_str(), "agent A"),
+            (cap_b.clone(), raw_b.as_str(), raw_a.as_str(), "agent B"),
+        ] {
+            let events = cap.events.lock();
+            let conv_ids: Vec<Option<&str>> = events
+                .iter()
+                .filter_map(attributed_conversation_id)
+                .collect();
+            assert!(
+                !conv_ids.is_empty(),
+                "{label} should emit attributed events"
+            );
+            assert!(
+                conv_ids.iter().all(|id| *id == Some(expected)),
+                "{label} must carry only its own conversation id: {conv_ids:?}"
+            );
+            assert!(
+                !conv_ids.contains(&Some(other)),
+                "{label} must not see the other session's conversation id: {conv_ids:?}"
+            );
+        }
+    }
+
+    /// `run_gateway_chat_with_tools` accepts an independent `conversation_id`
+    /// alongside the memory-scoped `session_id`. In the test build the mock
+    /// provider bypasses `process_message`, so this guards the seam compiles
+    /// and the two distinct ids coexist without fallback or panic; the
+    /// production branch (verified by the type system + code review) forwards
+    /// `conversation_id` straight to `process_message`.
+    #[tokio::test]
+    async fn run_gateway_chat_with_tools_accepts_independent_conversation_id() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: Arc::new(MockMemory),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        // Distinct memory-session id and conversation id coexist.
+        let outcome = run_gateway_chat_with_tools(
+            &state,
+            "hi",
+            Some("memory-session-id"),
+            None,
+            Some("distinct-conversation-id"),
+        )
+        .await
+        .expect("dispatch with an independent conversation id should succeed");
+        assert_eq!(outcome.response, "ok");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+
+        // `conversation_id = None` is also accepted (no fallback to session_id
+        // required on this path).
+        let outcome_none =
+            run_gateway_chat_with_tools(&state, "hi", Some("memory-session-id"), None, None)
+                .await
+                .expect("dispatch with no conversation id should succeed");
+        assert_eq!(outcome_none.response, "ok");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
     }
 }
 
