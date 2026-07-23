@@ -313,6 +313,7 @@ pub async fn render_memory_context(
         channel: Some(turn.channel_name.to_string()),
         agent_alias: turn.agent_alias.map(str::to_string),
         turn_id: Some(turn.turn_id.to_string()),
+        conversation_id: None,
     });
 
     if cfg.rerank_enabled {

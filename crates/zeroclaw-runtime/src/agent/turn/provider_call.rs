@@ -48,6 +48,7 @@ pub(crate) async fn announce_llm_request(
         agent_alias: ctx.agent_alias.map(|s| s.to_string()),
         parent_agent_alias: ctx.parent_agent_alias.map(|s| s.to_string()),
         turn_id: Some(ctx.turn_id.to_string()),
+        conversation_id: None,
     });
     {
         let _provider_guard = ::zeroclaw_log::attribution_span!(active_model_provider).entered();

@@ -106,6 +106,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             channel: channel_opt,
             agent_alias: agent_alias_opt,
             turn_id: turn_id_opt,
+            conversation_id: None,
         }),
         "agent_end" => Some(ObserverEvent::AgentEnd {
             model_provider,
@@ -135,6 +136,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             channel: channel_opt,
             agent_alias: agent_alias_opt,
             turn_id: turn_id_opt,
+            conversation_id: None,
         }),
         "llm_request" => Some(ObserverEvent::LlmRequest {
             model_provider,
@@ -148,6 +150,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             agent_alias: agent_alias_opt,
             parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
+            conversation_id: None,
         }),
         "llm_response" => Some(ObserverEvent::LlmResponse {
             model_provider,
@@ -172,6 +175,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             agent_alias: agent_alias_opt,
             parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
+            conversation_id: None,
         }),
         "tool_call_start" => Some(ObserverEvent::ToolCallStart {
             tool,
@@ -181,6 +185,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             agent_alias: agent_alias_opt,
             parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
+            conversation_id: None,
         }),
         "tool_call" | "tool_call_result" => Some(ObserverEvent::ToolCall {
             tool,
@@ -193,6 +198,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             agent_alias: agent_alias_opt,
             parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
+            conversation_id: None,
         }),
         "memory_audit" => Some(ObserverEvent::MemoryAudit {
             action: event
@@ -410,6 +416,7 @@ mod tests {
                 agent_alias,
                 parent_agent_alias: _,
                 turn_id,
+                ..
             } => {
                 assert_eq!(model_provider, "anthropic");
                 assert_eq!(model, "claude-sonnet-4-6");

@@ -21893,6 +21893,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: None,
                 agent_alias: None,
                 turn_id: None,
+                conversation_id: None,
             },
         );
 
@@ -21923,6 +21924,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: None,
                 agent_alias: None,
                 turn_id: None,
+                conversation_id: None,
             },
         );
 
@@ -21964,6 +21966,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         };
 
         // First push lands in the bounded buffer (capacity 1).

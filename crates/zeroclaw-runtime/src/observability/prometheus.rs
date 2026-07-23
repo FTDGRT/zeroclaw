@@ -319,6 +319,7 @@ impl Observer for PrometheusObserver {
                 channel: _,
                 agent_alias: _,
                 turn_id: _,
+                conversation_id: _,
             } => {
                 self.agent_starts
                     .with_label_values(&[model_provider, model])
@@ -333,6 +334,7 @@ impl Observer for PrometheusObserver {
                 channel: _,
                 agent_alias: _,
                 turn_id: _,
+                conversation_id: _,
             } => {
                 // Agent duration is recorded via the histogram with model_provider/model labels
                 self.agent_duration
@@ -520,6 +522,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -533,6 +536,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -543,6 +547,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -555,6 +560,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -567,6 +573,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
@@ -604,6 +611,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -616,6 +624,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_metric(&ObserverMetric::RequestLatency(Duration::from_millis(250)));
@@ -664,6 +673,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -676,6 +686,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -688,6 +699,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
 
         let output = obs.encode();
@@ -743,6 +755,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             parent_agent_alias: None,
@@ -757,6 +770,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
 
         let output = obs.encode();
@@ -788,6 +802,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
 
         let output = obs.encode();

@@ -201,6 +201,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 agent_alias,
                 parent_agent_alias,
                 turn_id,
+                ..
             } => {
                 let mut json = serde_json::json!({
                     "type": "llm_request",
@@ -275,6 +276,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                ..
             } => {
                 let mut json = serde_json::json!({
                     "type": "agent_start",
@@ -297,6 +299,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                ..
             } => {
                 let (tokens_total, input_tokens, output_tokens) = tokens_used
                     .as_ref()
@@ -401,6 +404,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
 
         let value = rx.try_recv().expect("event should be broadcast");
@@ -425,6 +429,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
 
         let value = rx.try_recv().expect("event should be broadcast");
@@ -600,6 +605,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         });
 
         let value = rx.try_recv().expect("event should be broadcast");
@@ -629,6 +635,7 @@ mod tests {
                 channel: None,
                 agent_alias: None,
                 turn_id: None,
+                conversation_id: None,
             },
             ObserverEvent::ToolCall {
                 parent_agent_alias: None,
@@ -641,6 +648,7 @@ mod tests {
                 channel: None,
                 agent_alias: None,
                 turn_id: None,
+                conversation_id: None,
             },
             ObserverEvent::ToolCallStart {
                 parent_agent_alias: None,
@@ -650,6 +658,7 @@ mod tests {
                 channel: None,
                 agent_alias: None,
                 turn_id: None,
+                conversation_id: None,
             },
             ObserverEvent::Error {
                 component: "any".into(),
@@ -661,6 +670,7 @@ mod tests {
                 channel: None,
                 agent_alias: None,
                 turn_id: None,
+                conversation_id: None,
             },
             ObserverEvent::AgentEnd {
                 model_provider: "p".into(),
@@ -671,6 +681,7 @@ mod tests {
                 channel: None,
                 agent_alias: None,
                 turn_id: None,
+                conversation_id: None,
             },
         ];
         for ev in cases {
@@ -712,6 +723,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
 
         let value = rx
@@ -761,6 +773,7 @@ mod tests {
             channel: Some("telegram".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         });
         observer.record_event(&ObserverEvent::AgentEnd {
             model_provider: "p".into(),
@@ -771,6 +784,7 @@ mod tests {
             channel: Some("telegram".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         });
 
         let payload = history_events_payload(&buffer);

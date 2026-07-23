@@ -1121,6 +1121,7 @@ impl Agent {
                 channel: Some(self.channel_name.clone()),
                 agent_alias: self.observer_agent_alias(),
                 turn_id: Some(turn_id.to_string()),
+                conversation_id: None,
             });
         }
 
@@ -2281,6 +2282,7 @@ impl Agent {
                 channel: Some(self.channel_name.clone()),
                 agent_alias: self.observer_agent_alias(),
                 turn_id: Some(turn_id.clone()),
+                conversation_id: None,
             });
         }
 

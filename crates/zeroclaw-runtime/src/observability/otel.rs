@@ -275,6 +275,7 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                conversation_id: _,
             } => {
                 self.agent_starts.add(
                     1,
@@ -324,6 +325,7 @@ impl Observer for OtelObserver {
                 agent_alias,
                 parent_agent_alias,
                 turn_id,
+                conversation_id: _,
             } => {
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
                 let mut span = tracer.build_with_context(
@@ -360,6 +362,7 @@ impl Observer for OtelObserver {
                 agent_alias,
                 parent_agent_alias,
                 turn_id,
+                conversation_id: _,
             } => {
                 let mut span_attrs = vec![
                     KeyValue::new("gen_ai.operation.name", "execute_tool"),
@@ -404,6 +407,7 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                conversation_id: _,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -461,6 +465,7 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                conversation_id: _,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -507,6 +512,7 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                conversation_id: _,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -599,6 +605,7 @@ impl Observer for OtelObserver {
                 parent_agent_alias,
                 turn_id,
                 messages,
+                conversation_id: _,
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
@@ -689,6 +696,7 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                conversation_id: _,
             } => {
                 if let Some(tid) = turn_id {
                     let entry = self
@@ -780,6 +788,7 @@ impl Observer for OtelObserver {
                 agent_alias,
                 parent_agent_alias,
                 turn_id,
+                conversation_id: _,
             } => {
                 let secs = duration.as_secs_f64();
 
@@ -1310,6 +1319,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::LlmRequest {
             parent_agent_alias: None,
@@ -1319,6 +1329,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             parent_agent_alias: None,
@@ -1333,6 +1344,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -1343,6 +1355,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -1353,6 +1366,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             parent_agent_alias: None,
@@ -1362,6 +1376,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -1374,6 +1389,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -1386,6 +1402,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
         obs.record_event(&ObserverEvent::ChannelMessage {
@@ -1430,6 +1447,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         // MemoryRecall failure path with query_summary: None.
         obs.record_event(&ObserverEvent::MemoryRecall {
@@ -1441,6 +1459,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
 
         // RagRetrieve with populated query_summary.
@@ -1452,6 +1471,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         // RagRetrieve with query_summary: None.
         obs.record_event(&ObserverEvent::RagRetrieve {
@@ -1462,6 +1482,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
 
         // MemoryStore success path.
@@ -1473,6 +1494,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         // MemoryStore failure path.
         obs.record_event(&ObserverEvent::MemoryStore {
@@ -1483,6 +1505,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::MemoryAudit {
             action: "store".into(),
@@ -1509,6 +1532,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -1521,6 +1545,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         // Failure case — the issue author specifically wants to see *why*
         // a tool call failed, so the result field is the error text.
@@ -1535,6 +1560,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
     }
 
@@ -1566,6 +1592,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
     }
 
@@ -1596,6 +1623,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         });
 
         assert!(
@@ -1614,6 +1642,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             parent_agent_alias: None,
@@ -1628,6 +1657,7 @@ mod tests {
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
             messages: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             parent_agent_alias: None,
@@ -1637,6 +1667,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -1649,6 +1680,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "anthropic".into(),
@@ -1662,6 +1694,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            conversation_id: None,
         });
 
         assert!(
@@ -1687,6 +1720,7 @@ mod tests {
             channel: Some("cli".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-m1".into()),
+            conversation_id: None,
         });
         assert!(
             obs.active_agent_spans
@@ -1705,6 +1739,7 @@ mod tests {
             channel: Some("cli".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-m1".into()),
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::RagRetrieve {
             query_summary: Some("ESP32 pinout".into()),
@@ -1714,6 +1749,7 @@ mod tests {
             channel: Some("cli".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-m1".into()),
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::MemoryStore {
             category: "conversation".into(),
@@ -1723,6 +1759,7 @@ mod tests {
             channel: Some("cli".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-m1".into()),
+            conversation_id: None,
         });
 
         assert!(
@@ -1742,6 +1779,7 @@ mod tests {
             channel: Some("cli".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-m1".into()),
+            conversation_id: None,
         });
         assert!(
             !obs.active_agent_spans
@@ -1761,6 +1799,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: Some("no-such-turn".into()),
+            conversation_id: None,
         });
     }
 
@@ -1820,6 +1859,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             parent_agent_alias: None,
@@ -1832,6 +1872,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            conversation_id: None,
         });
     }
 

@@ -74,6 +74,7 @@ impl<'a> AgentTurnGuard<'a> {
             channel: channel.clone(),
             agent_alias: agent_alias.clone(),
             turn_id: turn_id.clone(),
+            conversation_id: None,
         });
         Self {
             observer,
@@ -120,6 +121,7 @@ impl<'a> AgentTurnGuard<'a> {
             channel: self.channel.clone(),
             agent_alias: self.agent_alias.clone(),
             turn_id: self.turn_id.clone(),
+            conversation_id: None,
         });
     }
 }

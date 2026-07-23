@@ -73,6 +73,7 @@ fn unavailable_tool_outcome(
         agent_alias: meta.agent_alias.map(|s| s.to_string()),
         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
         turn_id: Some(meta.turn_id.to_string()),
+        conversation_id: None,
     });
     ToolExecutionOutcome {
         output: reason.clone(),
@@ -126,6 +127,7 @@ pub(crate) async fn execute_one_tool(
         agent_alias: meta.agent_alias.map(|s| s.to_string()),
         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
         turn_id: Some(meta.turn_id.to_string()),
+        conversation_id: None,
     });
     let start = Instant::now();
 
@@ -185,6 +187,7 @@ pub(crate) async fn execute_one_tool(
             agent_alias: meta.agent_alias.map(|s| s.to_string()),
             parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
             turn_id: Some(meta.turn_id.to_string()),
+            conversation_id: None,
         });
         return Ok(ToolExecutionOutcome {
             output: reason.clone(),
@@ -328,6 +331,7 @@ pub(crate) async fn execute_one_tool(
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
                         turn_id: Some(meta.turn_id.to_string()),
+                        conversation_id: None,
                     });
                     Ok(ToolExecutionOutcome {
                         output: normalized_output.to_string(),
@@ -350,6 +354,7 @@ pub(crate) async fn execute_one_tool(
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
                         turn_id: Some(meta.turn_id.to_string()),
+                        conversation_id: None,
                     });
                     Ok(ToolExecutionOutcome {
                         output: format!("Error: {reason}"),
@@ -389,6 +394,7 @@ pub(crate) async fn execute_one_tool(
                     agent_alias: meta.agent_alias.map(|s| s.to_string()),
                     parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
                     turn_id: Some(meta.turn_id.to_string()),
+                    conversation_id: None,
                 });
                 Ok(ToolExecutionOutcome {
                     output: reason.clone(),
