@@ -593,15 +593,33 @@ mod tests {
     /// its `turn_id`.
     fn conversation_id(event: &ObserverEvent) -> Option<&str> {
         match event {
-            ObserverEvent::AgentStart { conversation_id, .. }
-            | ObserverEvent::AgentEnd { conversation_id, .. }
-            | ObserverEvent::LlmRequest { conversation_id, .. }
-            | ObserverEvent::LlmResponse { conversation_id, .. }
-            | ObserverEvent::ToolCallStart { conversation_id, .. }
-            | ObserverEvent::ToolCall { conversation_id, .. }
-            | ObserverEvent::MemoryRecall { conversation_id, .. }
-            | ObserverEvent::MemoryStore { conversation_id, .. }
-            | ObserverEvent::RagRetrieve { conversation_id, .. } => conversation_id.as_deref(),
+            ObserverEvent::AgentStart {
+                conversation_id, ..
+            }
+            | ObserverEvent::AgentEnd {
+                conversation_id, ..
+            }
+            | ObserverEvent::LlmRequest {
+                conversation_id, ..
+            }
+            | ObserverEvent::LlmResponse {
+                conversation_id, ..
+            }
+            | ObserverEvent::ToolCallStart {
+                conversation_id, ..
+            }
+            | ObserverEvent::ToolCall {
+                conversation_id, ..
+            }
+            | ObserverEvent::MemoryRecall {
+                conversation_id, ..
+            }
+            | ObserverEvent::MemoryStore {
+                conversation_id, ..
+            }
+            | ObserverEvent::RagRetrieve {
+                conversation_id, ..
+            } => conversation_id.as_deref(),
             _ => None,
         }
     }

@@ -6,7 +6,7 @@ use crate::session_backend::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use std::path::Path;
 use zeroclaw_api::model_provider::ChatMessage;
 
@@ -29,7 +29,8 @@ impl SqliteSessionBackend {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;
-             PRAGMA mmap_size = 4194304;",
+             PRAGMA mmap_size = 4194304;
+             PRAGMA busy_timeout = 5000;",
         )?;
 
         conn.execute_batch(
@@ -136,6 +137,14 @@ impl SqliteSessionBackend {
             (
                 "sender_id",
                 "ALTER TABLE session_metadata ADD COLUMN sender_id TEXT",
+            ),
+            // Cross-turn conversation identity. Nullable: legacy rows keep
+            // NULL until first `resolve_or_create_conversation_id`
+            // backfills it. The UUID is a fact of record creation, persisted
+            // by the backend - never computed from `session_key`.
+            (
+                "conversation_id",
+                "ALTER TABLE session_metadata ADD COLUMN conversation_id TEXT",
             ),
         ] {
             let present: bool = conn
@@ -393,7 +402,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, conversation_id
              FROM session_metadata ORDER BY last_activity DESC",
         ) {
             Ok(s) => s,
@@ -410,6 +419,7 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
+            let conversation_id: Option<String> = row.get(9)?;
 
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -429,6 +439,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                conversation_id,
             })
         }) {
             Ok(r) => r,
@@ -590,7 +601,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, conversation_id
              FROM session_metadata WHERE session_key = ?1",
             params![session_key],
             |row| {
@@ -603,6 +614,7 @@ impl SessionBackend for SqliteSessionBackend {
                 let channel_id: Option<String> = row.get(6)?;
                 let room_id: Option<String> = row.get(7)?;
                 let sender_id: Option<String> = row.get(8)?;
+                let conversation_id: Option<String> = row.get(9)?;
 
                 let created = DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&Utc))
@@ -622,6 +634,7 @@ impl SessionBackend for SqliteSessionBackend {
                     channel_id,
                     room_id,
                     sender_id,
+                    conversation_id,
                 })
             },
         )
@@ -681,7 +694,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_running_sessions(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, conversation_id
              FROM session_metadata WHERE state = 'running' ORDER BY turn_started_at DESC",
         ) {
             Ok(s) => s,
@@ -698,6 +711,7 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
+            let conversation_id: Option<String> = row.get(9)?;
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -715,6 +729,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                conversation_id,
             })
         }) {
             Ok(r) => r,
@@ -729,7 +744,7 @@ impl SessionBackend for SqliteSessionBackend {
         #[allow(clippy::cast_possible_wrap)]
         let cutoff = (Utc::now() - chrono::Duration::seconds(threshold_secs as i64)).to_rfc3339();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, conversation_id
              FROM session_metadata
              WHERE state = 'running' AND turn_started_at < ?1
              ORDER BY turn_started_at ASC",
@@ -748,6 +763,7 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
+            let conversation_id: Option<String> = row.get(9)?;
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -765,6 +781,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                conversation_id,
             })
         }) {
             Ok(r) => r,
@@ -810,7 +827,7 @@ impl SessionBackend for SqliteSessionBackend {
         keys.iter()
             .filter_map(|key| {
                 conn.query_row(
-                    "SELECT created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id FROM session_metadata WHERE session_key = ?1",
+                    "SELECT created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, conversation_id FROM session_metadata WHERE session_key = ?1",
                     params![key],
                     |row| {
                         let created_str: String = row.get(0)?;
@@ -821,6 +838,7 @@ impl SessionBackend for SqliteSessionBackend {
                         let channel_id: Option<String> = row.get(5)?;
                         let room_id: Option<String> = row.get(6)?;
                         let sender_id: Option<String> = row.get(7)?;
+                        let conversation_id: Option<String> = row.get(8)?;
                         Ok(SessionMetadata {
                             key: key.clone(),
                             name,
@@ -836,6 +854,7 @@ impl SessionBackend for SqliteSessionBackend {
                             channel_id,
                             room_id,
                             sender_id,
+                            conversation_id,
                         })
                     },
                 )
@@ -900,6 +919,116 @@ impl SessionBackend for SqliteSessionBackend {
         )
         .map_err(std::io::Error::other)?;
         Ok(())
+    }
+
+    /// Atomically resolve-or-create the conversation id for a session record.
+    ///
+    /// Runs in a single `IMMEDIATE` transaction so that two independent
+    /// connections (or processes) that hit a never-resolved key converge on
+    /// one id: the first writer to acquire the RESERVED lock backfills the
+    /// column; every later transaction reads the committed value. The
+    /// `busy_timeout` pragma makes a contended `BEGIN IMMEDIATE` block instead
+    /// of returning `SQLITE_BUSY`, so convergence is deterministic.
+    fn resolve_or_create_conversation_id(&self, session_key: &str) -> std::io::Result<String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let now = Utc::now().to_rfc3339();
+
+        // Ensure a metadata row exists so the conversation id has a home.
+        // `resolve` may be called before the first `append`, so we can't rely
+        // on a prior row. `ON CONFLICT DO NOTHING` keeps `created_at` stable
+        // for existing rows.
+        tx.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
+             VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT(session_key) DO NOTHING",
+            params![session_key, now, now],
+        )
+        .map_err(std::io::Error::other)?;
+
+        // Read the committed value (NULL/empty for a legacy or fresh row).
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT conversation_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+
+        let resolved = match existing.filter(|id| !id.is_empty()) {
+            Some(id) => id,
+            None => {
+                let candidate = uuid::Uuid::new_v4().to_string();
+                // Upsert-if-null/empty: only write when no value is committed.
+                // Under the IMMEDIATE lock no concurrent writer can race this,
+                // but the predicate is kept defensive so a non-IMMEDIATE
+                // caller path could not clobber a winner.
+                tx.execute(
+                    "UPDATE session_metadata SET conversation_id = ?1
+                     WHERE session_key = ?2
+                       AND (conversation_id IS NULL OR conversation_id = '')",
+                    params![candidate, session_key],
+                )
+                .map_err(std::io::Error::other)?;
+                // Re-read the committed value (the fact, not the candidate).
+                tx.query_row(
+                    "SELECT conversation_id FROM session_metadata WHERE session_key = ?1",
+                    params![session_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(std::io::Error::other)?
+            }
+        };
+
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(resolved)
+    }
+
+    /// Atomically clear history + rotate the conversation id in one
+    /// record-scoped `IMMEDIATE` transaction. The fresh id is the fact of the
+    /// new conversation; it is returned (not re-derived by the caller). This
+    /// is the `/new`/`/clear` path - `remove_last`, `update_last`, `compact`,
+    /// and crash repair intentionally do NOT rotate.
+    fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let now = Utc::now().to_rfc3339();
+
+        // Ensure a metadata row exists (rotate may be requested before any
+        // message was appended).
+        tx.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
+             VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT(session_key) DO NOTHING",
+            params![session_key, now, now],
+        )
+        .map_err(std::io::Error::other)?;
+
+        // Clear the history. The FTS5 `sessions_ad` trigger keeps the index in
+        // sync with the row deletion.
+        tx.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        // Fresh id + message_count reset + activity stamp, together.
+        let new_id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "UPDATE session_metadata
+             SET message_count = 0, last_activity = ?1, conversation_id = ?2
+             WHERE session_key = ?3",
+            params![now, new_id, session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(new_id)
     }
 }
 
@@ -1533,5 +1662,221 @@ mod tests {
         assert_eq!(single.name, from_list.name);
         assert_eq!(single.created_at, from_list.created_at);
         assert_eq!(single.last_activity, from_list.last_activity);
+    }
+
+    // ── conversation_id (atomic channel identity) tests ───────────────
+
+    #[test]
+    fn conversation_id_resolve_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let id1 = backend.resolve_or_create_conversation_id("k").unwrap();
+        let id2 = backend.resolve_or_create_conversation_id("k").unwrap();
+        assert!(!id1.is_empty());
+        assert_eq!(id1, id2, "repeated resolve must return the same id");
+    }
+
+    #[test]
+    fn conversation_id_legacy_null_row_backfills() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // Simulate a legacy row created before the conversation_id column
+        // existed: a metadata row with conversation_id left NULL and no
+        // prior resolve call.
+        backend.append("legacy", &ChatMessage::user("old")).unwrap();
+        {
+            let conn = backend.conn.lock();
+            let present: bool = conn
+                .query_row(
+                    "SELECT conversation_id IS NULL FROM session_metadata \
+                     WHERE session_key = 'legacy'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "legacy row must start with NULL conversation_id");
+        }
+
+        let id = backend.resolve_or_create_conversation_id("legacy").unwrap();
+        assert!(!id.is_empty(), "resolve must backfill a non-empty id");
+        // Re-resolve returns the same committed value.
+        assert_eq!(
+            backend.resolve_or_create_conversation_id("legacy").unwrap(),
+            id
+        );
+    }
+
+    #[test]
+    fn conversation_id_survives_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let id_before = {
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            backend
+                .resolve_or_create_conversation_id("persist")
+                .unwrap()
+        };
+        // Reopen the same db file - the id was persisted, not recomputed.
+        let backend2 = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let id_after = backend2
+            .resolve_or_create_conversation_id("persist")
+            .unwrap();
+        assert_eq!(id_before, id_after);
+    }
+
+    #[test]
+    fn conversation_id_clear_and_rotate_clears_history_and_mints_new_id() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("rot", &ChatMessage::user("a")).unwrap();
+        backend.append("rot", &ChatMessage::assistant("b")).unwrap();
+        let id1 = backend.resolve_or_create_conversation_id("rot").unwrap();
+        assert_eq!(backend.load("rot").len(), 2);
+
+        let id2 = backend.clear_and_rotate_conversation("rot").unwrap();
+        assert_ne!(id1, id2, "rotate must mint a fresh id");
+        assert!(backend.load("rot").is_empty(), "rotate must clear history");
+        let meta = backend.get_session_metadata("rot").unwrap();
+        assert_eq!(meta.message_count, 0);
+        assert_eq!(
+            meta.conversation_id.as_deref(),
+            Some(id2.as_str()),
+            "metadata must expose the rotated id"
+        );
+        // Post-rotate resolve is stable on the new id (rotate is not repeated).
+        assert_eq!(
+            backend.resolve_or_create_conversation_id("rot").unwrap(),
+            id2
+        );
+    }
+
+    #[test]
+    fn conversation_id_other_key_isolation() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let id_a = backend.resolve_or_create_conversation_id("a").unwrap();
+        let id_b = backend.resolve_or_create_conversation_id("b").unwrap();
+        assert_ne!(id_a, id_b);
+
+        let id_a2 = backend.clear_and_rotate_conversation("a").unwrap();
+        assert_ne!(id_a, id_a2);
+        // Rotating a must not touch b's id.
+        assert_eq!(
+            backend.resolve_or_create_conversation_id("b").unwrap(),
+            id_b,
+            "other-key isolation: rotate(a) must not change b"
+        );
+    }
+
+    #[test]
+    fn conversation_id_delete_then_recreate_mints_new_id() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let id1 = backend.resolve_or_create_conversation_id("del").unwrap();
+        assert!(backend.delete_session("del").unwrap());
+        let id2 = backend.resolve_or_create_conversation_id("del").unwrap();
+        assert_ne!(id1, id2, "delete + recreate must mint a fresh id");
+    }
+
+    #[test]
+    fn conversation_id_concurrent_resolve_converges() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        // Two independent backend instances (separate connections) on the
+        // same db file - the IMMEDIATE txn + busy_timeout must serialize
+        // them onto one id.
+        let a = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        let b = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let key = "conv_concurrent";
+
+        let bar = barrier.clone();
+        let a_c = a.clone();
+        let h1 = thread::spawn(move || {
+            bar.wait();
+            a_c.resolve_or_create_conversation_id(key).unwrap()
+        });
+        let bar2 = barrier.clone();
+        let h2 = thread::spawn(move || {
+            bar2.wait();
+            b.resolve_or_create_conversation_id(key).unwrap()
+        });
+        let id1 = h1.join().unwrap();
+        let id2 = h2.join().unwrap();
+
+        assert!(!id1.is_empty() && !id2.is_empty());
+        assert_eq!(
+            id1, id2,
+            "two concurrent first-access resolves must converge on one id"
+        );
+
+        // A third fresh instance must read the same committed id.
+        let c = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let id3 = c.resolve_or_create_conversation_id(key).unwrap();
+        assert_eq!(id3, id1);
+    }
+
+    #[test]
+    fn conversation_id_resolve_and_rotate_race_stays_consistent() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let a = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        let initial = a.resolve_or_create_conversation_id("race").unwrap();
+        let b = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Resolver: spins resolves; every one must observe a valid,
+        // linearly-explainable id (either pre-rotate `initial` or the
+        // post-rotate id - never empty/corrupt).
+        let bar = barrier.clone();
+        let a_c = a.clone();
+        let h_res = thread::spawn(move || {
+            bar.wait();
+            let mut ids = Vec::new();
+            for _ in 0..64 {
+                ids.push(a_c.resolve_or_create_conversation_id("race").unwrap());
+            }
+            ids
+        });
+
+        // Rotator: one atomic clear+rotate.
+        let bar2 = barrier.clone();
+        let h_rot = thread::spawn(move || {
+            bar2.wait();
+            b.clear_and_rotate_conversation("race").unwrap()
+        });
+
+        let rotated = h_rot.join().unwrap();
+        let ids = h_res.join().unwrap();
+        assert_ne!(rotated, initial);
+        for id in &ids {
+            assert!(!id.is_empty(), "race produced an empty id");
+            assert!(
+                *id == initial || *id == rotated,
+                "race produced an id ({id}) that is neither the pre- nor post-rotate value"
+            );
+        }
+
+        // After both threads joined, the rotate has committed. A fresh
+        // instance must observe the post-rotate state: rotated id, empty
+        // history.
+        let c = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(
+            c.resolve_or_create_conversation_id("race").unwrap(),
+            rotated,
+            "final committed id must be the rotated one"
+        );
+        assert!(
+            c.load("race").is_empty(),
+            "rotate must have cleared history"
+        );
     }
 }

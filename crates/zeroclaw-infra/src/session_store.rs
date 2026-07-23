@@ -13,6 +13,14 @@ type MutationLock = parking_lot::Mutex<()>;
 static MUTATION_LOCKS: OnceLock<parking_lot::Mutex<HashMap<PathBuf, Weak<MutationLock>>>> =
     OnceLock::new();
 
+/// Suffix for the per-key advisory file lock (held across resolve / rotate /
+/// delete so two `SessionStore` instances on the same dir converge on one
+/// conversation id). Kept distinct from `.jsonl` so it never shows up in
+/// `list_sessions`.
+const LOCK_SUFFIX: &str = ".lock";
+/// Suffix for the conversation-identity sidecar persisted next to `.jsonl`.
+const META_SUFFIX: &str = ".meta.json";
+
 /// Append-only JSONL session store for channel conversations.
 pub struct SessionStore {
     sessions_dir: PathBuf,
@@ -35,6 +43,89 @@ impl SessionStore {
     fn session_path(&self, session_key: &str) -> PathBuf {
         self.sessions_dir
             .join(format!("{}.jsonl", sanitize_session_key(session_key)))
+    }
+
+    /// Path to the per-key advisory lock file. Derives from the sanitized key
+    /// the same way `.jsonl` does so the two stay siblings.
+    fn lock_path(&self, session_key: &str) -> PathBuf {
+        self.sessions_dir.join(format!(
+            "{}{}",
+            sanitize_session_key(session_key),
+            LOCK_SUFFIX
+        ))
+    }
+
+    /// Path to the conversation-identity sidecar (`{"conversation_id": "..."}`).
+    fn meta_path(&self, session_key: &str) -> PathBuf {
+        self.sessions_dir.join(format!(
+            "{}{}",
+            sanitize_session_key(session_key),
+            META_SUFFIX
+        ))
+    }
+
+    /// Run `f` while holding the per-key exclusive file lock. Creates the
+    /// `.lock` file if it does not yet exist. The lock is advisory and
+    /// process-local-coherent: it serializes resolve / clear+rotate / delete
+    /// across independent `SessionStore` instances pointing at the same dir,
+    /// which is what makes concurrent first-access converge on one id.
+    #[allow(clippy::suspicious_open_options)]
+    fn with_key_lock<R>(
+        &self,
+        session_key: &str,
+        f: impl FnOnce() -> std::io::Result<R>,
+    ) -> std::io::Result<R> {
+        let lock_path = self.lock_path(session_key);
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Lock file content is irrelevant - only the file lock is used - so
+        // neither truncate nor append is wanted here.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        file.lock()?;
+        f()
+    }
+
+    /// Read the persisted conversation id from the sidecar. `None` if the
+    /// sidecar is absent (legacy `.jsonl` with no identity yet) or holds an
+    /// empty value.
+    fn read_conversation_id(&self, session_key: &str) -> std::io::Result<Option<String>> {
+        let path = self.meta_path(session_key);
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => {
+                let v: serde_json::Value = serde_json::from_str(&contents)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                Ok(v.get("conversation_id")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Persist the conversation id to the sidecar via a sibling temp file +
+    /// flush/sync + atomic rename, so a crash mid-write never leaves a
+    /// truncated or empty identity. Caller already holds the per-key lock.
+    fn write_conversation_id(&self, session_key: &str, id: &str) -> std::io::Result<()> {
+        let path = self.meta_path(session_key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::json!({ "conversation_id": id }).to_string() + "\n";
+        let tmp = path.with_extension("tmp");
+        {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
     }
 
     /// Load all messages for a session from its JSONL file.
@@ -168,15 +259,28 @@ impl SessionStore {
         Ok(count)
     }
 
-    /// Delete a session's JSONL file. Returns `true` if the file existed.
+    /// Delete a session's JSONL file and conversation-identity sidecar.
+    /// Returns `true` if either existed. The per-key `.lock` file is
+    /// intentionally NOT unlinked so concurrent operations on the same key
+    /// stay coherent. The delete is performed under the per-key exclusive
+    /// lock so it cannot race a concurrent resolve / rotate.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let _guard = self.mutation_lock.lock();
-        let path = self.session_path(session_key);
-        if !path.exists() {
-            return Ok(false);
-        }
-        std::fs::remove_file(&path)?;
-        Ok(true)
+        self.with_key_lock(session_key, || {
+            let data_path = self.session_path(session_key);
+            let meta_path = self.meta_path(session_key);
+            let data_existed = data_path.exists();
+            let meta_existed = meta_path.exists();
+            if data_existed {
+                std::fs::remove_file(&data_path)?;
+            }
+            // Best-effort: a missing/unreadable sidecar must not fail the
+            // delete of the data file that did exist.
+            if meta_existed {
+                let _ = std::fs::remove_file(&meta_path);
+            }
+            Ok(data_existed || meta_existed)
+        })
     }
 
     /// Return the modification time of a session's JSONL file.
@@ -258,6 +362,10 @@ impl SessionBackend for SessionStore {
                     channel_id: None,
                     room_id: None,
                     sender_id: None,
+                    // The listing is intentionally partial (mirrors `name` /
+                    // `message_count` being best-effort here). The
+                    // authoritative read is `resolve_or_create_conversation_id`.
+                    conversation_id: None,
                 }
             })
             .collect()
@@ -280,6 +388,44 @@ impl SessionBackend for SessionStore {
     /// O(1) `stat` that `delete_session` itself performs.
     fn session_exists(&self, session_key: &str) -> bool {
         self.session_path(session_key).exists()
+    }
+
+    /// Atomically resolve-or-create the conversation id for a session key.
+    /// Reads the `.meta.json` sidecar under the per-key exclusive lock; if
+    /// absent/empty (legacy `.jsonl` with no sidecar, or a brand new key) it
+    /// generates a UUID and persists it via temp+sync+rename. The exclusive
+    /// lock makes two `SessionStore` instances on the same dir converge on a
+    /// single id.
+    fn resolve_or_create_conversation_id(&self, session_key: &str) -> std::io::Result<String> {
+        self.with_key_lock(session_key, || {
+            if let Some(existing) = self.read_conversation_id(session_key)? {
+                return Ok(existing);
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            self.write_conversation_id(session_key, &id)?;
+            Ok(id)
+        })
+    }
+
+    /// Atomically clear the JSONL history AND rotate the conversation id in
+    /// one record-scoped operation under the per-key exclusive lock. The
+    /// `.jsonl` is truncated (file preserved so the key stays listed) and a
+    /// fresh UUID is persisted to the sidecar. This is the `/new`/`/clear`
+    /// path - `remove_last`, `update_last`, `compact`, and crash repair do
+    /// NOT rotate.
+    fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String> {
+        self.with_key_lock(session_key, || {
+            let data_path = self.session_path(session_key);
+            if let Some(parent) = data_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Truncate the history. `File::create` truncates to empty while
+            // preserving the file so the key remains in `list_sessions`.
+            std::fs::File::create(&data_path)?;
+            let id = uuid::Uuid::new_v4().to_string();
+            self.write_conversation_id(session_key, &id)?;
+            Ok(id)
+        })
     }
 }
 
@@ -715,5 +861,203 @@ mod tests {
         assert_eq!(meta.key, "test_session");
         assert_eq!(meta.message_count, 2);
         assert!(meta.name.is_none());
+    }
+
+    // ── conversation_id (atomic channel identity) tests ───────────────
+
+    #[test]
+    fn conversation_id_resolve_is_idempotent_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        let id1 = store.resolve_or_create_conversation_id("k").unwrap();
+        let id2 = store.resolve_or_create_conversation_id("k").unwrap();
+        assert!(!id1.is_empty());
+        assert_eq!(id1, id2, "repeated resolve must return the same id");
+        // Sidecar is written next to the jsonl.
+        assert!(store.meta_path("k").exists());
+    }
+
+    #[test]
+    fn conversation_id_legacy_jsonl_backfills_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        // Legacy: a `.jsonl` exists with NO sidecar (pre-dates the identity
+        // column). First resolve must synthesize the sidecar, not fail.
+        store.append("legacy", &ChatMessage::user("old")).unwrap();
+        assert!(!store.meta_path("legacy").exists(), "legacy has no sidecar");
+
+        let id = store.resolve_or_create_conversation_id("legacy").unwrap();
+        assert!(!id.is_empty());
+        assert!(
+            store.meta_path("legacy").exists(),
+            "resolve must create sidecar"
+        );
+        assert_eq!(
+            store.resolve_or_create_conversation_id("legacy").unwrap(),
+            id,
+            "re-resolve returns the same id"
+        );
+    }
+
+    #[test]
+    fn conversation_id_survives_reopen_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let id_before = {
+            let store = SessionStore::new(tmp.path()).unwrap();
+            store.resolve_or_create_conversation_id("persist").unwrap()
+        };
+        let store2 = SessionStore::new(tmp.path()).unwrap();
+        let id_after = store2.resolve_or_create_conversation_id("persist").unwrap();
+        assert_eq!(id_before, id_after);
+    }
+
+    #[test]
+    fn conversation_id_clear_and_rotate_clears_history_and_mints_new_id_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        store.append("rot", &ChatMessage::user("a")).unwrap();
+        store.append("rot", &ChatMessage::assistant("b")).unwrap();
+        let id1 = store.resolve_or_create_conversation_id("rot").unwrap();
+        assert_eq!(store.load("rot").len(), 2);
+
+        let id2 = store.clear_and_rotate_conversation("rot").unwrap();
+        assert_ne!(id1, id2, "rotate must mint a fresh id");
+        assert!(store.load("rot").is_empty(), "rotate must clear history");
+        // The .jsonl is preserved (truncated) so the key stays listed.
+        assert!(store.session_path("rot").exists());
+        // The sidecar now holds the rotated id.
+        let stored = store.read_conversation_id("rot").unwrap();
+        assert_eq!(stored.as_deref(), Some(id2.as_str()));
+        // Post-rotate resolve is stable on the new id.
+        assert_eq!(store.resolve_or_create_conversation_id("rot").unwrap(), id2);
+    }
+
+    #[test]
+    fn conversation_id_other_key_isolation_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        let id_a = store.resolve_or_create_conversation_id("a").unwrap();
+        let id_b = store.resolve_or_create_conversation_id("b").unwrap();
+        assert_ne!(id_a, id_b);
+
+        let id_a2 = store.clear_and_rotate_conversation("a").unwrap();
+        assert_ne!(id_a, id_a2);
+        assert_eq!(
+            store.resolve_or_create_conversation_id("b").unwrap(),
+            id_b,
+            "other-key isolation: rotate(a) must not change b"
+        );
+    }
+
+    #[test]
+    fn conversation_id_delete_then_recreate_mints_new_id_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        // Seed a data file + sidecar so both exist before delete.
+        store.append("del", &ChatMessage::user("x")).unwrap();
+        let id1 = store.resolve_or_create_conversation_id("del").unwrap();
+        assert!(store.delete_session("del").unwrap());
+        assert!(
+            !store.meta_path("del").exists(),
+            "delete must remove sidecar"
+        );
+        let id2 = store.resolve_or_create_conversation_id("del").unwrap();
+        assert_ne!(id1, id2, "delete + recreate must mint a fresh id");
+    }
+
+    #[test]
+    fn conversation_id_concurrent_resolve_converges_jsonl() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        // Two independent SessionStore instances on the same dir. The
+        // per-key file lock must serialize them onto one id.
+        let a = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let b = SessionStore::new(tmp.path()).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let key = "conv_concurrent";
+
+        let bar = barrier.clone();
+        let a_c = a.clone();
+        let h1 = thread::spawn(move || {
+            bar.wait();
+            a_c.resolve_or_create_conversation_id(key).unwrap()
+        });
+        let bar2 = barrier.clone();
+        let h2 = thread::spawn(move || {
+            bar2.wait();
+            b.resolve_or_create_conversation_id(key).unwrap()
+        });
+        let id1 = h1.join().unwrap();
+        let id2 = h2.join().unwrap();
+
+        assert!(!id1.is_empty() && !id2.is_empty());
+        assert_eq!(
+            id1, id2,
+            "two concurrent first-access resolves must converge on one id"
+        );
+
+        // A third fresh instance reads the same persisted id.
+        let c = SessionStore::new(tmp.path()).unwrap();
+        assert_eq!(c.resolve_or_create_conversation_id(key).unwrap(), id1);
+    }
+
+    #[test]
+    fn conversation_id_resolve_and_rotate_race_stays_consistent_jsonl() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let a = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let initial = a.resolve_or_create_conversation_id("race").unwrap();
+        let b = SessionStore::new(tmp.path()).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+
+        let bar = barrier.clone();
+        let a_c = a.clone();
+        let h_res = thread::spawn(move || {
+            bar.wait();
+            let mut ids = Vec::new();
+            for _ in 0..64 {
+                ids.push(a_c.resolve_or_create_conversation_id("race").unwrap());
+            }
+            ids
+        });
+
+        let bar2 = barrier.clone();
+        let h_rot = thread::spawn(move || {
+            bar2.wait();
+            b.clear_and_rotate_conversation("race").unwrap()
+        });
+
+        let rotated = h_rot.join().unwrap();
+        let ids = h_res.join().unwrap();
+        assert_ne!(rotated, initial);
+        for id in &ids {
+            assert!(!id.is_empty(), "race produced an empty id");
+            assert!(
+                *id == initial || *id == rotated,
+                "race produced an id ({id}) that is neither the pre- nor post-rotate value"
+            );
+        }
+
+        // After both threads joined the rotate has committed. A fresh
+        // instance must observe post-rotate state.
+        let c = SessionStore::new(tmp.path()).unwrap();
+        assert_eq!(
+            c.resolve_or_create_conversation_id("race").unwrap(),
+            rotated,
+            "final persisted id must be the rotated one"
+        );
+        assert!(
+            c.load("race").is_empty(),
+            "rotate must have cleared history"
+        );
     }
 }

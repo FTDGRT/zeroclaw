@@ -31,6 +31,12 @@ pub struct SessionMetadata {
     /// Inbound sender id verbatim (Discord username, phone number, ...).
     /// Not an FK — sessions can survive deletion of the upstream user.
     pub sender_id: Option<String>,
+    /// Cross-turn conversation identity. This is a FACT of record creation,
+    /// generated server-side and persisted by the backend (NOT computed from
+    /// `session_key` - the key only LOCATES the record). `None` for legacy
+    /// rows that predate the column / sidecar and have not yet been resolved.
+    /// In durable mode the backend record is the single source of truth.
+    pub conversation_id: Option<String>,
 }
 
 /// Structured routing context recorded alongside a session. Mirrors the
@@ -119,6 +125,7 @@ pub trait SessionBackend: Send + Sync {
                     channel_id: None,
                     room_id: None,
                     sender_id: None,
+                    conversation_id: None,
                 }
             })
             .collect()
@@ -217,6 +224,7 @@ pub trait SessionBackend: Send + Sync {
             channel_id: None,
             room_id: None,
             sender_id: None,
+            conversation_id: None,
         })
     }
 
@@ -245,6 +253,30 @@ pub trait SessionBackend: Send + Sync {
     fn list_stuck_sessions(&self, _threshold_secs: u64) -> Vec<SessionMetadata> {
         Vec::new()
     }
+
+    /// Atomically resolve-or-create the cross-turn conversation identity for
+    /// a session record. The UUID is a fact of record creation, generated
+    /// server-side and persisted; `session_key` only locates the record.
+    ///
+    /// Concurrency contract: two independent backend instances (or two
+    /// processes) that resolve the same key for the first time MUST converge
+    /// on one and the same id. In durable mode the backend record is the
+    /// single source of truth; legacy rows (NULL/empty id) are backfilled
+    /// on first resolve. Production backends MUST NOT provide a "fresh UUID
+    /// every call" default - the id is stable once written.
+    ///
+    /// No default implementation is provided so that every mock is forced to
+    /// declare its behavior explicitly.
+    fn resolve_or_create_conversation_id(&self, session_key: &str) -> std::io::Result<String>;
+
+    /// Atomically clear the session history AND rotate the conversation id
+    /// in a single record-scoped operation. Returns the fresh id.
+    ///
+    /// This is ONE atomic op (clear history + new id together), NOT a
+    /// caller-composed `delete + resolve`. `remove_last`, `update_last`,
+    /// `compact`, and crash repair do NOT rotate the id. No default
+    /// implementation is provided.
+    fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String>;
 }
 
 /// Session state information.
@@ -274,6 +306,7 @@ mod tests {
             channel_id: None,
             room_id: None,
             sender_id: None,
+            conversation_id: None,
         };
         assert_eq!(meta.key, "test");
         assert_eq!(meta.message_count, 5);

@@ -2068,6 +2068,14 @@ mod tests {
             // The user deleted the session between cancel and append.
             false
         }
+        // This mock is about append-resurrection, not conversation identity.
+        // A fresh id per call is fine - it just needs to compile.
+        fn resolve_or_create_conversation_id(&self, _session_key: &str) -> std::io::Result<String> {
+            Ok(uuid::Uuid::new_v4().to_string())
+        }
+        fn clear_and_rotate_conversation(&self, _session_key: &str) -> std::io::Result<String> {
+            Ok(uuid::Uuid::new_v4().to_string())
+        }
     }
 
     #[test]

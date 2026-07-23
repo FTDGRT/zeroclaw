@@ -859,6 +859,14 @@ mod tests {
             self.metadata.lock().unwrap().contains_key(session_key)
                 || self.inner.session_exists(session_key)
         }
+
+        fn resolve_or_create_conversation_id(&self, session_key: &str) -> std::io::Result<String> {
+            self.inner.resolve_or_create_conversation_id(session_key)
+        }
+
+        fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String> {
+            self.inner.clear_and_rotate_conversation(session_key)
+        }
     }
 
     fn session_metadata(
@@ -877,6 +885,7 @@ mod tests {
             channel_id: channel_id.map(str::to_string),
             room_id: None,
             sender_id: None,
+            conversation_id: None,
         }
     }
 
@@ -1690,6 +1699,12 @@ mod tests {
         }
         fn list_sessions(&self) -> Vec<String> {
             self.0.list_sessions()
+        }
+        fn resolve_or_create_conversation_id(&self, key: &str) -> std::io::Result<String> {
+            self.0.resolve_or_create_conversation_id(key)
+        }
+        fn clear_and_rotate_conversation(&self, key: &str) -> std::io::Result<String> {
+            self.0.clear_and_rotate_conversation(key)
         }
     }
 

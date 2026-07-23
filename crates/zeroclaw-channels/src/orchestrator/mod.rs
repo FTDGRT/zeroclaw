@@ -11824,6 +11824,16 @@ fn concurrent_persist_lock_serialization() {
         fn list_sessions(&self) -> Vec<String> {
             vec![]
         }
+        // Test mock: a fresh id per call is fine here - the persist-lock
+        // serialization under test is about `append` ordering, not the
+        // conversation identity invariant. Explicit impl is required because
+        // the trait provides no default.
+        fn resolve_or_create_conversation_id(&self, _key: &str) -> std::io::Result<String> {
+            Ok(uuid::Uuid::new_v4().to_string())
+        }
+        fn clear_and_rotate_conversation(&self, _key: &str) -> std::io::Result<String> {
+            Ok(uuid::Uuid::new_v4().to_string())
+        }
     }
 
     let sender = "concurrent_test_key".to_string();
