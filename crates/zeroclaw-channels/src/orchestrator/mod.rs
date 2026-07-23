@@ -5567,6 +5567,7 @@ async fn process_channel_message_body(
         route.model.clone(),
         Some(msg.channel.to_string()),
         Some(ctx.agent_alias.to_string()),
+        None,
         Some(turn_id.clone()),
     );
     let (llm_result, fallback_info) = scope_provider_fallback(async {
@@ -5657,6 +5658,7 @@ async fn process_channel_message_body(
                 agent_alias: Some(ctx.agent_alias.as_str()),
                 parent_agent_alias: None,
                 turn_id: &turn_id,
+                conversation_id: None,
                 // Live channel-daemon SOP path: re-assemble a nested step's
                 // agent when it delegates to a different agent, so the step runs
                 // with that agent's own gated tools/policy/MCP scope rather than
@@ -23263,6 +23265,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 parent_agent_alias: None,
                 agent_alias: Some("test-agent"),
                 turn_id: "test-turn",
+                conversation_id: None,
                 channel_name: "test-channel",
             },
         )

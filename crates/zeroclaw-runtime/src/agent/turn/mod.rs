@@ -132,6 +132,12 @@ pub struct ToolLoop<'a> {
     /// the acting authority and its parent. `None` for ordinary turns.
     pub parent_agent_alias: Option<&'a str>,
     pub turn_id: &'a str,
+    /// Caller-owned cross-turn conversation attribution, threaded verbatim
+    /// into [`TurnCtx`] and its [`TurnMeta`] so every turn-level observer
+    /// event in the loop carries one stable id. `None` for nested sub-loops
+    /// and paths without a conversation owner. Independent of
+    /// `memory_session_id`; never a fallback between the two.
+    pub conversation_id: Option<&'a str>,
     /// Handle the live SOP driver uses to re-assemble a nested step's execution
     /// context when the step delegates to a different agent (see
     /// [`SopStepReassembly`]). `None` on every path that cannot reach `Config`
@@ -309,6 +315,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         agent_alias,
         parent_agent_alias,
         turn_id,
+        conversation_id,
         sop_reassembly,
     } = p;
     let ResolvedAgentExecution {
@@ -400,6 +407,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     agent_alias,
                     parent_agent_alias,
                     turn_id,
+                    conversation_id,
                     channel_name,
                 },
             )
@@ -459,6 +467,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         strict_tool_parsing,
         channel,
         turn_id,
+        conversation_id,
         agent_alias,
         parent_agent_alias,
     };
@@ -1989,6 +1998,10 @@ async fn drive_live_sop_actions(
                                         parent_agent_alias
                                     },
                                     turn_id: &nested_turn_id,
+                                    // Nested cross-agent SOP step: a distinct
+                                    // conversation owner (if any) is the step
+                                    // agent's to mint, never the parent's.
+                                    conversation_id: None,
                                     sop_reassembly,
                                 })),
                             )

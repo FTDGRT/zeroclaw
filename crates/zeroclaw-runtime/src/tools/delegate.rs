@@ -2690,6 +2690,7 @@ impl DelegateTool {
                 agent_alias: Some(agent_name),
                 parent_agent_alias: None,
                 turn_id: &turn_id,
+                conversation_id: None,
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)

@@ -716,6 +716,7 @@ fn build_hardware_context(
         channel: Some(turn.channel_name.to_string()),
         agent_alias: turn.agent_alias.map(str::to_string),
         turn_id: Some(turn.turn_id.to_string()),
+        conversation_id: turn.conversation_id.map(str::to_string),
     });
 
     if chunks.is_empty() && pin_ctx.is_empty() {
@@ -781,6 +782,7 @@ pub async fn agent_turn(
     origin: TurnOrigin,
     memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
     agent_alias: Option<&str>,
+    conversation_id: Option<&str>,
     turn_id: Option<&str>,
 ) -> Result<String> {
     agent_turn_with_sop_reassembly(
@@ -810,6 +812,7 @@ pub async fn agent_turn(
         origin,
         memory,
         agent_alias,
+        conversation_id,
         turn_id,
         None,
     )
@@ -844,6 +847,7 @@ async fn agent_turn_with_sop_reassembly(
     origin: TurnOrigin,
     memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
     agent_alias: Option<&str>,
+    conversation_id: Option<&str>,
     turn_id: Option<&str>,
     sop_reassembly: Option<SopStepReassembly<'_>>,
 ) -> Result<String> {
@@ -861,14 +865,16 @@ async fn agent_turn_with_sop_reassembly(
     // through `agent_turn` (gateway webhook chat via `process_message`, peer
     // messages) surface turn lifecycle events to observers — mirroring the
     // CLI `run` and `Agent::turn_streamed` entry points. The brackets carry
-    // the caller's resolved alias, so they agree with the inner events on the
-    // full (channel, agent_alias, turn_id) triple.
+    // the caller's resolved alias and caller-owned conversation id, so they
+    // agree with the inner events on the full
+    // (channel, agent_alias, turn_id, conversation_id) correlation tuple.
     let mut turn_guard = crate::observability::AgentTurnGuard::start(
         observer,
         provider_name,
         model,
         Some(channel_name.to_string()),
         agent_alias.map(str::to_string),
+        conversation_id.map(str::to_string),
         Some(turn_id.clone()),
     );
     let result = run_tool_call_loop(ToolLoop {
@@ -924,6 +930,7 @@ async fn agent_turn_with_sop_reassembly(
         agent_alias,
         parent_agent_alias: None,
         turn_id: &turn_id,
+        conversation_id,
     })
     .await;
     // Snapshot token usage from the task-local cost context when the caller
@@ -1818,6 +1825,7 @@ pub async fn run(
                             parent_agent_alias: None,
                             agent_alias: Some(agent_alias),
                             turn_id: &turn_id,
+                            conversation_id: None,
                             channel_name,
                         },
                     )
@@ -1940,6 +1948,7 @@ pub async fn run(
                                 agent_alias: Some(agent_alias),
                                 parent_agent_alias: None,
                                 turn_id: &turn_id,
+                                conversation_id: None,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
                                 }),
@@ -2336,6 +2345,7 @@ pub async fn run(
                                 parent_agent_alias: None,
                                 agent_alias: Some(agent_alias),
                                 turn_id: &turn_id,
+                                conversation_id: None,
                                 channel_name,
                             },
                         )
@@ -2489,6 +2499,7 @@ pub async fn run(
                                     agent_alias: Some(agent_alias),
                                     parent_agent_alias: None,
                                     turn_id: &turn_id,
+                                    conversation_id: None,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
                                     }),
@@ -2772,6 +2783,7 @@ pub async fn process_message(
     message: &str,
     session_id: Option<&str>,
     origin: TurnOrigin,
+    conversation_id: Option<&str>,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
@@ -2803,6 +2815,7 @@ pub async fn process_message(
     let __zc_alias = agent_alias.to_string();
     let __zc_message = message.to_string();
     let __zc_session_id = session_id.map(str::to_string);
+    let __zc_conversation_id = conversation_id.map(str::to_string);
     let __zc_attribution_span =
         ::zeroclaw_log::attribution_span!(&crate::agent::AgentAttribution(__zc_alias.as_str()));
     let __zc_scope_span = ::zeroclaw_log::info_span!(
@@ -2816,6 +2829,7 @@ pub async fn process_message(
         let agent_alias: &str = __zc_alias.as_str();
         let message: &str = __zc_message.as_str();
         let session_id: Option<&str> = __zc_session_id.as_deref();
+        let conversation_id: Option<&str> = __zc_conversation_id.as_deref();
 
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
@@ -3231,6 +3245,7 @@ pub async fn process_message(
                         parent_agent_alias: None,
                         agent_alias: Some(agent_alias),
                         turn_id: &turn_id,
+                        conversation_id,
                         channel_name: "daemon",
                     },
                 )
@@ -3312,6 +3327,7 @@ pub async fn process_message(
                         ),
                     }),
                     Some(agent_alias),
+                    conversation_id,
                     Some(&turn_id),
                     Some(SopStepReassembly { config: &config }),
                 ),
@@ -3812,6 +3828,7 @@ mod tests {
 
         let observer = NoopObserver;
         let meta = TurnMeta {
+            conversation_id: None,
             parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
@@ -3856,6 +3873,7 @@ mod tests {
             .activate("docker-mcp__extract_text".into(), activated_tool);
 
         let meta = TurnMeta {
+            conversation_id: None,
             parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
@@ -3906,6 +3924,7 @@ mod tests {
         .join();
 
         let meta = TurnMeta {
+            conversation_id: None,
             parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
@@ -3941,6 +3960,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EmptySuccessTool)];
 
         let meta = TurnMeta {
+            conversation_id: None,
             parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
@@ -3997,6 +4017,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(CredentialOutputTool)];
 
         let meta = TurnMeta {
+            conversation_id: None,
             parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
@@ -5185,6 +5206,7 @@ mod tests {
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5262,6 +5284,7 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5346,6 +5369,7 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5435,6 +5459,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5509,6 +5534,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5586,6 +5612,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5664,6 +5691,7 @@ mod tests {
         // Even though vision_model_provider points to a nonexistent model_provider, this
         // should succeed because there are no image markers to trigger routing.
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5729,6 +5757,7 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                conversation_id: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
@@ -5915,6 +5944,7 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                conversation_id: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
@@ -6040,6 +6070,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6117,6 +6148,7 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6193,6 +6225,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6355,6 +6388,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6496,6 +6530,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6657,6 +6692,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6775,6 +6811,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6948,6 +6985,7 @@ mod tests {
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
 
         let _ = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7057,6 +7095,7 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7150,6 +7189,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7235,6 +7275,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7328,6 +7369,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7424,6 +7466,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7525,6 +7568,7 @@ mod tests {
         );
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7739,6 +7783,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7837,6 +7882,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7940,6 +7986,7 @@ mod tests {
         let dedup_exempt = vec!["shell".to_string()];
 
         let err = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8033,6 +8080,7 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8130,6 +8178,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8229,6 +8278,7 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let _result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8314,6 +8364,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8403,6 +8454,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8487,6 +8539,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8569,6 +8622,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8654,6 +8708,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8736,6 +8791,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8817,6 +8873,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8890,6 +8947,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8964,6 +9022,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9038,6 +9097,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9114,6 +9174,7 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9195,6 +9256,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9288,6 +9350,7 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9364,6 +9427,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9443,6 +9507,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9520,6 +9585,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9598,6 +9664,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9733,6 +9800,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9819,6 +9887,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9909,6 +9978,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10022,6 +10092,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10141,6 +10212,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10233,6 +10305,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10336,6 +10409,7 @@ This is an example, not an invocation."#;
 
         let turn_id = uuid::Uuid::new_v4().to_string();
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11219,6 +11293,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11324,6 +11399,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11428,6 +11504,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11532,6 +11609,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11691,6 +11769,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11830,6 +11909,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // conversation_id: not under test
                 None, // turn_id: self-minted
             )
             .await
@@ -11903,6 +11983,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // conversation_id: not under test
                 None, // turn_id: self-minted
             )
             .await
@@ -12033,6 +12114,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // conversation_id: not under test
                 None, // turn_id: self-minted
             )
             .await
@@ -12114,6 +12196,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // conversation_id: not under test
                 None, // turn_id: self-minted
             )
             .await
@@ -14099,6 +14182,7 @@ Let me check the result."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -14278,6 +14362,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    conversation_id: None,
                     parent_agent_alias: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
@@ -14478,6 +14563,7 @@ Let me check the result."#;
         ];
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -14594,6 +14680,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    conversation_id: None,
                     parent_agent_alias: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
@@ -14676,6 +14763,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -14765,6 +14853,7 @@ Let me check the result."#;
         ];
 
         let _ = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -15658,6 +15747,7 @@ Let me check the result."#;
             "hello",
             Some("session"),
             TurnOrigin::SubTurn,
+            None,
         )
         .await;
 
@@ -15734,6 +15824,7 @@ Let me check the result."#;
             "hello",
             Some("session"),
             TurnOrigin::SubTurn,
+            None,
         )
         .await;
 
@@ -15982,6 +16073,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            conversation_id: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -16086,6 +16178,7 @@ Let me check the result."#;
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
+            None, // conversation_id: not under test
             None, // turn_id: self-minted
         )
         .await
@@ -16139,6 +16232,7 @@ Let me check the result."#;
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
+            None, // conversation_id: not under test
             None, // turn_id: self-minted
         )
         .await
@@ -16209,6 +16303,7 @@ Let me check the result."#;
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
+            None, // conversation_id: not under test
             Some("pre-minted-turn"),
         )
         .await
@@ -16784,6 +16879,7 @@ Pin 13: LED
             &boards,
             5,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: Some("coder"),
                 turn_id: "turn-7",

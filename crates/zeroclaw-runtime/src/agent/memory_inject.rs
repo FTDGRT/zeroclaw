@@ -313,7 +313,7 @@ pub async fn render_memory_context(
         channel: Some(turn.channel_name.to_string()),
         agent_alias: turn.agent_alias.map(str::to_string),
         turn_id: Some(turn.turn_id.to_string()),
-        conversation_id: None,
+        conversation_id: turn.conversation_id.map(str::to_string),
     });
 
     if cfg.rerank_enabled {
@@ -673,6 +673,7 @@ mod tests {
             &MemoryInjectConfig::default(),
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -705,6 +706,7 @@ mod tests {
             &MemoryInjectConfig::default(),
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: Some("default"),
                 turn_id: "turn-42",
@@ -754,6 +756,7 @@ mod tests {
             &MemoryInjectConfig::default(),
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -779,6 +782,7 @@ mod tests {
             &MemoryInjectConfig::default(),
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -812,6 +816,7 @@ mod tests {
             &MemoryInjectConfig::default(),
             true,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -852,6 +857,7 @@ mod tests {
             &MemoryInjectConfig::default(),
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -887,6 +893,7 @@ mod tests {
             &cfg,
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -920,6 +927,7 @@ mod tests {
             &MemoryInjectConfig::default(),
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -958,6 +966,7 @@ mod tests {
             &cfg,
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -999,6 +1008,7 @@ mod tests {
             &MemoryInjectConfig::default(),
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -1041,6 +1051,7 @@ mod tests {
             &MemoryInjectConfig::default(),
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -1056,6 +1067,7 @@ mod tests {
             &MemoryInjectConfig::default(),
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -1178,6 +1190,7 @@ mod tests {
                     cfg,
                     exclude_conversation,
                     TurnMeta {
+                        conversation_id: None,
                         parent_agent_alias: None,
                         agent_alias: None,
                         turn_id: "t",
@@ -1385,6 +1398,7 @@ mod tests {
             &off,
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -1423,6 +1437,7 @@ mod tests {
             &on,
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -1457,6 +1472,7 @@ mod tests {
             &cfg,
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -1482,6 +1498,7 @@ mod tests {
             &cfg,
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -1538,6 +1555,7 @@ mod tests {
             &cfg,
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -1593,6 +1611,7 @@ mod tests {
             &cfg,
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -1724,6 +1743,7 @@ mod tests {
             &cfg,
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",
@@ -1810,6 +1830,7 @@ mod tests {
             &inject,
             false,
             TurnMeta {
+                conversation_id: None,
                 parent_agent_alias: None,
                 agent_alias: None,
                 turn_id: "t",

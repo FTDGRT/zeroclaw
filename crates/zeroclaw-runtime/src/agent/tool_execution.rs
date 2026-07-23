@@ -73,7 +73,7 @@ fn unavailable_tool_outcome(
         agent_alias: meta.agent_alias.map(|s| s.to_string()),
         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
         turn_id: Some(meta.turn_id.to_string()),
-        conversation_id: None,
+        conversation_id: meta.conversation_id.map(str::to_string),
     });
     ToolExecutionOutcome {
         output: reason.clone(),
@@ -127,7 +127,7 @@ pub(crate) async fn execute_one_tool(
         agent_alias: meta.agent_alias.map(|s| s.to_string()),
         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
         turn_id: Some(meta.turn_id.to_string()),
-        conversation_id: None,
+        conversation_id: meta.conversation_id.map(str::to_string),
     });
     let start = Instant::now();
 
@@ -187,7 +187,7 @@ pub(crate) async fn execute_one_tool(
             agent_alias: meta.agent_alias.map(|s| s.to_string()),
             parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
             turn_id: Some(meta.turn_id.to_string()),
-            conversation_id: None,
+            conversation_id: meta.conversation_id.map(str::to_string),
         });
         return Ok(ToolExecutionOutcome {
             output: reason.clone(),
@@ -331,7 +331,7 @@ pub(crate) async fn execute_one_tool(
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
                         turn_id: Some(meta.turn_id.to_string()),
-                        conversation_id: None,
+                        conversation_id: meta.conversation_id.map(str::to_string),
                     });
                     Ok(ToolExecutionOutcome {
                         output: normalized_output.to_string(),
@@ -354,7 +354,7 @@ pub(crate) async fn execute_one_tool(
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
                         turn_id: Some(meta.turn_id.to_string()),
-                        conversation_id: None,
+                        conversation_id: meta.conversation_id.map(str::to_string),
                     });
                     Ok(ToolExecutionOutcome {
                         output: format!("Error: {reason}"),
@@ -394,7 +394,7 @@ pub(crate) async fn execute_one_tool(
                     agent_alias: meta.agent_alias.map(|s| s.to_string()),
                     parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
                     turn_id: Some(meta.turn_id.to_string()),
-                    conversation_id: None,
+                    conversation_id: meta.conversation_id.map(str::to_string),
                 });
                 Ok(ToolExecutionOutcome {
                     output: reason.clone(),
@@ -639,6 +639,7 @@ mod tests {
         // execute_one_tool must recover the poisoned lock and resolve
         // the activated tool without panicking.
         let meta = crate::agent::turn::TurnMeta {
+            conversation_id: None,
             parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
@@ -694,6 +695,7 @@ mod tests {
             .activate("docker-mcp__extract_text".into(), activated_tool);
 
         let meta = crate::agent::turn::TurnMeta {
+            conversation_id: None,
             parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",

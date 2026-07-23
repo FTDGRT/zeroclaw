@@ -207,6 +207,7 @@ impl Tool for SendMessageToPeerTool {
                     &body,
                     None,
                     zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                    None,
                 );
                 if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
                 {
