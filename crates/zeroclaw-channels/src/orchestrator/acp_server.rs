@@ -800,6 +800,13 @@ impl AcpServer {
             }
         };
 
+        // Reuse the server-minted ACP session UUID as the cross-turn
+        // conversation id so observer events for this session stay grouped
+        // across turns. In-memory only - no ACP DB column, no auth/validation/
+        // limit changes. `session/load` and `session/resume` stamp the SAME id
+        // (the request's `sessionId`) on the restored agent.
+        agent.set_conversation_id(Some(session_id.clone()));
+
         // Wire an ACP back-channel so tools like `ask_user`,
         // `escalate_to_human`, and `reaction` can talk to the IDE/CLI client
         // for this session. Registered as `"acp"`; channel_name must match so
@@ -1018,6 +1025,10 @@ impl AcpServer {
             }
         };
 
+        // Reuse the request's ACP `sessionId` as the cross-turn conversation id
+        // on the restored agent - parity with `session/new`. In-memory only.
+        agent.set_conversation_id(Some(session_id.clone()));
+
         let stored_messages: Vec<_> = data
             .messages
             .into_iter()
@@ -1232,6 +1243,10 @@ impl AcpServer {
                 return Err(e);
             }
         };
+
+        // Reuse the request's ACP `sessionId` as the cross-turn conversation id
+        // on the restored agent - parity with `session/new`/`session/load`.
+        agent.set_conversation_id(Some(session_id.clone()));
 
         let restore_trim_event = agent.seed_conversation_history_with_event(data.messages);
 
@@ -5541,6 +5556,167 @@ mod tests {
             second_err.code, INTERNAL_ERROR,
             "second resume must fail with INTERNAL_ERROR, not INVALID_PARAMS (leaked slot); got: {:?}",
             second_err
+        );
+    }
+
+    /// Read the cross-turn conversation id stamped on an in-memory session's
+    /// agent. Mirrors `session_agent_alias` for the conversation-id field.
+    async fn session_conversation_id(server: &AcpServer, session_id: &str) -> Option<String> {
+        let sessions = server.sessions.lock().await;
+        let session = sessions.get(session_id).expect("session must exist");
+        let session = session.lock().await;
+        session.agent.conversation_id().map(str::to_string)
+    }
+
+    /// `session/new` mints a fresh ACP session UUID and stamps it on the agent
+    /// as the cross-turn conversation id. The getter must return the SAME id
+    /// `session/new` handed back to the caller - the bare session UUID, never an
+    /// `rpc_`-prefixed history key.
+    #[tokio::test]
+    async fn acp_conversation_id_session_new_matches_returned_id() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        );
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = result["sessionId"]
+            .as_str()
+            .expect("session/new returns a sessionId")
+            .to_string();
+
+        let stamped = session_conversation_id(&server, &session_id)
+            .await
+            .expect("session/new must stamp a conversation id");
+        assert_eq!(
+            stamped, session_id,
+            "session/new must stamp the returned sessionId as the agent's conversation id"
+        );
+        assert!(
+            !stamped.starts_with("rpc_"),
+            "the ACP conversation id is the bare session UUID, never an rpc_-prefixed history key: {stamped}"
+        );
+    }
+
+    /// Closing then loading a session must re-stamp the SAME conversation id on
+    /// the restored agent. `session/load` rebuilds the agent from the persisted
+    /// store row and stamps the request's `sessionId` - parity with
+    /// `session/new` - so observer events stay grouped across the close/open
+    /// boundary.
+    #[tokio::test]
+    async fn acp_conversation_id_load_keeps_session_id() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        );
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = result["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(
+            session_conversation_id(&server, &session_id)
+                .await
+                .expect("session/new stamps a conversation id"),
+            session_id,
+            "session/new must stamp the conversation id"
+        );
+
+        // Close evicts the in-memory agent; the persisted session row remains.
+        server
+            .handle_session_close(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("session/close must succeed");
+        assert!(
+            !server.sessions.lock().await.contains_key(&session_id),
+            "session/close must evict the in-memory session"
+        );
+
+        // session/load rebuilds the agent from the store and re-stamps the
+        // SAME conversation id (the request's sessionId).
+        server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must succeed");
+        assert_eq!(
+            session_conversation_id(&server, &session_id)
+                .await
+                .expect("session/load stamps a conversation id"),
+            session_id,
+            "session/load must re-stamp the same conversation id on the restored agent"
+        );
+    }
+
+    /// Closing then resuming a session must re-stamp the SAME conversation id on
+    /// the restored agent. `session/resume` mirrors `session/load` and
+    /// `session/new` so all three entry paths agree on the cross-turn id.
+    #[tokio::test]
+    async fn acp_conversation_id_resume_keeps_session_id() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        );
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = result["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(
+            session_conversation_id(&server, &session_id)
+                .await
+                .expect("session/new stamps a conversation id"),
+            session_id,
+            "session/new must stamp the conversation id"
+        );
+
+        server
+            .handle_session_close(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("session/close must succeed");
+        assert!(
+            !server.sessions.lock().await.contains_key(&session_id),
+            "session/close must evict the in-memory session"
+        );
+
+        server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/resume must succeed");
+        assert_eq!(
+            session_conversation_id(&server, &session_id)
+                .await
+                .expect("session/resume stamps a conversation id"),
+            session_id,
+            "session/resume must re-stamp the same conversation id on the restored agent"
         );
     }
 }

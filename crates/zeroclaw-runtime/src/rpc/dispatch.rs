@@ -1784,6 +1784,14 @@ impl RpcDispatcher {
             cancel,
             TurnAttribution {
                 session_key: Some(sid.to_string()),
+                // The conversation id reuses the protocol `session_id` (bare
+                // UUID). It is the SAME value as `session_key` here but
+                // semantically independent: the `rpc_<sid>`-prefixed history
+                // key (dispatch.rs `session_key` local in `handle_session_create`'s
+                // Chat branch) must NEVER enter this field. `execute_turn`
+                // stamps it onto the agent as the unified ordinary/resume/reaper
+                // entry point.
+                conversation_id: Some(sid.to_string()),
                 agent_alias,
                 model_provider,
                 model,
