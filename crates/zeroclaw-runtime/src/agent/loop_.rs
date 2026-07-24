@@ -1121,6 +1121,14 @@ static AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK: LazyLock<
     Mutex<Option<AgentTurnSopReassemblyTestHook>>,
 > = LazyLock::new(|| Mutex::new(None));
 
+/// Test-only override of the observer `run` constructs from config. When set,
+/// `run` records every event through this observer instead of the config
+/// backend, so tests can assert on the conversation_id stamped onto CLI
+/// lifecycle events. Production builds never read it.
+#[cfg(test)]
+static RUN_OBSERVER_TEST_HOOK: LazyLock<Mutex<Option<Arc<dyn Observer>>>> =
+    LazyLock::new(|| Mutex::new(None));
+
 fn api_key_and_uri_for_provider(
     config: &zeroclaw_config::schema::Config,
     provider_name: &str,
@@ -1199,9 +1207,32 @@ pub async fn run(
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let eff_model_context_window = agent.resolved.model_context_window;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
-        let base_observer = observability::create_observer(&config.observability);
-        let observer: Arc<dyn Observer> = Arc::from(base_observer);
+        let observer: Arc<dyn Observer> = {
+            #[cfg(test)]
+            {
+                RUN_OBSERVER_TEST_HOOK
+                    .lock()
+                    .expect("run-observer test hook lock should not be poisoned")
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Arc::from(observability::create_observer(&config.observability))
+                    })
+            }
+            #[cfg(not(test))]
+            {
+                Arc::from(observability::create_observer(&config.observability))
+            }
+        };
         let turn_id = uuid::Uuid::new_v4().to_string();
+        // Caller-owned cross-turn conversation id. Single-shot `run` mints one
+        // per invocation; the interactive REPL mints one per session and reuses
+        // it across ordinary turns (each turn keeps its own fresh `turn_id`),
+        // rotating to a fresh value on `/new`/`/clear` after the history reset.
+        // It is never persisted to the state file and never derived from the
+        // memory session or the state-file path - both stay scoped to
+        // history/memory as before, independent of this id.
+        let mut conversation_id = Uuid::new_v4().to_string();
         let channel_name = if interactive { "cli" } else { "daemon" };
         let _flush_guard = interactive.then(|| observability::FlushGuard::new(observer.clone()));
         if interactive
@@ -1466,6 +1497,7 @@ pub async fn run(
             model_name.to_string(),
             Some(channel_name.to_string()),
             Some(agent_alias.to_string()),
+            Some(conversation_id.clone()),
             Some(turn_id.clone()),
         );
 
@@ -1804,6 +1836,7 @@ pub async fn run(
                     channel: Some(channel_name.to_string()),
                     agent_alias: Some(agent_alias.to_string()),
                     turn_id: Some(turn_id.clone()),
+                    conversation_id: Some(conversation_id.clone()),
                 });
             }
 
@@ -1825,7 +1858,7 @@ pub async fn run(
                             parent_agent_alias: None,
                             agent_alias: Some(agent_alias),
                             turn_id: &turn_id,
-                            conversation_id: None,
+                            conversation_id: Some(&conversation_id),
                             channel_name,
                         },
                     )
@@ -1948,7 +1981,7 @@ pub async fn run(
                                 agent_alias: Some(agent_alias),
                                 parent_agent_alias: None,
                                 turn_id: &turn_id,
-                                conversation_id: None,
+                                conversation_id: Some(&conversation_id),
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
                                 }),
@@ -2217,6 +2250,14 @@ pub async fn run(
                         if let Some(path) = session_state_file.as_deref() {
                             save_interactive_session_history(path, &history)?;
                         }
+                        // Rotate to a fresh conversation id for the new
+                        // conversation. This runs AFTER the history reset
+                        // (and the state-file save) completes, so prior turns
+                        // stay attributed to the previous id. The new id is
+                        // never written to the state file - a process restoring
+                        // this history later mints its own fresh id - and the
+                        // memory partition semantics above are unchanged.
+                        conversation_id = Uuid::new_v4().to_string();
                         continue;
                     }
                     _ => {}
@@ -2324,6 +2365,7 @@ pub async fn run(
                         channel: Some(channel_name.to_string()),
                         agent_alias: Some(agent_alias.to_string()),
                         turn_id: Some(turn_id.clone()),
+                        conversation_id: Some(conversation_id.clone()),
                     });
                 }
 
@@ -2345,7 +2387,7 @@ pub async fn run(
                                 parent_agent_alias: None,
                                 agent_alias: Some(agent_alias),
                                 turn_id: &turn_id,
-                                conversation_id: None,
+                                conversation_id: Some(&conversation_id),
                                 channel_name,
                             },
                         )
@@ -2499,7 +2541,7 @@ pub async fn run(
                                     agent_alias: Some(agent_alias),
                                     parent_agent_alias: None,
                                     turn_id: &turn_id,
-                                    conversation_id: None,
+                                    conversation_id: Some(&conversation_id),
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
                                     }),
@@ -16048,6 +16090,202 @@ Let me check the result."#;
                 assert_eq!(ch.as_deref(), Some(channel), "channel should be consistent");
             }
         }
+    }
+
+    // ── CLI conversation attribution (Task 6) ────────────────────────────
+    //
+    // `run` owns the conversation_id: one UUID v4 per single-shot invocation
+    // (and one per REPL session, reused across ordinary turns and rotated on
+    // `/new`/`/clear` after the history reset). The id is never derived from
+    // the state-file path or memory session and never persisted to the state
+    // file. These tests inject a CapturingObserver via RUN_OBSERVER_TEST_HOOK
+    // and assert on the id stamped onto the AgentStart lifecycle event.
+    //
+    // The REPL loop reads stdin, so multi-turn reuse and `/new`/`/clear`
+    // rotation are exercised structurally (a single `let mut
+    // conversation_id` mutated only in the `/new`/`/clear` arm, after the
+    // history reset) rather than driven end-to-end here; the single-shot path
+    // below pins the minting and the event wiring.
+
+    /// Serializes the cli_conversation_id_* tests so the global
+    /// RUN_OBSERVER_TEST_HOOK is never read by a sibling test running in
+    /// parallel. `tokio::sync::Mutex` so the guard may cross the `run` await.
+    static CLI_CID_TEST_GUARD: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// Minimal config whose agent resolves past risk-profile/provider setup so
+    /// `run` reaches the conversation_id mint and emits AgentStart. The ollama
+    /// endpoint refuses connections (1s timeout), so the turn errors after
+    /// AgentStart fires - which is all these tests need to observe.
+    fn cid_test_config() -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("cid-test".to_string()),
+                    timeout_secs: Some(1),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "cid-test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+        config
+    }
+
+    fn cid_from_agent_start(events: &[ObserverEvent]) -> Option<String> {
+        events.iter().find_map(|event| match event {
+            ObserverEvent::AgentStart {
+                conversation_id, ..
+            } => conversation_id.clone(),
+            _ => None,
+        })
+    }
+
+    fn assert_valid_v4_conversation_id(cid: &str) {
+        let parsed = uuid::Uuid::parse_str(cid).unwrap_or_else(|err| {
+            panic!("conversation_id should be a valid UUID, got {cid:?}: {err}")
+        });
+        assert_eq!(
+            parsed.get_version(),
+            Some(uuid::Version::Random),
+            "conversation_id should be a random UUID v4, got {cid:?}"
+        );
+    }
+
+    /// Run single-shot `run` once and return the conversation_id stamped onto
+    /// its AgentStart event. Holds the cli_conversation_id guard for the whole
+    /// call so the global observer hook stays scoped to this invocation.
+    async fn run_once_capture_cid(
+        config: zeroclaw_config::schema::Config,
+        state_file: Option<std::path::PathBuf>,
+        message: &str,
+    ) -> String {
+        let _guard = CLI_CID_TEST_GUARD.lock().await;
+        let capturing = Arc::new(CapturingObserver::default());
+        {
+            let mut slot = RUN_OBSERVER_TEST_HOOK
+                .lock()
+                .expect("run-observer test hook lock should not be poisoned");
+            *slot = Some(capturing.clone());
+        }
+        let result = super::run(
+            config,
+            "cid-test-agent",
+            Some(message.to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            state_file,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+        // The turn errors at the unreachable ollama endpoint; AgentStart has
+        // already fired (and been captured) before that point.
+        let _ = result;
+        let cid = cid_from_agent_start(&capturing.events.lock()).unwrap_or_else(|| {
+            panic!(
+                "run() should emit AgentStart with a conversation_id; \
+                 result={result:?}; events={:?}",
+                capturing.events.lock()
+            )
+        });
+        *RUN_OBSERVER_TEST_HOOK
+            .lock()
+            .expect("run-observer test hook lock should not be poisoned") = None;
+        cid
+    }
+
+    #[tokio::test]
+    async fn cli_conversation_id_single_shot_invocations_differ() {
+        let cid_a = run_once_capture_cid(cid_test_config(), None, "hello").await;
+        let cid_b = run_once_capture_cid(cid_test_config(), None, "hello again").await;
+        assert_valid_v4_conversation_id(&cid_a);
+        assert_valid_v4_conversation_id(&cid_b);
+        assert_ne!(
+            cid_a, cid_b,
+            "each single-shot run invocation must mint a fresh conversation_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_conversation_id_not_derived_from_state_path_or_memory() {
+        // A distinctive poison path: the conversation_id must not equal or
+        // embed it. It is a fresh UUID v4, not the state-file path or any
+        // path/memory-session derivation.
+        let dir = tempdir().unwrap();
+        let poison_path = dir.path().join("POISON-STATE-PATH-xyz");
+        let poison_path_str = poison_path.to_string_lossy().to_string();
+        let cid = run_once_capture_cid(cid_test_config(), Some(poison_path.clone()), "hello").await;
+        assert_valid_v4_conversation_id(&cid);
+        assert_ne!(
+            cid, poison_path_str,
+            "conversation_id must not be the state-file path"
+        );
+        assert!(
+            !cid.contains("POISON-STATE-PATH"),
+            "conversation_id must not embed the state-file path: {cid}"
+        );
+        assert_ne!(
+            cid, "cid-test-agent",
+            "conversation_id must not be the agent alias / memory composite"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_conversation_id_state_restore_yields_fresh_id() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        // Seed a state file with history; a poison string rides inside a
+        // message to prove it never surfaces as the conversation_id.
+        let poison = "POISON-FROM-RESTORED-HISTORY";
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(poison),
+            ChatMessage::assistant("ok"),
+        ];
+        save_interactive_session_history(&path, &history).unwrap();
+        let file_text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !file_text.contains("conversation_id"),
+            "state file must not persist a conversation_id: {file_text}"
+        );
+
+        let cid_a = run_once_capture_cid(cid_test_config(), Some(path.clone()), "turn one").await;
+        let cid_b = run_once_capture_cid(cid_test_config(), Some(path), "turn two").await;
+        assert_valid_v4_conversation_id(&cid_a);
+        assert_valid_v4_conversation_id(&cid_b);
+        assert_ne!(
+            cid_a, cid_b,
+            "restoring history must not restore a conversation_id; each run mints fresh"
+        );
+        assert_ne!(
+            cid_a, poison,
+            "restored poison must not leak as conversation_id"
+        );
+        assert_ne!(
+            cid_b, poison,
+            "restored poison must not leak as conversation_id"
+        );
     }
 
     #[tokio::test]
