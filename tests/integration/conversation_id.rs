@@ -460,7 +460,7 @@ async fn concurrent_agents_keep_their_conversation_ids_isolated() {
             "agent must carry only its own conversation id {own}, got {convs:?}"
         );
         assert!(
-            !convs.iter().any(|c| *c == other),
+            !convs.contains(&other),
             "agent must not see the other conversation id {other}, got {convs:?}"
         );
     }

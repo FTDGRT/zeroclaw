@@ -15039,9 +15039,12 @@ api_key = "anthropic-key"
             observer.clone(),
         );
 
+        let msg = message_sent_hook_test_message();
+        let history_key = conversation_history_key(&msg);
+
         process_channel_message(
-            runtime_ctx,
-            message_sent_hook_test_message(),
+            Arc::clone(&runtime_ctx),
+            msg.clone(),
             CancellationToken::new(),
         )
         .await;
@@ -15085,6 +15088,62 @@ api_key = "anthropic-key"
             llm_request_turn_id,
             Some(start_turn_id),
             "inner LlmRequest must share the brackets' turn_id"
+        );
+
+        // The orchestrator resolves an opaque cross-turn conversation id for the
+        // turn's history key and stamps it onto both lifecycle brackets. Assert
+        // the resolved id actually propagates through a real turn, not just the
+        // resolver in isolation.
+        let start_conversation_id = events.iter().find_map(|e| match e {
+            ObserverEvent::AgentStart {
+                conversation_id, ..
+            } => conversation_id.clone(),
+            _ => None,
+        });
+        let end_conversation_id = events.iter().find_map(|e| match e {
+            ObserverEvent::AgentEnd {
+                conversation_id, ..
+            } => conversation_id.clone(),
+            _ => None,
+        });
+        let conversation_id = start_conversation_id
+            .as_ref()
+            .expect("AgentStart must carry the orchestrator-resolved conversation id");
+        assert_eq!(
+            start_conversation_id, end_conversation_id,
+            "AgentStart and AgentEnd must share one conversation id for the turn"
+        );
+        assert!(
+            !conversation_id.is_empty(),
+            "conversation id must be non-empty"
+        );
+
+        // The id is opaque - it must never leak the routing/storage key nor any
+        // gateway/rpc/sender-derived prefix.
+        assert_ne!(
+            conversation_id, &history_key,
+            "conversation id must not be the history_key"
+        );
+        assert!(
+            uuid::Uuid::parse_str(conversation_id.as_str()).is_ok(),
+            "conversation id must be an opaque UUID, got {conversation_id}"
+        );
+        let forbidden_prefixes: [&str; 3] = ["gw_", "rpc_", msg.sender.as_str()];
+        for prefix in forbidden_prefixes {
+            assert!(
+                !conversation_id.starts_with(prefix),
+                "conversation id must not use a routing-derived prefix: {conversation_id}"
+            );
+        }
+
+        // Re-resolving the same history key converges on the id the turn stamped
+        // (the memory-only harness caches it in the orchestrator's bounded map),
+        // proving the orchestrator's resolved id reaches the lifecycle events.
+        let resolved = resolve_channel_conversation_id(runtime_ctx.as_ref(), &history_key)
+            .expect("memory-only resolve must succeed");
+        assert_eq!(
+            conversation_id, &resolved,
+            "lifecycle conversation id must equal the orchestrator-resolved id"
         );
     }
 
