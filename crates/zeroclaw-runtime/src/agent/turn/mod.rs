@@ -1208,6 +1208,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 image_cache.as_deref_mut(),
                 agent_alias,
                 parent_agent_alias,
+                conversation_id,
                 sop_reassembly,
                 &mut sop_exec_cache,
             ))
@@ -1657,6 +1658,7 @@ async fn drive_live_sop_actions(
     mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
     agent_alias: Option<&str>,
     parent_agent_alias: Option<&str>,
+    parent_conversation_id: Option<&str>,
     sop_reassembly: Option<SopStepReassembly<'_>>,
     // Per-agent execution contexts re-assembled in flight for steps that
     // delegate to a different agent, memoized by alias. Owned by the caller
@@ -1998,10 +2000,15 @@ async fn drive_live_sop_actions(
                                         parent_agent_alias
                                     },
                                     turn_id: &nested_turn_id,
-                                    // Nested cross-agent SOP step: a distinct
-                                    // conversation owner (if any) is the step
-                                    // agent's to mint, never the parent's.
-                                    conversation_id: None,
+                                    // Nested cross-agent SOP step: the child
+                                    // inherits the parent turn's conversation
+                                    // id (same attribution semantics as
+                                    // `parent_agent_alias` above) rather than
+                                    // going unattributed. There is no separate
+                                    // "child conversation" concept - the whole
+                                    // cross-agent delegation is one conversation
+                                    // from the caller's view.
+                                    conversation_id: parent_conversation_id,
                                     sop_reassembly,
                                 })),
                             )
@@ -2808,11 +2815,13 @@ mod sop_step_reassembly_tests {
         }
     }
 
-    /// Observer capture of `(agent_alias, parent_agent_alias)` on LlmRequest
-    /// records — the audit-identity pair for the nested loop.
+    type IdentityTriple = (Option<String>, Option<String>, Option<String>);
+
+    /// Observer capture of `(agent_alias, parent_agent_alias, conversation_id)`
+    /// on ALL conversation-id-carrying LlmRequest records.
     #[derive(Default)]
     struct IdentityCapture {
-        pairs: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
+        pairs: std::sync::Mutex<Vec<IdentityTriple>>,
     }
 
     impl crate::observability::Observer for IdentityCapture {
@@ -2820,13 +2829,15 @@ mod sop_step_reassembly_tests {
             if let crate::observability::ObserverEvent::LlmRequest {
                 agent_alias,
                 parent_agent_alias,
+                conversation_id,
                 ..
             } = event
             {
-                self.pairs
-                    .lock()
-                    .expect("pairs lock")
-                    .push((agent_alias.clone(), parent_agent_alias.clone()));
+                self.pairs.lock().expect("pairs lock").push((
+                    agent_alias.clone(),
+                    parent_agent_alias.clone(),
+                    conversation_id.clone(),
+                ));
             }
         }
 
@@ -2973,6 +2984,7 @@ mod sop_step_reassembly_tests {
         new_messages_out: Option<&mut Vec<ChatMessage>>,
         agent_alias: Option<&str>,
         sop_reassembly: Option<SopStepReassembly<'_>>,
+        parent_conversation_id: Option<&str>,
         // The (would-be) enclosing round's own switch state. Real callers
         // always pass `None` here (they have no enclosing round); the
         // isolation regression below passes `Some(parent_arc)` to prove the
@@ -3025,6 +3037,7 @@ mod sop_step_reassembly_tests {
             None,
             agent_alias,
             None,
+            parent_conversation_id,
             sop_reassembly,
             exec_cache,
         )
@@ -3094,6 +3107,7 @@ mod sop_step_reassembly_tests {
             Some(&mut new_out),
             Some("outer"),
             Some(handle),
+            None, // parent_conversation_id: not under test here
             None,
             &mut exec_cache,
         )
@@ -3202,6 +3216,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             Some(handle),
+            None, // parent_conversation_id: not under test here
             None,
             &mut exec_cache,
         )
@@ -3278,6 +3293,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             Some(handle),
+            None, // parent_conversation_id: not under test here
             None,
             &mut exec_cache,
         )
@@ -3287,7 +3303,7 @@ mod sop_step_reassembly_tests {
         assert!(
             pairs
                 .iter()
-                .any(|(alias, parent)| alias.as_deref() == Some("stepper")
+                .any(|(alias, parent, _conv)| alias.as_deref() == Some("stepper")
                     && parent.as_deref() == Some("outer")),
             "nested records must stamp the effective agent with parent correlation: {pairs:?}"
         );
@@ -3298,6 +3314,69 @@ mod sop_step_reassembly_tests {
             Some("stepper"),
             "the SOP audit record names the acting authority"
         );
+    }
+
+    /// Conversation attribution: a nested cross-agent step inherits the
+    /// PARENT turn's conversation id rather than going unattributed. This
+    /// fixture drives the nested step's `LlmRequest` via `TextProvider`, so
+    /// the claim is scoped to that event type; the inheritance holds for every
+    /// attributed event in production (they all draw `conversation_id` from the
+    /// same `TurnCtx`/`TurnMeta` field threaded through the loop).
+    #[tokio::test]
+    async fn cross_agent_sop_step_inherits_parent_conversation_id() {
+        let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+        let config = zeroclaw_config::schema::Config::default();
+        let handle = SopStepReassembly { config: &config };
+
+        let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut exec_cache = std::collections::HashMap::new();
+        exec_cache.insert(
+            "stepper".to_string(),
+            seeded_owned(
+                Arc::clone(&requests),
+                Vec::new(),
+                std::collections::HashSet::new(),
+                Vec::new(),
+                None,
+            ),
+        );
+
+        let observer = IdentityCapture::default();
+        let parent_provider = TextProvider;
+        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let mut history: Vec<ChatMessage> = Vec::new();
+
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &parent_provider,
+            &parent_tools,
+            &observer,
+            &mut history,
+            None,
+            Some("outer"),
+            Some(handle),
+            Some("parent-conv-opaque"), // parent_conversation_id - under test
+            None,                       // model_switch_callback
+            &mut exec_cache,
+        )
+        .await;
+
+        let pairs = observer.pairs.lock().expect("pairs lock");
+        assert!(
+            !pairs.is_empty(),
+            "the nested step must emit LlmRequest records"
+        );
+        assert!(
+            pairs
+                .iter()
+                .all(|(_alias, _parent, conv)| conv.as_deref() == Some("parent-conv-opaque")),
+            "every nested-step LlmRequest must carry the parent's conversation id: {pairs:?}"
+        );
+        drop(pairs);
+
+        let _ = step1_result(&engine, &run_id);
     }
 
     /// Same-agent control: a step naming the CURRENT agent keeps today's inline
@@ -3324,6 +3403,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             Some(handle),
+            None, // parent_conversation_id: not under test here
             None,
             &mut exec_cache,
         )
@@ -3343,7 +3423,7 @@ mod sop_step_reassembly_tests {
         assert!(
             pairs
                 .iter()
-                .all(|(alias, parent)| alias.as_deref() == Some("outer") && parent.is_none()),
+                .all(|(alias, parent, _conv)| alias.as_deref() == Some("outer") && parent.is_none()),
             "same-agent steps keep the outer identity with no parent correlation: {pairs:?}"
         );
         drop(pairs);
@@ -3429,6 +3509,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             Some(handle),
+            None, // parent_conversation_id: not under test here
             None,
             &mut exec_cache,
         )
@@ -3474,6 +3555,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             None,
+            None, // parent_conversation_id: not under test here
             None,
             &mut exec_cache,
         )
@@ -3650,6 +3732,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             Some(handle),
+            None, // parent_conversation_id: not under test here
             Some(Arc::clone(&parent_switch_state)),
             &mut exec_cache,
         )
