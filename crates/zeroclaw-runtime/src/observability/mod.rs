@@ -446,6 +446,7 @@ pub(crate) static HOOK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::c
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex as PlMutex;
 
     #[test]
     fn factory_none_returns_noop() {
@@ -817,6 +818,60 @@ mod tests {
             2,
             "explicit finish and drop must still emit one matched pair"
         );
+    }
+
+    #[test]
+    fn agent_turn_guard_model_route_updates_only_the_closing_event() {
+        #[derive(Default)]
+        struct CapturingObserver(PlMutex<Vec<ObserverEvent>>);
+
+        impl Observer for CapturingObserver {
+            fn record_event(&self, event: &ObserverEvent) {
+                self.0.lock().push(event.clone());
+            }
+
+            fn record_metric(&self, _metric: &ObserverMetric) {}
+
+            fn name(&self) -> &str {
+                "capturing"
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let observer = CapturingObserver::default();
+        let mut guard = AgentTurnGuard::start(
+            &observer,
+            "provider-a",
+            "model-a",
+            Some("cli".into()),
+            Some("agent".into()),
+            Some("conversation".into()),
+            Some("turn".into()),
+        );
+        guard.set_model_route("provider-b", "model-b");
+        guard.finish();
+
+        let events = observer.0.lock();
+        assert_eq!(events.len(), 2, "route changes must not reopen the bracket");
+        assert!(matches!(
+            &events[0],
+            ObserverEvent::AgentStart {
+                model_provider,
+                model,
+                ..
+            } if model_provider == "provider-a" && model == "model-a"
+        ));
+        assert!(matches!(
+            &events[1],
+            ObserverEvent::AgentEnd {
+                model_provider,
+                model,
+                ..
+            } if model_provider == "provider-b" && model == "model-b"
+        ));
     }
 
     /// Capture the `conversation_id` of each `AgentStart`/`AgentEnd` so the

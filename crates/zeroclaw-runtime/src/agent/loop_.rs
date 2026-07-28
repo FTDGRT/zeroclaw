@@ -218,6 +218,23 @@ fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result
     }
 }
 
+/// Source of interactive REPL input. The production implementation wraps
+/// `std::io::stdin`; tests inject a `VecDeque<String>` so the REPL loop can
+/// be driven in-process without spawning a process or piping stdin.
+pub(crate) trait ReplInput {
+    fn read_capped_line(&mut self, max_bytes: usize) -> std::io::Result<CappedLine>;
+}
+
+/// Production REPL input from stdin.
+struct StdinReplInput;
+
+impl ReplInput for StdinReplInput {
+    fn read_capped_line(&mut self, max_bytes: usize) -> std::io::Result<CappedLine> {
+        let stdin = std::io::stdin().lock();
+        read_capped_line(stdin, max_bytes)
+    }
+}
+
 fn glob_match(pattern: &str, name: &str) -> bool {
     match pattern.find('*') {
         None => pattern == name,
@@ -1491,15 +1508,25 @@ pub async fn run(
                 &provider_runtime_options,
             )?;
 
-        let mut turn_guard = crate::observability::AgentTurnGuard::start(
-            observer.as_ref(),
-            provider_name.to_string(),
-            model_name.to_string(),
-            Some(channel_name.to_string()),
-            Some(agent_alias.to_string()),
-            Some(conversation_id.clone()),
-            Some(turn_id.clone()),
-        );
+        // The outer bracket serves the single-shot path only. The interactive
+        // REPL opens its own per-prompt `AgentStart`/`AgentEnd` pair inside
+        // `repl_loop`, so this is gated on `message.is_some()` (the actual
+        // single-shot condition) rather than `interactive`: the CLI passes
+        // `interactive = true` for both `-m` and the REPL session.
+        let is_single_shot = message.is_some();
+        let mut turn_guard = if is_single_shot {
+            Some(crate::observability::AgentTurnGuard::start(
+                observer.as_ref(),
+                provider_name.to_string(),
+                model_name.to_string(),
+                Some(channel_name.to_string()),
+                Some(agent_alias.to_string()),
+                Some(conversation_id.clone()),
+                Some(turn_id.clone()),
+            ))
+        } else {
+            None
+        };
 
         // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
         let hardware_rag: Option<crate::rag::HardwareRag> = config
@@ -2037,7 +2064,9 @@ pub async fn run(
                             provider_name = new_model_provider;
                             model_name = new_model;
 
-                            turn_guard.set_model_route(provider_name.clone(), model_name.clone());
+                            if let Some(ref mut guard) = turn_guard {
+                                guard.set_model_route(provider_name.clone(), model_name.clone());
+                            }
 
                             continue;
                         }
@@ -2168,632 +2197,758 @@ pub async fn run(
                 vec![ChatMessage::system(&system_prompt)]
             };
 
-            loop {
-                print!("> ");
-                let _ = std::io::stdout().flush();
+            repl_loop(
+                &mut StdinReplInput,
+                &observer,
+                &config,
+                &agent,
+                agent_alias,
+                channel_name,
+                &base_system_prompt,
+                session_state_file.as_deref(),
+                &mem,
+                &*cli,
+                &tools_registry,
+                &mcp_tool_names,
+                &deferred_section,
+                &skills,
+                &agent_workspace,
+                &tool_descs,
+                &risk_profile,
+                &cost_tracking_context,
+                &approval_manager,
+                &memory_session_id,
+                eff_max_history_messages,
+                eff_compact_context,
+                eff_max_system_prompt_chars,
+                eff_model_context_window,
+                eff_prompt_injection_mode,
+                &hardware_rag,
+                &board_names,
+                temperature,
+                origin,
+                suppress_memory_inject,
+                agent_model_provider,
+                &activated_handle,
+                &mut history,
+                &mut final_output,
+                &mut conversation_id,
+                &mut model_provider,
+                &mut provider_name,
+                &mut model_name,
+            )
+            .await?;
+        }
 
-                let input = {
-                    let stdin = std::io::stdin().lock();
-                    match read_capped_line(stdin, MAX_INTERACTIVE_INPUT_BYTES) {
-                        Ok(CappedLine::Eof) => break,
-                        Ok(CappedLine::Line(s)) => s,
-                        Ok(CappedLine::Truncated) => {
-                            eprintln!(
-                                "\nWarning: input line exceeds {} bytes and was discarded.",
-                                MAX_INTERACTIVE_INPUT_BYTES
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            eprintln!("\nError reading input: {e}\n");
-                            break;
-                        }
-                    }
-                };
+        if let Some(ref mut guard) = turn_guard {
+            let tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
+                let usage = ctx.snapshot_turn_usage();
+                (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
+                    zeroclaw_api::observability_traits::TurnTokenUsage {
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                    },
+                )
+            });
+            guard.set_model_route(provider_name.clone(), model_name.clone());
+            guard.set_usage(tokens_used, None);
+            guard.finish();
+        }
 
-                let user_input = input.trim().to_string();
-                if user_input.is_empty() {
+        Ok(final_output)
+    };
+    __zc_body
+        .instrument(__zc_scope_span)
+        .instrument(__zc_attribution_span)
+        .await
+}
+
+/// Process a single message through the full agent (with tools, peripherals, memory).
+/// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn repl_loop<R: ReplInput>(
+    repl_input: &mut R,
+    observer: &Arc<dyn Observer>,
+    config: &zeroclaw_config::schema::Config,
+    agent: &zeroclaw_config::schema::AliasedAgentConfig,
+    agent_alias: &str,
+    channel_name: &str,
+    base_system_prompt: &str,
+    session_state_file: Option<&std::path::Path>,
+    mem: &Arc<dyn Memory>,
+    cli: &dyn zeroclaw_api::channel::Channel,
+    tools_registry: &[Box<dyn Tool>],
+    mcp_tool_names: &HashSet<String>,
+    deferred_section: &str,
+    skills: &[crate::skills::Skill],
+    agent_workspace: &std::path::Path,
+    tool_descs: &[(&str, &str)],
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    cost_tracking_context: &Option<crate::agent::cost::ToolLoopCostTrackingContext>,
+    approval_manager: &Option<ApprovalManager>,
+    memory_session_id: &Option<String>,
+    eff_max_history_messages: usize,
+    eff_compact_context: bool,
+    eff_max_system_prompt_chars: usize,
+    eff_model_context_window: usize,
+    eff_prompt_injection_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    hardware_rag: &Option<crate::rag::HardwareRag>,
+    board_names: &[String],
+    temperature: Option<f64>,
+    origin: zeroclaw_api::ingress::TurnOrigin,
+    suppress_memory_inject: bool,
+    agent_model_provider: Option<&zeroclaw_config::schema::ModelProviderConfig>,
+    activated_handle: &Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    history: &mut Vec<ChatMessage>,
+    final_output: &mut String,
+    conversation_id: &mut String,
+    model_provider: &mut Box<dyn ModelProvider>,
+    provider_name: &mut String,
+    model_name: &mut String,
+) -> Result<()> {
+    let bootstrap_max_chars = if eff_compact_context {
+        Some(6000)
+    } else {
+        None
+    };
+    loop {
+        print!("> ");
+        let _ = std::io::stdout().flush();
+
+        let input = {
+            match repl_input.read_capped_line(MAX_INTERACTIVE_INPUT_BYTES) {
+                Ok(CappedLine::Eof) => break,
+                Ok(CappedLine::Line(s)) => s,
+                Ok(CappedLine::Truncated) => {
+                    eprintln!(
+                        "\nWarning: input line exceeds {} bytes and was discarded.",
+                        MAX_INTERACTIVE_INPUT_BYTES
+                    );
                     continue;
                 }
-                match user_input.as_str() {
-                    "/quit" | "/exit" => break,
-                    "/help" => {
-                        println!("Available commands:");
-                        println!("  /help             Show this help message");
-                        println!("  /clear /new       Clear conversation history");
-                        println!("  /quit /exit       Exit interactive mode");
-                        println!(
-                            "  /think:<level>    Set reasoning depth (off|minimal|low|medium|high|max)\n"
-                        );
-                        continue;
-                    }
-                    "/clear" | "/new" => {
-                        println!(
-                            "This will clear the current conversation and delete all session memory."
-                        );
-                        println!("Core memories (long-term facts/preferences) will be preserved.");
-                        print!("Continue? [y/N] ");
-                        let _ = std::io::stdout().flush();
+                Err(e) => {
+                    eprintln!("\nError reading input: {e}\n");
+                    break;
+                }
+            }
+        };
 
-                        let confirm = {
-                            let stdin = std::io::stdin().lock();
-                            match read_capped_line(stdin, MAX_INTERACTIVE_INPUT_BYTES) {
-                                Ok(CappedLine::Line(s)) => s,
-                                Ok(CappedLine::Truncated) | Ok(CappedLine::Eof) | Err(_) => {
-                                    println!("Cancelled.\n");
-                                    continue;
-                                }
-                            }
-                        };
-                        if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
+        let user_input = input.trim().to_string();
+        if user_input.is_empty() {
+            continue;
+        }
+        match user_input.as_str() {
+            "/quit" | "/exit" => break,
+            "/help" => {
+                println!("Available commands:");
+                println!("  /help             Show this help message");
+                println!("  /clear /new       Clear conversation history");
+                println!("  /quit /exit       Exit interactive mode");
+                println!(
+                    "  /think:<level>    Set reasoning depth (off|minimal|low|medium|high|max)\n"
+                );
+                continue;
+            }
+            "/clear" | "/new" => {
+                println!("This will clear the current conversation and delete all session memory.");
+                println!("Core memories (long-term facts/preferences) will be preserved.");
+                print!("Continue? [y/N] ");
+                let _ = std::io::stdout().flush();
+
+                let confirm = {
+                    match repl_input.read_capped_line(MAX_INTERACTIVE_INPUT_BYTES) {
+                        Ok(CappedLine::Line(s)) => s,
+                        Ok(CappedLine::Truncated) | Ok(CappedLine::Eof) | Err(_) => {
                             println!("Cancelled.\n");
                             continue;
                         }
-
-                        history.clear();
-                        history.push(ChatMessage::system(&system_prompt));
-                        // Clear conversation and daily memory
-                        let mut cleared = 0;
-                        for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
-                            let entries = mem.list(Some(&category), None).await.unwrap_or_default();
-                            for entry in entries {
-                                if mem.forget(&entry.key).await.unwrap_or(false) {
-                                    cleared += 1;
-                                }
-                            }
-                        }
-                        if cleared > 0 {
-                            println!("Conversation cleared ({cleared} memory entries removed).\n");
-                        } else {
-                            println!("Conversation cleared.\n");
-                        }
-                        if let Some(path) = session_state_file.as_deref() {
-                            save_interactive_session_history(path, &history)?;
-                        }
-                        // Rotate to a fresh conversation id for the new
-                        // conversation. This runs AFTER the history reset
-                        // (and the state-file save) completes, so prior turns
-                        // stay attributed to the previous id. The new id is
-                        // never written to the state file - a process restoring
-                        // this history later mints its own fresh id - and the
-                        // memory partition semantics above are unchanged.
-                        conversation_id = Uuid::new_v4().to_string();
-                        continue;
                     }
-                    _ => {}
-                }
-
-                // ── Parse thinking directive from interactive input ───
-                let (thinking_directive, effective_input) =
-                    match crate::agent::thinking::parse_thinking_directive(&user_input) {
-                        Some((level, remaining)) => {
-                            ::zeroclaw_log::record!(
-                                INFO,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_category(::zeroclaw_log::EventCategory::Agent)
-                                .with_attrs(::serde_json::json!({"thinking_level": level})),
-                                "Thinking directive parsed"
-                            );
-                            (Some(level), remaining)
-                        }
-                        None => (None, user_input.clone()),
-                    };
-                let thinking_level = crate::agent::thinking::resolve_thinking_level(
-                    thinking_directive,
-                    None,
-                    &agent.resolved.thinking,
-                );
-                let thinking_params = crate::agent::thinking::apply_thinking_level_with_config(
-                    thinking_level,
-                    &agent.resolved.thinking,
-                );
-                let turn_temperature: Option<f64> = temperature.map(|t| {
-                    crate::agent::thinking::clamp_temperature(
-                        t + thinking_params.temperature_adjustment,
-                    )
-                });
-
-                // Compute per-turn excluded MCP tools from tool_filter_groups
-                // before the provider call; the system prompt is rebuilt from
-                // this same set immediately before each attempt.
-                let excluded_tools = compute_excluded_mcp_tools(
-                    &tools_registry,
-                    &agent.resolved.tool_filter_groups,
-                    &effective_input,
-                    &mcp_tool_names,
-                );
-
-                let excluded_tool_names: HashSet<&str> =
-                    excluded_tools.iter().map(String::as_str).collect();
-                let runtime_capability_names = tools_registry
-                    .iter()
-                    .map(|tool| tool.name())
-                    .filter(|name| !excluded_tool_names.contains(*name))
-                    .collect::<Vec<_>>();
-                if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
-                    &effective_input,
-                    &skills,
-                    &runtime_capability_names,
-                    &config.data_dir,
-                    &config.skills.extra_registries,
-                    config.skills.install_suggestions.enabled,
-                ) {
-                    final_output = suggestion;
-                    if let Err(e) = zeroclaw_api::channel::Channel::send(
-                        &*cli,
-                        &zeroclaw_api::channel::SendMessage::new(
-                            format!("\n{final_output}\n"),
-                            "user",
-                        ),
-                    )
-                    .await
-                    {
-                        eprintln!("\nError sending CLI response: {e}\n");
-                    }
-                    observer.record_event(&ObserverEvent::TurnComplete);
-                    if let Some(sys_msg) = history.first_mut()
-                        && sys_msg.role == "system"
-                    {
-                        sys_msg.content.clone_from(&base_system_prompt);
-                    }
+                };
+                if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
+                    println!("Cancelled.\n");
                     continue;
                 }
 
-                // Auto-save conversation turns (skip short/trivial messages)
-                if config.memory.auto_save
-                    && effective_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-                    && !zeroclaw_memory::should_skip_autosave_content(&effective_input)
-                {
-                    let user_key = autosave_memory_key("user_msg");
-                    let store_start = std::time::Instant::now();
-                    let store_result = mem
-                        .store(
-                            &user_key,
-                            &effective_input,
-                            MemoryCategory::Conversation,
-                            memory_session_id.as_deref(),
-                        )
-                        .await;
-                    observer.record_event(&ObserverEvent::MemoryStore {
-                        category: MemoryCategory::Conversation.to_string(),
-                        backend: mem.name().to_string(),
-                        duration: store_start.elapsed(),
-                        success: store_result.is_ok(),
-                        channel: Some(channel_name.to_string()),
-                        agent_alias: Some(agent_alias.to_string()),
-                        turn_id: Some(turn_id.clone()),
-                        conversation_id: Some(conversation_id.clone()),
-                    });
-                }
-
-                // Memory context is injected once in the engine, keyed on
-                // the ingress origin (agent::memory_inject). Hardware RAG
-                // stays site-built; the engine prepends the memory block
-                // above it.
-                let rag_limit = if eff_compact_context { 2 } else { 5 };
-                let hw_context = hardware_rag
-                    .as_ref()
-                    .map(|r| {
-                        build_hardware_context(
-                            r,
-                            &*observer,
-                            &effective_input,
-                            &board_names,
-                            rag_limit,
-                            TurnMeta {
-                                parent_agent_alias: None,
-                                agent_alias: Some(agent_alias),
-                                turn_id: &turn_id,
-                                conversation_id: Some(&conversation_id),
-                                channel_name,
-                            },
-                        )
-                    })
-                    .unwrap_or_default();
-                let context = hw_context;
-                let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-                let enriched = if context.is_empty() {
-                    format!("[{now}] {effective_input}")
-                } else {
-                    format!("{context}[{now}] {effective_input}")
-                };
-
-                history.push(ChatMessage::user(&enriched));
-
-                // Set up streaming channel so tool progress and response
-                // content are printed progressively instead of buffered.
-                let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
-                let content_was_streamed =
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let content_streamed_flag = content_was_streamed.clone();
-                let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
-
-                let consumer_handle = zeroclaw_spawn::spawn!(async move {
-                    use std::io::Write;
-                    while let Some(event) = delta_rx.recv().await {
-                        match event {
-                            StreamDelta::Lifecycle(_) => {}
-                            StreamDelta::Status(text) => {
-                                if is_tty {
-                                    let _ = write!(std::io::stderr(), "\x1b[2m{text}\x1b[0m");
-                                } else {
-                                    let _ = write!(std::io::stderr(), "{text}");
-                                }
-                                let _ = std::io::stderr().flush();
-                            }
-                            StreamDelta::Text(text) => {
-                                content_streamed_flag
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                                print!("{text}");
-                                let _ = std::io::stdout().flush();
-                            }
+                history.clear();
+                history.push(ChatMessage::system(base_system_prompt));
+                // Clear conversation and daily memory
+                let mut cleared = 0;
+                for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
+                    let entries = mem.list(Some(&category), None).await.unwrap_or_default();
+                    for entry in entries {
+                        if mem.forget(&entry.key).await.unwrap_or(false) {
+                            cleared += 1;
                         }
                     }
-                });
+                }
+                if cleared > 0 {
+                    println!("Conversation cleared ({cleared} memory entries removed).\n");
+                } else {
+                    println!("Conversation cleared.\n");
+                }
+                if let Some(path) = session_state_file.as_deref() {
+                    save_interactive_session_history(path, &history)?;
+                }
+                // Rotate to a fresh conversation id for the new
+                // conversation. This runs AFTER the history reset
+                // (and the state-file save) completes, so prior turns
+                // stay attributed to the previous id. The new id is
+                // never written to the state file - a process restoring
+                // this history later mints its own fresh id - and the
+                // memory partition semantics above are unchanged.
+                *conversation_id = Uuid::new_v4().to_string();
+                continue;
+            }
+            _ => {}
+        }
 
-                // Ctrl+C cancels the in-flight turn instead of killing the process.
-                let cancel_token = CancellationToken::new();
-                let cancel_token_clone = cancel_token.clone();
-                let ctrlc_handle = zeroclaw_spawn::spawn!(async move {
-                    if tokio::signal::ctrl_c().await.is_ok() {
-                        cancel_token_clone.cancel();
-                    }
-                });
+        // Fresh turn id + its own drop-safe lifecycle bracket for this
+        // accepted input. Built-in commands above do not open a bracket.
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let mut turn_guard = crate::observability::AgentTurnGuard::start(
+            observer.as_ref(),
+            provider_name.as_str(),
+            model_name.as_str(),
+            Some(channel_name.to_string()),
+            Some(agent_alias.to_string()),
+            Some(conversation_id.clone()),
+            Some(turn_id.clone()),
+        );
 
-                let response = loop {
-                    if let Some(sys_msg) = history.first_mut()
-                        && sys_msg.role == "system"
-                    {
-                        sys_msg.content = build_system_prompt_for_turn(
-                            &agent_workspace,
-                            &model_name,
-                            &tool_descs,
-                            &deferred_section,
-                            &skills,
-                            Some(&agent.identity),
-                            bootstrap_max_chars,
-                            &risk_profile,
-                            model_provider.as_ref(),
-                            &tools_registry,
-                            &excluded_tools,
-                            activated_handle.as_ref(),
-                            agent.resolved.strict_tool_parsing,
-                            eff_prompt_injection_mode,
-                            eff_compact_context,
-                            eff_max_system_prompt_chars,
-                            true,
-                            config.channels.show_tool_calls,
-                            thinking_params.system_prompt_prefix.as_deref(),
-                        )?;
+        // ── Parse thinking directive from interactive input ───
+        let (thinking_directive, effective_input) =
+            match crate::agent::thinking::parse_thinking_directive(&user_input) {
+                Some((level, remaining)) => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_attrs(::serde_json::json!({"thinking_level": level})),
+                        "Thinking directive parsed"
+                    );
+                    (Some(level), remaining)
+                }
+                None => (None, user_input.clone()),
+            };
+        let thinking_level = crate::agent::thinking::resolve_thinking_level(
+            thinking_directive,
+            None,
+            &agent.resolved.thinking,
+        );
+        let thinking_params = crate::agent::thinking::apply_thinking_level_with_config(
+            thinking_level,
+            &agent.resolved.thinking,
+        );
+        let turn_temperature: Option<f64> = temperature.map(|t| {
+            crate::agent::thinking::clamp_temperature(t + thinking_params.temperature_adjustment)
+        });
+
+        // Compute per-turn excluded MCP tools from tool_filter_groups
+        // before the provider call; the system prompt is rebuilt from
+        // this same set immediately before each attempt.
+        let excluded_tools = compute_excluded_mcp_tools(
+            &tools_registry,
+            &agent.resolved.tool_filter_groups,
+            &effective_input,
+            &mcp_tool_names,
+        );
+
+        let excluded_tool_names: HashSet<&str> =
+            excluded_tools.iter().map(String::as_str).collect();
+        let runtime_capability_names = tools_registry
+            .iter()
+            .map(|tool| tool.name())
+            .filter(|name| !excluded_tool_names.contains(*name))
+            .collect::<Vec<_>>();
+        if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
+            &effective_input,
+            &skills,
+            &runtime_capability_names,
+            &config.data_dir,
+            &config.skills.extra_registries,
+            config.skills.install_suggestions.enabled,
+        ) {
+            *final_output = suggestion;
+            if let Err(e) = zeroclaw_api::channel::Channel::send(
+                &*cli,
+                &zeroclaw_api::channel::SendMessage::new(format!("\n{final_output}\n"), "user"),
+            )
+            .await
+            {
+                eprintln!("\nError sending CLI response: {e}\n");
+            }
+            observer.record_event(&ObserverEvent::TurnComplete);
+            if let Some(sys_msg) = history.first_mut()
+                && sys_msg.role == "system"
+            {
+                sys_msg.content = base_system_prompt.to_string();
+            }
+            continue;
+        }
+
+        // Auto-save conversation turns (skip short/trivial messages)
+        if config.memory.auto_save
+            && effective_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+            && !zeroclaw_memory::should_skip_autosave_content(&effective_input)
+        {
+            let user_key = autosave_memory_key("user_msg");
+            let store_start = std::time::Instant::now();
+            let store_result = mem
+                .store(
+                    &user_key,
+                    &effective_input,
+                    MemoryCategory::Conversation,
+                    memory_session_id.as_deref(),
+                )
+                .await;
+            observer.record_event(&ObserverEvent::MemoryStore {
+                category: MemoryCategory::Conversation.to_string(),
+                backend: mem.name().to_string(),
+                duration: store_start.elapsed(),
+                success: store_result.is_ok(),
+                channel: Some(channel_name.to_string()),
+                agent_alias: Some(agent_alias.to_string()),
+                turn_id: Some(turn_id.clone()),
+                conversation_id: Some(conversation_id.clone()),
+            });
+        }
+
+        // Memory context is injected once in the engine, keyed on
+        // the ingress origin (agent::memory_inject). Hardware RAG
+        // stays site-built; the engine prepends the memory block
+        // above it.
+        let rag_limit = if eff_compact_context { 2 } else { 5 };
+        let hw_context = hardware_rag
+            .as_ref()
+            .map(|r| {
+                build_hardware_context(
+                    r,
+                    &*observer,
+                    &effective_input,
+                    &board_names,
+                    rag_limit,
+                    TurnMeta {
+                        parent_agent_alias: None,
+                        agent_alias: Some(agent_alias),
+                        turn_id: &turn_id,
+                        conversation_id: Some(&conversation_id),
+                        channel_name,
+                    },
+                )
+            })
+            .unwrap_or_default();
+        let context = hw_context;
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let enriched = if context.is_empty() {
+            format!("[{now}] {effective_input}")
+        } else {
+            format!("{context}[{now}] {effective_input}")
+        };
+
+        history.push(ChatMessage::user(&enriched));
+
+        // Set up streaming channel so tool progress and response
+        // content are printed progressively instead of buffered.
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
+        let content_was_streamed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let content_streamed_flag = content_was_streamed.clone();
+        let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+
+        let consumer_handle = zeroclaw_spawn::spawn!(async move {
+            use std::io::Write;
+            while let Some(event) = delta_rx.recv().await {
+                match event {
+                    StreamDelta::Lifecycle(_) => {}
+                    StreamDelta::Status(text) => {
+                        if is_tty {
+                            let _ = write!(std::io::stderr(), "\x1b[2m{text}\x1b[0m");
+                        } else {
+                            let _ = write!(std::io::stderr(), "{text}");
+                        }
+                        let _ = std::io::stderr().flush();
                     }
-                    match zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                        .scope(
-                            thinking_params.native_thinking,
-                            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                                cost_tracking_context.clone(),
-                                run_tool_call_loop(ToolLoop {
-                                    exec: ResolvedAgentExecution::resolve(
-                                        ResolvedModelAccess {
-                                            model_provider: model_provider.as_ref(),
-                                            provider_name: &provider_name,
-                                            model: &model_name,
-                                            temperature: turn_temperature,
-                                        },
-                                        ResolvedIo {
-                                            tools_registry: &tools_registry,
-                                            observer: observer.as_ref(),
-                                            silent: true,
-                                            approval: approval_manager.as_ref(),
-                                            multimodal_config: &config.multimodal,
-                                            config: Some(&config),
-                                            hooks: None,
-                                            activated_tools: activated_handle.as_ref(),
-                                            model_switch_callback: None,
-                                            receipt_generator: None,
-                                        },
-                                        ResolvedRuntimeKnobs {
-                                            max_tool_iterations: agent.resolved.max_tool_iterations,
-                                            excluded_tools: &excluded_tools,
-                                            dedup_exempt_tools: &agent
-                                                .resolved
-                                                .tool_call_dedup_exempt,
-                                            pacing: &config.pacing,
-                                            strict_tool_parsing: agent.resolved.strict_tool_parsing,
-                                            parallel_tools: agent.resolved.parallel_tools,
-                                            max_tool_result_chars: agent
-                                                .resolved
-                                                .max_tool_result_chars,
-                                            context_token_budget: agent
-                                                .resolved
-                                                .effective_context_budget(),
-                                            knobs: &LoopKnobs::default(),
-                                        },
-                                    ),
-                                    history: &mut history,
-                                    channel_name,
-                                    channel_reply_target: None,
-                                    cancellation_token: Some(cancel_token.clone()),
-                                    on_delta: Some(delta_tx.clone()),
-                                    shared_budget: None,
-                                    channel: None,
-                                    collected_receipts: None,
-                                    event_tx: None,
-                                    steering: None,
-                                    new_messages_out: None,
-                                    image_cache: None,
-                                    // Origin is threaded from the entry point;
-                                    // source/transport/trust stay phase-1
-                                    // placeholders until per-transport stamping.
-                                    memory: Some(crate::agent::memory_inject::TurnMemory {
-                                        handle: mem.as_ref(),
-                                        query: effective_input.clone(),
-                                        sessions: vec![memory_session_id.clone()],
-                                        suppress: suppress_memory_inject,
-                                        cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
-                                            &config.memory,
-                                            crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
-                                        ),
-                                    }),
-                                    ingress: IngressContext::from_origin(origin),
-                                    agent_alias: Some(agent_alias),
-                                    parent_agent_alias: None,
-                                    turn_id: &turn_id,
-                                    conversation_id: Some(&conversation_id),
-                                    sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
-                                        config: &config,
-                                    }),
-                                }),
+                    StreamDelta::Text(text) => {
+                        content_streamed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        print!("{text}");
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+            }
+        });
+
+        // Ctrl+C cancels the in-flight turn instead of killing the process.
+        let cancel_token = CancellationToken::new();
+        let cancel_token_clone = cancel_token.clone();
+        let ctrlc_handle = zeroclaw_spawn::spawn!(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                cancel_token_clone.cancel();
+            }
+        });
+
+        let response = loop {
+            if let Some(sys_msg) = history.first_mut()
+                && sys_msg.role == "system"
+            {
+                match build_system_prompt_for_turn(
+                    &agent_workspace,
+                    &model_name,
+                    &tool_descs,
+                    &deferred_section,
+                    &skills,
+                    Some(&agent.identity),
+                    bootstrap_max_chars,
+                    &risk_profile,
+                    model_provider.as_ref(),
+                    &tools_registry,
+                    &excluded_tools,
+                    activated_handle.as_ref(),
+                    agent.resolved.strict_tool_parsing,
+                    eff_prompt_injection_mode,
+                    eff_compact_context,
+                    eff_max_system_prompt_chars,
+                    true,
+                    config.channels.show_tool_calls,
+                    thinking_params.system_prompt_prefix.as_deref(),
+                ) {
+                    Ok(content) => sys_msg.content = content,
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+            match zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                .scope(
+                    thinking_params.native_thinking,
+                    TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                        cost_tracking_context.clone(),
+                        run_tool_call_loop(ToolLoop {
+                            exec: ResolvedAgentExecution::resolve(
+                                ResolvedModelAccess {
+                                    model_provider: model_provider.as_ref(),
+                                    provider_name: &provider_name,
+                                    model: &model_name,
+                                    temperature: turn_temperature,
+                                },
+                                ResolvedIo {
+                                    tools_registry: &tools_registry,
+                                    observer: observer.as_ref(),
+                                    silent: true,
+                                    approval: approval_manager.as_ref(),
+                                    multimodal_config: &config.multimodal,
+                                    config: Some(&config),
+                                    hooks: None,
+                                    activated_tools: activated_handle.as_ref(),
+                                    model_switch_callback: None,
+                                    receipt_generator: None,
+                                },
+                                ResolvedRuntimeKnobs {
+                                    max_tool_iterations: agent.resolved.max_tool_iterations,
+                                    excluded_tools: &excluded_tools,
+                                    dedup_exempt_tools: &agent
+                                        .resolved
+                                        .tool_call_dedup_exempt,
+                                    pacing: &config.pacing,
+                                    strict_tool_parsing: agent.resolved.strict_tool_parsing,
+                                    parallel_tools: agent.resolved.parallel_tools,
+                                    max_tool_result_chars: agent
+                                        .resolved
+                                        .max_tool_result_chars,
+                                    context_token_budget: agent
+                                        .resolved
+                                        .effective_context_budget(),
+                                    knobs: &LoopKnobs::default(),
+                                },
                             ),
-                        )
-                        .await
+                            history: &mut *history,
+                            channel_name,
+                            channel_reply_target: None,
+                            cancellation_token: Some(cancel_token.clone()),
+                            on_delta: Some(delta_tx.clone()),
+                            shared_budget: None,
+                            channel: None,
+                            collected_receipts: None,
+                            event_tx: None,
+                            steering: None,
+                            new_messages_out: None,
+                            image_cache: None,
+                            // Origin is threaded from the entry point;
+                            // source/transport/trust stay phase-1
+                            // placeholders until per-transport stamping.
+                            memory: Some(crate::agent::memory_inject::TurnMemory {
+                                handle: mem.as_ref(),
+                                query: effective_input.clone(),
+                                sessions: vec![memory_session_id.clone()],
+                                suppress: suppress_memory_inject,
+                                cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                    &config.memory,
+                                    crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                                ),
+                            }),
+                            ingress: IngressContext::from_origin(origin),
+                            agent_alias: Some(agent_alias),
+                            parent_agent_alias: None,
+                            turn_id: &turn_id,
+                            conversation_id: Some(&conversation_id),
+                            sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
+                                config: &config,
+                            }),
+                        }),
+                    ),
+                )
+                .await
+            {
+                Ok(resp) => break resp,
+                Err(e) => {
+                    if is_tool_loop_cancelled(&e) {
+                        eprintln!("\n\x1b[2m(cancelled)\x1b[0m");
+                        break String::new();
+                    }
+                    if let Some((new_model_provider, new_model)) =
+                        is_model_switch_requested(&e)
                     {
-                        Ok(resp) => break resp,
-                        Err(e) => {
-                            if is_tool_loop_cancelled(&e) {
-                                eprintln!("\n\x1b[2m(cancelled)\x1b[0m");
-                                break String::new();
-                            }
-                            if let Some((new_model_provider, new_model)) =
-                                is_model_switch_requested(&e)
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Migrate
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Provider),
+                            &format!(
+                                "Model switch requested, switching from {} {} to {} {}",
+                                provider_name, model_name, new_model_provider, new_model
+                            )
+                        );
+
+                        let (switch_api_key2, switch_uri2) = api_key_and_uri_for_provider(
+                            &config,
+                            &new_model_provider,
+                            agent_model_provider,
+                        );
+                        *model_provider =
+                            match zeroclaw_providers::create_routed_model_provider_with_options(
+                                &config,
+                                &new_model_provider,
+                                switch_api_key2.as_deref(),
+                                switch_uri2.as_deref(),
+                                &config.reliability,
+                                &config.model_routes,
+                                &new_model,
+                                &zeroclaw_providers::options_for_provider_ref(
+                                    &config,
+                                    &new_model_provider,
+                                    &zeroclaw_providers::provider_runtime_options_for_agent(
+                                        &config,
+                                        agent_alias,
+                                    ),
+                                ),
+                            ) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    let tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
+                                        let usage = ctx.snapshot_turn_usage();
+                                        (usage.input_tokens > 0 || usage.output_tokens > 0)
+                                            .then_some(
+                                                zeroclaw_api::observability_traits::TurnTokenUsage {
+                                                    input_tokens: usage.input_tokens,
+                                                    output_tokens: usage.output_tokens,
+                                                },
+                                            )
+                                    });
+                                    turn_guard.set_usage(tokens_used, None);
+                                    return Err(e);
+                                }
+                            };
+
+                        *provider_name = new_model_provider;
+                        *model_name = new_model;
+                        turn_guard.set_model_route(provider_name.as_str(), model_name.as_str());
+
+                        continue;
+                    }
+                    // Context overflow recovery: drop oldest whole
+                    // turns and retry. No summarization, no splicing.
+                    if zeroclaw_providers::reliable::is_context_window_exceeded(&e) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Retry
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent),
+                            "Context overflow in interactive loop, attempting recovery"
+                        );
+                        let taken = std::mem::take(history);
+                        let recovery_budget = eff_model_context_window * 9 / 10;
+                        let result = crate::agent::history_trim::trim_to_recent_turns(
+                            taken,
+                            recovery_budget,
+                        );
+                        if result.trimmed {
+                            let mut trimmed = result.history;
+                            let system_count =
+                                trimmed.iter().take_while(|m| m.role == "system").count();
+                            trimmed.insert(
+                                system_count,
+                                crate::agent::history_trim::breadcrumb(),
+                            );
+                            *history = trimmed;
                             {
+                                let __zc_trim_span = ::zeroclaw_log::info_span!(
+                                    target: "zeroclaw_log_internal_scope",
+                                    "zeroclaw_scope",
+                                    model = %model_name,
+                                    model_provider = %provider_name,
+                                );
+                                let _zc_trim_guard = __zc_trim_span.entered();
                                 ::zeroclaw_log::record!(
                                     INFO,
                                     ::zeroclaw_log::Event::new(
                                         module_path!(),
-                                        ::zeroclaw_log::Action::Migrate
+                                        ::zeroclaw_log::Action::Retry
                                     )
-                                    .with_category(::zeroclaw_log::EventCategory::Provider),
-                                    &format!(
-                                        "Model switch requested, switching from {} {} to {} {}",
-                                        provider_name, model_name, new_model_provider, new_model
-                                    )
+                                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                    .with_attrs(::serde_json::json!({
+                                        "dropped_messages": result.dropped_messages,
+                                        "dropped_turns": result.dropped_turns,
+                                        "kept_turns": result.kept_turns,
+                                    })),
+                                    "Context recovered via whole-turn trim, retrying turn"
                                 );
-
-                                let (switch_api_key2, switch_uri2) = api_key_and_uri_for_provider(
-                                    &config,
-                                    &new_model_provider,
-                                    agent_model_provider,
-                                );
-                                model_provider =
-                                    zeroclaw_providers::create_routed_model_provider_with_options(
-                                        &config,
-                                        &new_model_provider,
-                                        switch_api_key2.as_deref(),
-                                        switch_uri2.as_deref(),
-                                        &config.reliability,
-                                        &config.model_routes,
-                                        &new_model,
-                                        &zeroclaw_providers::options_for_provider_ref(
-                                            &config,
-                                            &new_model_provider,
-                                            &zeroclaw_providers::provider_runtime_options_for_agent(
-                                                &config,
-                                                agent_alias,
-                                            ),
-                                        ),
-                                    )?;
-
-                                provider_name = new_model_provider;
-                                model_name = new_model;
-
-                                turn_guard
-                                    .set_model_route(provider_name.clone(), model_name.clone());
-
-                                continue;
                             }
-                            // Context overflow recovery: drop oldest whole
-                            // turns and retry. No summarization, no splicing.
-                            if zeroclaw_providers::reliable::is_context_window_exceeded(&e) {
+                            continue;
+                        }
+                        *history = result.history;
+                        let system_floor =
+                            crate::agent::history::estimate_system_floor_tokens(&history);
+                        let context_token_budget =
+                            agent.resolved.effective_context_budget();
+                        let floor_exceeds_budget = system_floor >= context_token_budget;
+                        {
+                            let __zc_trim_span = ::zeroclaw_log::info_span!(
+                                target: "zeroclaw_log_internal_scope",
+                                "zeroclaw_scope",
+                                model = %model_name,
+                                model_provider = %provider_name,
+                            );
+                            let _zc_trim_guard = __zc_trim_span.entered();
+                            if floor_exceeds_budget {
                                 ::zeroclaw_log::record!(
                                     WARN,
                                     ::zeroclaw_log::Event::new(
                                         module_path!(),
-                                        ::zeroclaw_log::Action::Retry
+                                        ::zeroclaw_log::Action::Fail
                                     )
-                                    .with_category(::zeroclaw_log::EventCategory::Agent),
-                                    "Context overflow in interactive loop, attempting recovery"
+                                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({
+                                        "system_floor": system_floor,
+                                        "budget": context_token_budget,
+                                        "error_key": "context_floor_exceeds_budget",
+                                    })),
+                                    crate::agent::history::context_floor_remediation(
+                                        system_floor,
+                                        context_token_budget,
+                                    )
                                 );
-                                let taken = std::mem::take(&mut history);
-                                let recovery_budget = eff_model_context_window * 9 / 10;
-                                let result = crate::agent::history_trim::trim_to_recent_turns(
-                                    taken,
-                                    recovery_budget,
+                            } else {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                    "Context overflow but only one turn remains; cannot trim further"
                                 );
-                                if result.trimmed {
-                                    let mut trimmed = result.history;
-                                    let system_count =
-                                        trimmed.iter().take_while(|m| m.role == "system").count();
-                                    trimmed.insert(
-                                        system_count,
-                                        crate::agent::history_trim::breadcrumb(),
-                                    );
-                                    history = trimmed;
-                                    {
-                                        let __zc_trim_span = ::zeroclaw_log::info_span!(
-                                            target: "zeroclaw_log_internal_scope",
-                                            "zeroclaw_scope",
-                                            model = %model_name,
-                                            model_provider = %provider_name,
-                                        );
-                                        let _zc_trim_guard = __zc_trim_span.entered();
-                                        ::zeroclaw_log::record!(
-                                            INFO,
-                                            ::zeroclaw_log::Event::new(
-                                                module_path!(),
-                                                ::zeroclaw_log::Action::Retry
-                                            )
-                                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                                            .with_attrs(::serde_json::json!({
-                                                "dropped_messages": result.dropped_messages,
-                                                "dropped_turns": result.dropped_turns,
-                                                "kept_turns": result.kept_turns,
-                                            })),
-                                            "Context recovered via whole-turn trim, retrying turn"
-                                        );
-                                    }
-                                    continue;
-                                }
-                                history = result.history;
-                                let system_floor =
-                                    crate::agent::history::estimate_system_floor_tokens(&history);
-                                let context_token_budget =
-                                    agent.resolved.effective_context_budget();
-                                let floor_exceeds_budget = system_floor >= context_token_budget;
-                                {
-                                    let __zc_trim_span = ::zeroclaw_log::info_span!(
-                                        target: "zeroclaw_log_internal_scope",
-                                        "zeroclaw_scope",
-                                        model = %model_name,
-                                        model_provider = %provider_name,
-                                    );
-                                    let _zc_trim_guard = __zc_trim_span.entered();
-                                    if floor_exceeds_budget {
-                                        ::zeroclaw_log::record!(
-                                            WARN,
-                                            ::zeroclaw_log::Event::new(
-                                                module_path!(),
-                                                ::zeroclaw_log::Action::Fail
-                                            )
-                                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                            .with_attrs(::serde_json::json!({
-                                                "system_floor": system_floor,
-                                                "budget": context_token_budget,
-                                                "error_key": "context_floor_exceeds_budget",
-                                            })),
-                                            crate::agent::history::context_floor_remediation(
-                                                system_floor,
-                                                context_token_budget,
-                                            )
-                                        );
-                                    } else {
-                                        ::zeroclaw_log::record!(
-                                            WARN,
-                                            ::zeroclaw_log::Event::new(
-                                                module_path!(),
-                                                ::zeroclaw_log::Action::Fail
-                                            )
-                                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                                            "Context overflow but only one turn remains; cannot trim further"
-                                        );
-                                    }
-                                }
-
-                                if floor_exceeds_budget {
-                                    eprintln!(
-                                        "\nError: {e}\n{}\n",
-                                        crate::agent::history::context_floor_remediation(
-                                            system_floor,
-                                            context_token_budget,
-                                        )
-                                    );
-                                    break String::new();
-                                }
                             }
+                        }
 
-                            eprintln!("\nError: {e}\n");
+                        if floor_exceeds_budget {
+                            eprintln!(
+                                "\nError: {e}\n{}\n",
+                                crate::agent::history::context_floor_remediation(
+                                    system_floor,
+                                    context_token_budget,
+                                )
+                            );
                             break String::new();
                         }
                     }
-                };
 
-                // Clean up: stop the Ctrl+C listener and flush streaming events.
-                ctrlc_handle.abort();
-                drop(delta_tx);
-                let _ = consumer_handle.await;
-
-                final_output = response;
-                if content_was_streamed.load(std::sync::atomic::Ordering::Relaxed) {
-                    println!();
-                } else if let Err(e) = zeroclaw_api::channel::Channel::send(
-                    &*cli,
-                    &zeroclaw_api::channel::SendMessage::new(format!("\n{final_output}\n"), "user"),
-                )
-                .await
-                {
-                    eprintln!("\nError sending CLI response: {e}\n");
-                }
-                observer.record_event(&ObserverEvent::TurnComplete);
-
-                // Display context usage for this turn.
-                if let Some(ref ctx) = cost_tracking_context {
-                    let usage = ctx.snapshot_turn_usage();
-                    let effective_input_tokens = usage.last_input_tokens;
-                    if effective_input_tokens > 0 || usage.output_tokens > 0 {
-                        let max_ctx = eff_model_context_window as u64;
-                        let pct = if max_ctx > 0 {
-                            (effective_input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
-                        } else {
-                            0.0
-                        };
-                        let bar_width: usize = 16;
-                        let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
-                        let empty = bar_width.saturating_sub(filled);
-                        let bar = format!(
-                            "[{}{}]",
-                            "\u{2588}".repeat(filled),
-                            "\u{2591}".repeat(empty)
-                        );
-                        let msg = if effective_input_tokens > 0 {
-                            crate::i18n::get_required_cli_string_with_args(
-                                "cli-agent-context-bar",
-                                &[
-                                    ("used", format_tokens(effective_input_tokens).as_str()),
-                                    ("max", format_tokens(max_ctx).as_str()),
-                                    ("bar", &bar),
-                                    ("pct", format!("{:.0}", pct).as_str()),
-                                ],
-                            )
-                        } else {
-                            crate::i18n::get_required_cli_string_with_args(
-                                "cli-agent-context-bar-unknown",
-                                &[("max", format_tokens(max_ctx).as_str())],
-                            )
-                        };
-                        eprintln!("\x1b[2m{}\x1b[0m", msg);
-                    }
-                }
-
-                // Hard cap as a safety net.
-                trim_history(&mut history, eff_max_history_messages);
-
-                // Restore base system prompt after the per-turn tool framing
-                // and optional thinking prefix have been applied.
-                if let Some(sys_msg) = history.first_mut()
-                    && sys_msg.role == "system"
-                {
-                    sys_msg.content.clone_from(&base_system_prompt);
-                }
-
-                if let Some(path) = session_state_file.as_deref() {
-                    save_interactive_session_history(path, &history)?;
+                    eprintln!("\nError: {e}\n");
+                    break String::new();
                 }
             }
+        };
+
+        // Clean up: stop the Ctrl+C listener and flush streaming events.
+        ctrlc_handle.abort();
+        drop(delta_tx);
+        let _ = consumer_handle.await;
+
+        *final_output = response;
+        if content_was_streamed.load(std::sync::atomic::Ordering::Relaxed) {
+            println!();
+        } else if let Err(e) = zeroclaw_api::channel::Channel::send(
+            &*cli,
+            &zeroclaw_api::channel::SendMessage::new(format!("\n{final_output}\n"), "user"),
+        )
+        .await
+        {
+            eprintln!("\nError sending CLI response: {e}\n");
+        }
+        observer.record_event(&ObserverEvent::TurnComplete);
+
+        // Display context usage for this turn.
+        if let Some(ctx) = cost_tracking_context {
+            let usage = ctx.snapshot_turn_usage();
+            let effective_input_tokens = usage.last_input_tokens;
+            if effective_input_tokens > 0 || usage.output_tokens > 0 {
+                let max_ctx = eff_model_context_window as u64;
+                let pct = if max_ctx > 0 {
+                    (effective_input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
+                } else {
+                    0.0
+                };
+                let bar_width: usize = 16;
+                let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
+                let empty = bar_width.saturating_sub(filled);
+                let bar = format!(
+                    "[{}{}]",
+                    "\u{2588}".repeat(filled),
+                    "\u{2591}".repeat(empty)
+                );
+                let msg = if effective_input_tokens > 0 {
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-agent-context-bar",
+                        &[
+                            ("used", format_tokens(effective_input_tokens).as_str()),
+                            ("max", format_tokens(max_ctx).as_str()),
+                            ("bar", &bar),
+                            ("pct", format!("{:.0}", pct).as_str()),
+                        ],
+                    )
+                } else {
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-agent-context-bar-unknown",
+                        &[("max", format_tokens(max_ctx).as_str())],
+                    )
+                };
+                eprintln!("\x1b[2m{}\x1b[0m", msg);
+            }
+        }
+
+        // Hard cap as a safety net.
+        trim_history(history, eff_max_history_messages);
+
+        // Restore base system prompt after the per-turn tool framing
+        // and optional thinking prefix have been applied.
+        if let Some(sys_msg) = history.first_mut()
+            && sys_msg.role == "system"
+        {
+            sys_msg.content = base_system_prompt.to_string();
         }
 
         let tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
@@ -2807,18 +2962,15 @@ pub async fn run(
         });
         turn_guard.set_model_route(provider_name.clone(), model_name.clone());
         turn_guard.set_usage(tokens_used, None);
-        turn_guard.finish();
 
-        Ok(final_output)
-    };
-    __zc_body
-        .instrument(__zc_scope_span)
-        .instrument(__zc_attribution_span)
-        .await
+        if let Some(path) = session_state_file.as_deref() {
+            save_interactive_session_history(path, &history)?;
+        }
+        turn_guard.finish();
+    }
+    Ok(())
 }
 
-/// Process a single message through the full agent (with tools, peripherals, memory).
-/// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(
     config: Config,
     agent_alias: &str,
@@ -16285,6 +16437,289 @@ Let me check the result."#;
         assert_ne!(
             cid_b, poison,
             "restored poison must not leak as conversation_id"
+        );
+    }
+
+    /// The CLI calls `run` with `interactive = true` for BOTH single-shot
+    /// (`-m`) and the REPL session, so the outer `AgentStart`/`AgentEnd`
+    /// bracket must be gated on `message.is_some()` (the actual single-shot
+    /// condition), not `!interactive`. Every other `run` test passes
+    /// `interactive = false`, so this is the sole guard against a regression
+    /// that reverts the guard to `!interactive` - which would silently strip
+    /// the bracket from the primary CLI `-m` path. The turn errors at the
+    /// unreachable ollama endpoint before `AgentEnd` fires; observing
+    /// `AgentStart` is sufficient to catch the regression.
+    #[tokio::test]
+    async fn cli_single_shot_with_interactive_flag_still_emits_agent_start() {
+        let _guard = CLI_CID_TEST_GUARD.lock().await;
+        let capturing = Arc::new(CapturingObserver::default());
+        {
+            let mut slot = RUN_OBSERVER_TEST_HOOK
+                .lock()
+                .expect("run-observer test hook lock should not be poisoned");
+            *slot = Some(capturing.clone());
+        }
+        let result = super::run(
+            cid_test_config(),
+            "cid-test-agent",
+            Some("hello".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            true,
+            None,
+            None,
+            TurnOrigin::Interactive,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+        // The turn errors at the unreachable ollama endpoint; AgentStart has
+        // already fired (and been captured) before that point.
+        let _ = result;
+        let cid = cid_from_agent_start(&capturing.events.lock()).unwrap_or_else(|| {
+            panic!(
+                "run(interactive=true, message=Some) must still emit AgentStart; \
+                 result={result:?}; events={:?}",
+                capturing.events.lock()
+            )
+        });
+        assert_valid_v4_conversation_id(&cid);
+        *RUN_OBSERVER_TEST_HOOK
+            .lock()
+            .expect("run-observer test hook lock should not be poisoned") = None;
+    }
+
+    /// In-process REPL input backed by a `VecDeque<String>`. Each
+    /// `read_capped_line` pops the next pre-seeded line; an empty deque yields
+    /// `CappedLine::Eof`, terminating `repl_loop` the same way a closed stdin
+    /// would.
+    struct TestReplInput {
+        lines: std::collections::VecDeque<String>,
+    }
+
+    impl TestReplInput {
+        fn new<I: IntoIterator<Item = &'static str>>(lines: I) -> Self {
+            Self {
+                lines: lines.into_iter().map(str::to_string).collect(),
+            }
+        }
+    }
+
+    impl super::ReplInput for TestReplInput {
+        fn read_capped_line(&mut self, _max_bytes: usize) -> std::io::Result<super::CappedLine> {
+            match self.lines.pop_front() {
+                Some(line) => Ok(super::CappedLine::Line(line)),
+                None => Ok(super::CappedLine::Eof),
+            }
+        }
+    }
+
+    /// Minimal `Channel` for driving `repl_loop` without a real CLI: `send`
+    /// discards output and `listen` never produces inbound traffic.
+    struct SilentCliChannel;
+
+    impl zeroclaw_api::attribution::Attributable for SilentCliChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Cli)
+        }
+        fn alias(&self) -> &str {
+            "cli"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::channel::Channel for SilentCliChannel {
+        fn name(&self) -> &str {
+            "cli"
+        }
+        async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_approval(
+            &self,
+            _recipient: &str,
+            _request: &zeroclaw_api::channel::ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+            Ok(None)
+        }
+    }
+
+    /// The interactive REPL must mint a fresh `turn_id` AND its own
+    /// `AgentStart`/`AgentEnd` pair per accepted prompt (not one pair for the
+    /// whole session), so a `turn_id` never spans two conversations after
+    /// `/clear`/`/new` (which rotate `conversation_id` only). Each round's
+    /// bracket `turn_id` must equal its inner `LlmRequest`'s `turn_id` - no
+    /// orphan events under a still-open agent span.
+    #[tokio::test]
+    async fn repl_mints_fresh_turn_id_per_input_and_rotates_conversation_id_on_clear() {
+        let config = cid_test_config();
+        let agent = super::resolved_agent_for_turn(&config, "cid-test-agent")
+            .expect("cid-test-agent should resolve");
+        let agent_workspace = config.agent_workspace_dir("cid-test-agent");
+        let risk_profile = config
+            .risk_profile_for_agent("cid-test-agent")
+            .expect("default risk profile configured")
+            .clone();
+        let base_system_prompt = "system".to_string();
+        let mut history = vec![ChatMessage::system(&base_system_prompt)];
+        let mut final_output = String::new();
+        let mut conversation_id = uuid::Uuid::new_v4().to_string();
+        let mem: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+        let cli = SilentCliChannel;
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mcp_tool_names: HashSet<String> = HashSet::new();
+        let deferred_section = String::new();
+        let skills: Vec<crate::skills::Skill> = Vec::new();
+        let tool_descs: Vec<(&str, &str)> = Vec::new();
+        let board_names: Vec<String> = Vec::new();
+        let cost_tracking_context: Option<crate::agent::cost::ToolLoopCostTrackingContext> = None;
+        let approval_manager: Option<ApprovalManager> = None;
+        let memory_session_id: Option<String> = None;
+        let hardware_rag: Option<crate::rag::HardwareRag> = None;
+        let activated_handle: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>> = None;
+        let mut model_provider: Box<dyn ModelProvider> =
+            Box::new(ScriptedModelProvider::from_text_responses(vec![
+                "resp A", "resp B", "resp C",
+            ]));
+        let mut provider_name = "mock-provider".to_string();
+        let mut model_name = "mock-model".to_string();
+
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+
+        let mut repl_input =
+            TestReplInput::new(["普通消息 A", "普通消息 B", "/clear", "y", "普通消息 C"]);
+
+        super::repl_loop(
+            &mut repl_input,
+            &observer,
+            &config,
+            &agent,
+            "cid-test-agent",
+            "cli",
+            &base_system_prompt,
+            None,
+            &mem,
+            &cli,
+            &tools_registry,
+            &mcp_tool_names,
+            &deferred_section,
+            &skills,
+            &agent_workspace,
+            &tool_descs,
+            &risk_profile,
+            &cost_tracking_context,
+            &approval_manager,
+            &memory_session_id,
+            agent.resolved.max_history_messages,
+            agent.resolved.compact_context,
+            agent.resolved.max_system_prompt_chars,
+            agent.resolved.model_context_window,
+            agent.resolved.prompt_injection_mode,
+            &hardware_rag,
+            &board_names,
+            None,
+            zeroclaw_api::ingress::TurnOrigin::Interactive,
+            false,
+            None,
+            &activated_handle,
+            &mut history,
+            &mut final_output,
+            &mut conversation_id,
+            &mut model_provider,
+            &mut provider_name,
+            &mut model_name,
+        )
+        .await
+        .expect("repl_loop should complete");
+
+        let events = capturing.events.lock().clone();
+        let agent_starts: Vec<(Option<String>, Option<String>)> = events
+            .iter()
+            .filter_map(|e| match e {
+                ObserverEvent::AgentStart {
+                    turn_id,
+                    conversation_id,
+                    ..
+                } => Some((turn_id.clone(), conversation_id.clone())),
+                _ => None,
+            })
+            .collect();
+        let agent_ends: Vec<Option<String>> = events
+            .iter()
+            .filter_map(|e| match e {
+                ObserverEvent::AgentEnd { turn_id, .. } => Some(turn_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let llm_requests: Vec<(Option<String>, Option<String>)> = events
+            .iter()
+            .filter_map(|e| match e {
+                ObserverEvent::LlmRequest {
+                    turn_id,
+                    conversation_id,
+                    ..
+                } => Some((turn_id.clone(), conversation_id.clone())),
+                _ => None,
+            })
+            .collect();
+
+        // Three ordinary turns (A, B, C) => three paired brackets, not one
+        // pair shared across the whole REPL session.
+        assert_eq!(agent_starts.len(), 3, "3 AgentStart events: {events:?}");
+        assert_eq!(agent_ends.len(), 3, "3 AgentEnd events: {events:?}");
+        assert_eq!(llm_requests.len(), 3, "3 LlmRequest events: {events:?}");
+
+        // Each round's bracket turn_id equals its inner LlmRequest turn_id -
+        // no orphan events under a still-open agent span. The AgentEnd closes
+        // the same turn_id the AgentStart opened.
+        for i in 0..3 {
+            assert_eq!(
+                agent_starts[i].0, llm_requests[i].0,
+                "round {} bracket turn_id must equal its LlmRequest turn_id",
+                i
+            );
+            assert_eq!(
+                agent_ends[i], llm_requests[i].0,
+                "round {} AgentEnd turn_id must equal its LlmRequest turn_id",
+                i
+            );
+            assert_eq!(
+                agent_starts[i].1, llm_requests[i].1,
+                "round {} bracket conversation_id must equal its LlmRequest conversation_id",
+                i
+            );
+        }
+
+        // A, B, C turn_ids are pairwise distinct (one fresh id per prompt).
+        assert_ne!(agent_starts[0].0, agent_starts[1].0, "A != B turn_id");
+        assert_ne!(agent_starts[0].0, agent_starts[2].0, "A != C turn_id");
+        assert_ne!(agent_starts[1].0, agent_starts[2].0, "B != C turn_id");
+
+        // A and B share conversation_id; C (post-/clear) rotates to a new one.
+        assert_eq!(
+            agent_starts[0].1, agent_starts[1].1,
+            "A and B share conversation_id"
+        );
+        assert_ne!(
+            agent_starts[2].1, agent_starts[0].1,
+            "C conversation_id differs from A/B after /clear"
+        );
+
+        // C's bracket conversation_id matches its inner LlmRequest
+        // conversation_id: the new conversation lives in a new bracket rather
+        // than crossing the old one.
+        assert_eq!(
+            agent_starts[2].1, llm_requests[2].1,
+            "C AgentStart conversation_id matches its LlmRequest conversation_id"
         );
     }
 
