@@ -154,24 +154,24 @@ impl SessionStore {
         messages
     }
 
-    /// Append a single message to the session JSONL file.
+    /// Append a single message to the session JSONL file. Runs under the
+    /// same per-key exclusive lock as resolve/rotate/delete so a concurrent
+    /// append can never interleave with a `/clear` truncation mid-write.
     pub fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         let _guard = self.mutation_lock.lock();
-        self.append_unlocked(session_key, message)
-    }
+        self.with_key_lock(session_key, || {
+            let path = self.session_path(session_key);
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
 
-    fn append_unlocked(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let path = self.session_path(session_key);
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+            let json = serde_json::to_string(message)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        let json = serde_json::to_string(message)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        writeln!(file, "{json}")?;
-        Ok(())
+            writeln!(file, "{json}")?;
+            Ok(())
+        })
     }
 
     /// Remove the last message from a session's JSONL file.
@@ -271,13 +271,19 @@ impl SessionStore {
             let meta_path = self.meta_path(session_key);
             let data_existed = data_path.exists();
             let meta_existed = meta_path.exists();
+            // Remove the identity sidecar FIRST and propagate its error. A
+            // silently-ignored sidecar removal (`let _ = ...`) would leave the
+            // old conversation_id on disk after the data file is gone, so the
+            // next resolve would read back and REUSE a "deleted" id - exactly
+            // the identity-leak the review flagged. Ordering sidecar-before-data
+            // means a failure here aborts before we touch history, leaving a
+            // coherent "both still present" state rather than "history gone,
+            // stale id survives".
+            if meta_existed {
+                std::fs::remove_file(&meta_path)?;
+            }
             if data_existed {
                 std::fs::remove_file(&data_path)?;
-            }
-            // Best-effort: a missing/unreadable sidecar must not fail the
-            // delete of the data file that did exist.
-            if meta_existed {
-                let _ = std::fs::remove_file(&meta_path);
             }
             Ok(data_existed || meta_existed)
         })
@@ -419,11 +425,24 @@ impl SessionBackend for SessionStore {
             if let Some(parent) = data_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            // Truncate the history. `File::create` truncates to empty while
-            // preserving the file so the key remains in `list_sessions`.
-            std::fs::File::create(&data_path)?;
+            // Write the fresh id FIRST (via write_conversation_id's own
+            // temp+sync+rename, so this step alone is crash-atomic), THEN
+            // truncate history. A crash between the two steps leaves
+            // "new id + stale history" (the FULL old history may survive
+            // because the truncate below has not been fsynced yet) rather
+            // than "empty history + stale id" (a `/clear` that silently
+            // didn't rotate). Both steps run under the same per-key exclusive
+            // lock as before.
             let id = uuid::Uuid::new_v4().to_string();
             self.write_conversation_id(session_key, &id)?;
+            // Truncate the history. `File::create` truncates to empty while
+            // preserving the file so the key remains in `list_sessions`.
+            // fsync so the truncate is durable on power loss (returning Ok
+            // alone is not a durability guarantee).
+            {
+                let file = std::fs::File::create(&data_path)?;
+                file.sync_all()?;
+            }
             Ok(id)
         })
     }
@@ -1058,6 +1077,70 @@ mod tests {
         assert!(
             c.load("race").is_empty(),
             "rotate must have cleared history"
+        );
+    }
+
+    // ── crash / delete hardening tests ───────────────────────────────
+
+    #[test]
+    fn clear_and_rotate_mints_fresh_id_and_truncates() {
+        // Asserts the observable post-state (new id persisted + history
+        // cleared), NOT crash injection; the write-id-before-truncate ORDER
+        // is statically guaranteed by the implementation structure -
+        // `write_conversation_id` is a complete temp+sync+rename atomic write
+        // that completes before `File::create` truncates, and
+        // `file.sync_all()` provides truncate durability - so no
+        // fault-injection seam is needed in production code.
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        store.append("rot", &ChatMessage::user("a")).unwrap();
+        store.append("rot", &ChatMessage::assistant("b")).unwrap();
+        let id_before = store.resolve_or_create_conversation_id("rot").unwrap();
+        assert_eq!(store.load("rot").len(), 2);
+
+        let id_after = store.clear_and_rotate_conversation("rot").unwrap();
+        assert_ne!(id_after, id_before, "rotate must mint a fresh id");
+        assert!(store.load("rot").is_empty(), "history must be truncated");
+        assert_eq!(
+            store.resolve_or_create_conversation_id("rot").unwrap(),
+            id_after,
+            "fresh id must be persisted to the sidecar"
+        );
+    }
+
+    #[test]
+    fn delete_session_propagates_sidecar_removal_error() {
+        // Inject a REAL failure: replace the sidecar FILE with a DIRECTORY at
+        // the same path. `remove_file` on a directory returns `Err`
+        // cross-platform (no permission bits needed), so the sidecar-removal
+        // step inside `delete_session` is forced to fail. Because sidecar
+        // removal now runs BEFORE data removal and propagates its error,
+        // `delete_session` must return `Err` and the data file must STILL be
+        // present (the failure aborted before touching history).
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        // Seed a data file + identity sidecar so both exist.
+        store.append("del", &ChatMessage::user("x")).unwrap();
+        let _ = store.resolve_or_create_conversation_id("del").unwrap();
+        let meta_path = store.meta_path("del");
+        let data_path = store.session_path("del");
+        assert!(meta_path.exists(), "sidecar must exist after resolve");
+        assert!(data_path.exists(), "data must exist after append");
+
+        // Swap the sidecar file for a directory so `remove_file` fails.
+        std::fs::remove_file(&meta_path).unwrap();
+        std::fs::create_dir(&meta_path).unwrap();
+
+        let result = store.delete_session("del");
+        assert!(
+            result.is_err(),
+            "delete must propagate sidecar-removal failure"
+        );
+        assert!(
+            data_path.exists(),
+            "data file must survive when sidecar removal fails first"
         );
     }
 }

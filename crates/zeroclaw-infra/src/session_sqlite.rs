@@ -180,7 +180,14 @@ impl SqliteSessionBackend {
         })
     }
 
-    /// Migrate JSONL session files into SQLite. Renames migrated files to `.jsonl.migrated`.
+    /// Migrate JSONL session files into SQLite. Renames migrated files to
+    /// `.jsonl.migrated`. Each session is imported in ONE `IMMEDIATE`
+    /// transaction: all messages + one metadata upsert (carrying the JSONL
+    /// sidecar's `conversation_id` if present) commit together, so a partial
+    /// failure never leaves half-imported data. The source file is renamed
+    /// ONLY after commit; a rename failure returns an error (not silently
+    /// increments `migrated`). Idempotent: a session already present in the
+    /// DB is skipped so a retried migration does not duplicate messages.
     pub fn migrate_from_jsonl(&self, workspace_dir: &Path) -> Result<usize> {
         let sessions_dir = workspace_dir.join("sessions");
         let entries = match std::fs::read_dir(&sessions_dir) {
@@ -208,26 +215,84 @@ impl SqliteSessionBackend {
                 Err(_) => continue,
             };
 
+            // Read the sidecar's conversation_id (if any) BEFORE the message
+            // loop so it is written in the same commit as the messages.
+            let sidecar_path = path.with_extension("meta.json");
+            let sidecar_conversation_id = std::fs::read_to_string(&sidecar_path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+                .and_then(|v| {
+                    v.get("conversation_id")
+                        .and_then(|x| x.as_str().map(str::to_string))
+                })
+                .filter(|s| !s.is_empty());
+
+            // Parse all messages first so the insert runs in one transaction.
             let reader = std::io::BufReader::new(file);
-            let mut count = 0;
+            let mut messages: Vec<ChatMessage> = Vec::new();
             for line in std::io::BufRead::lines(reader) {
                 let Ok(line) = line else { continue };
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Ok(msg) = serde_json::from_str::<ChatMessage>(trimmed)
-                    && self.append(key, &msg).is_ok()
-                {
-                    count += 1;
+                if let Ok(msg) = serde_json::from_str::<ChatMessage>(trimmed) {
+                    messages.push(msg);
                 }
             }
-
-            if count > 0 {
-                let migrated_path = path.with_extension("jsonl.migrated");
-                let _ = std::fs::rename(&path, &migrated_path);
-                migrated += 1;
+            if messages.is_empty() {
+                continue;
             }
+
+            let mut conn = self.conn.lock();
+            // Idempotency: skip sessions already present in the DB. A real DB
+            // error here MUST propagate (not be masked as "absent"): the
+            // message inserts below are plain `INSERT INTO sessions` with no
+            // ON CONFLICT (the `sessions` table has no unique constraint), so
+            // a false "absent" would duplicate every message.
+            let already: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM session_metadata WHERE session_key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .context("Failed to read idempotency probe")?;
+            if already {
+                continue;
+            }
+
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .context("Failed to begin migration transaction")?;
+            let now = Utc::now().to_rfc3339();
+            // Upsert metadata with the sidecar id (if any) and the correct
+            // message_count, in the same transaction as the messages.
+            tx.execute(
+                "INSERT INTO session_metadata
+                    (session_key, created_at, last_activity, message_count, conversation_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(session_key) DO UPDATE SET
+                    last_activity = excluded.last_activity,
+                    message_count = excluded.message_count,
+                    conversation_id = COALESCE(excluded.conversation_id, session_metadata.conversation_id)",
+                params![key, now, now, messages.len() as i64, sidecar_conversation_id],
+            )?;
+            for msg in &messages {
+                tx.execute(
+                    "INSERT INTO sessions (session_key, role, content, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![key, msg.role, msg.content, now],
+                )?;
+            }
+            tx.commit()
+                .context("Failed to commit migration transaction")?;
+            drop(conn);
+
+            // Rename ONLY after commit; a rename failure is an error.
+            let migrated_path = path.with_extension("jsonl.migrated");
+            std::fs::rename(&path, &migrated_path)
+                .with_context(|| format!("Failed to rename migrated file {:?}", path))?;
+            migrated += 1;
         }
 
         Ok(migrated)
@@ -499,35 +564,41 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
 
-        // Check if session exists
-        let exists: bool = conn
+        // Check if session exists. A real DB error MUST propagate (not be
+        // misreported as "does not exist" via unwrap_or(false)).
+        let exists: bool = tx
             .query_row(
                 "SELECT COUNT(*) > 0 FROM session_metadata WHERE session_key = ?1",
                 params![session_key],
                 |row| row.get(0),
             )
-            .unwrap_or(false);
+            .map_err(std::io::Error::other)?;
 
         if !exists {
             return Ok(false);
         }
 
-        // Delete messages (FTS5 trigger handles sessions_fts cleanup)
-        conn.execute(
+        // Delete messages (FTS5 trigger handles sessions_fts cleanup) and
+        // metadata together, in one transaction, so a failure on the second
+        // statement rolls back the first instead of leaving orphaned rows.
+        tx.execute(
             "DELETE FROM sessions WHERE session_key = ?1",
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
 
-        // Delete metadata
-        conn.execute(
+        tx.execute(
             "DELETE FROM session_metadata WHERE session_key = ?1",
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
 
+        tx.commit().map_err(std::io::Error::other)?;
         Ok(true)
     }
 
@@ -1878,5 +1949,117 @@ mod tests {
             c.load("race").is_empty(),
             "rotate must have cleared history"
         );
+    }
+
+    // ── crash / delete / migration hardening tests ───────────────────
+
+    #[test]
+    fn delete_session_rolls_back_when_second_statement_fails() {
+        // Inject a REAL failure: a BEFORE DELETE trigger on session_metadata
+        // raises ABORT, forcing the second DELETE inside `delete_session` to
+        // fail. With the single-IMMEDIATE-transaction rewrite the first
+        // DELETE (messages) must roll back, so both messages and metadata
+        // survive the aborted call.
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "CREATE TRIGGER fail_metadata_delete BEFORE DELETE ON session_metadata
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected failure');
+                 END",
+                [],
+            )
+            .unwrap();
+        }
+        let result = backend.delete_session("s1");
+        assert!(
+            result.is_err(),
+            "delete must error when second statement fails"
+        );
+        // Rollback worked: messages and metadata both still present.
+        assert!(
+            !backend.load("s1").is_empty(),
+            "messages must survive rollback"
+        );
+        assert!(
+            backend
+                .list_sessions_with_metadata()
+                .iter()
+                .any(|m| m.key == "s1"),
+            "metadata must survive rollback"
+        );
+    }
+
+    #[test]
+    fn migrate_from_jsonl_carries_over_sidecar_conversation_id() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let key = "sidecar_user";
+        let jsonl_path = sessions_dir.join(format!("{key}.jsonl"));
+        std::fs::write(&jsonl_path, "{\"role\":\"user\",\"content\":\"hello\"}\n").unwrap();
+        let meta_path = sessions_dir.join(format!("{key}.meta.json"));
+        std::fs::write(&meta_path, "{\"conversation_id\":\"conv-abc-123\"}\n").unwrap();
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let migrated = backend.migrate_from_jsonl(tmp.path()).unwrap();
+        assert_eq!(migrated, 1);
+
+        let meta = backend
+            .list_sessions_with_metadata()
+            .into_iter()
+            .find(|m| m.key == key)
+            .expect("migrated session must be listed");
+        assert_eq!(
+            meta.conversation_id.as_deref(),
+            Some("conv-abc-123"),
+            "sidecar conversation_id must be carried over"
+        );
+        assert_eq!(
+            meta.message_count, 1,
+            "message_count must reflect the migrated message"
+        );
+
+        // Idempotency: re-running migrate finds no `.jsonl` (renamed to
+        // `.jsonl.migrated`) -> 0, and messages are NOT duplicated.
+        let migrated_again = backend.migrate_from_jsonl(tmp.path()).unwrap();
+        assert_eq!(migrated_again, 0, "re-migrate must skip the renamed file");
+        assert_eq!(
+            backend.load(key).len(),
+            1,
+            "re-migrate must not duplicate messages"
+        );
+    }
+
+    #[test]
+    fn migrate_from_jsonl_without_sidecar_leaves_conversation_id_unset() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let key = "no_sidecar_user";
+        let jsonl_path = sessions_dir.join(format!("{key}.jsonl"));
+        std::fs::write(&jsonl_path, "{\"role\":\"user\",\"content\":\"hello\"}\n").unwrap();
+        // No sidecar file: a legacy JSONL with no recorded identity.
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let migrated = backend.migrate_from_jsonl(tmp.path()).unwrap();
+        assert_eq!(migrated, 1);
+
+        let meta = backend
+            .list_sessions_with_metadata()
+            .into_iter()
+            .find(|m| m.key == key)
+            .expect("migrated session must be listed");
+        assert!(
+            meta.conversation_id.is_none(),
+            "conversation_id must be unset when no sidecar is present"
+        );
+        assert_eq!(meta.message_count, 1);
     }
 }
