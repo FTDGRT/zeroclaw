@@ -201,13 +201,20 @@ impl Tool for SendMessageToPeerTool {
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
             zeroclaw_spawn::spawn!(async move {
+                // RFC #8933: an independent caller mints its own one-shot
+                // conversation id for a detached delivery - it is never
+                // `None`. This peer-message delivery has no cross-turn
+                // reuse contract (the recipient's turn is unrelated to the
+                // sender's), so a fresh UUID per call is correct, not a
+                // reused/durable id.
+                let peer_conversation_id = uuid::Uuid::new_v4().to_string();
                 let turn = crate::agent::loop_::process_message(
                     cfg,
                     &recipient_alias,
                     &body,
                     None,
                     zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                    None,
+                    Some(&peer_conversation_id),
                 );
                 if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
                 {
@@ -1089,5 +1096,197 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    // ── Detached peer delivery attribution (RFC #8933) ───────────────────
+    //
+    // `send_message_to_peer` spawns the recipient's turn as a detached task
+    // via `process_message`. An independent caller mints its own one-shot
+    // conversation id for that detached delivery (never `None`), so the
+    // recipient's `AgentStart` must carry a fresh UUID v4. The recipient's
+    // provider points at an unreachable ollama endpoint so the turn errors
+    // after `AgentStart` fires - observing `AgentStart` is sufficient.
+
+    /// Captures every `ObserverEvent` so the conversation_id the detached
+    /// `process_message` turn stamps onto its `AgentStart` can be asserted.
+    #[derive(Default)]
+    struct CapturingObserver {
+        events: parking_lot::Mutex<Vec<crate::observability::ObserverEvent>>,
+    }
+
+    impl crate::observability::Observer for CapturingObserver {
+        fn record_event(&self, event: &crate::observability::ObserverEvent) {
+            self.events.lock().push(event.clone());
+        }
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+        fn name(&self) -> &str {
+            "send-message-to-peer-capturing"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn flush(&self) {}
+    }
+
+    fn assert_valid_v4_conversation_id(cid: &str) {
+        let parsed = uuid::Uuid::parse_str(cid).unwrap_or_else(|err| {
+            panic!("conversation_id should be a valid UUID, got {cid:?}: {err}")
+        });
+        assert_eq!(
+            parsed.get_version(),
+            Some(uuid::Version::Random),
+            "conversation_id should be a random UUID v4, got {cid:?}"
+        );
+    }
+
+    /// Minimal config where `sender` and `peer-agent` share a peer group on
+    /// the `telegram` channel type and both listen on `telegram.prod`, so the
+    /// send passes the tool's peer-set and sender-channel validation. The
+    /// recipient resolves to an unreachable ollama endpoint (1s timeout) so
+    /// its `process_message` turn errors after `AgentStart` fires - which is
+    /// all this test needs to observe.
+    fn peer_delivery_test_config() -> Config {
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+        let mut config = Config::default();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("peer-delivery-test".to_string()),
+                    timeout_secs: Some(1),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "sender".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "peer-agent".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "team".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("peer-agent")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+        config
+    }
+
+    #[tokio::test]
+    async fn send_to_peer_agent_detached_delivery_carries_minted_conversation_id() {
+        // Serialize with the cli_conversation_id test group: both set the
+        // global RUN_OBSERVER_TEST_HOOK, so a parallel reader must not see
+        // this invocation's observer (or vice versa).
+        let _guard = crate::agent::loop_::CLI_CID_TEST_GUARD.lock().await;
+        let capturing = Arc::new(CapturingObserver::default());
+        {
+            let mut slot = crate::agent::loop_::RUN_OBSERVER_TEST_HOOK
+                .lock()
+                .expect("run-observer test hook lock should not be poisoned");
+            *slot = Some(capturing.clone());
+        }
+
+        let tool = SendMessageToPeerTool::new(Arc::new(peer_delivery_test_config()), "sender");
+        let args = json!({
+            "channel": "telegram.prod",
+            "target": "peer-agent",
+            "message": "hello peer",
+        });
+        let result = tool
+            .execute(args)
+            .await
+            .expect("execute should accept the validated send");
+        // The tool accepts synchronously and spawns the recipient turn
+        // detached. This text alone is NOT the assertion - it would also
+        // appear if the conversation_id param were `None`.
+        assert!(
+            result.success,
+            "send should be accepted for in-process delivery; got {result:?}"
+        );
+
+        // Wait for the detached task to emit the recipient's `AgentStart`.
+        // The recipient's turn is unrelated to this caller's, so its
+        // conversation_id is a fresh one-shot UUID - never `None`.
+        let agent_start_cid = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let events = capturing.events.lock();
+                    for event in events.iter() {
+                        if let crate::observability::ObserverEvent::AgentStart {
+                            agent_alias,
+                            conversation_id,
+                            ..
+                        } = event
+                            && agent_alias.as_deref() == Some("peer-agent")
+                        {
+                            return conversation_id.clone();
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|elapsed| {
+            panic!(
+                "timed out waiting for recipient AgentStart; elapsed={elapsed:?}; \
+                 result={result:?}; events={:?}",
+                capturing.events.lock()
+            )
+        });
+
+        let cid = agent_start_cid.unwrap_or_else(|| {
+            panic!(
+                "recipient AgentStart must carry a non-empty conversation_id; \
+                 events={:?}",
+                capturing.events.lock()
+            )
+        });
+        assert_valid_v4_conversation_id(&cid);
+
+        // If an LlmRequest was captured before the unreachable-ollama error,
+        // it must carry the SAME conversation_id as the AgentStart bracket.
+        {
+            let events = capturing.events.lock();
+            for event in events.iter() {
+                if let crate::observability::ObserverEvent::LlmRequest {
+                    agent_alias,
+                    conversation_id,
+                    ..
+                } = event
+                    && agent_alias.as_deref() == Some("peer-agent")
+                {
+                    assert_eq!(
+                        conversation_id.as_deref(),
+                        Some(cid.as_str()),
+                        "LlmRequest conversation_id must match the AgentStart bracket"
+                    );
+                }
+            }
+        }
+
+        *crate::agent::loop_::RUN_OBSERVER_TEST_HOOK
+            .lock()
+            .expect("run-observer test hook lock should not be poisoned") = None;
     }
 }

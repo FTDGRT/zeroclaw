@@ -1143,8 +1143,16 @@ static AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK: LazyLock<
 /// backend, so tests can assert on the conversation_id stamped onto CLI
 /// lifecycle events. Production builds never read it.
 #[cfg(test)]
-static RUN_OBSERVER_TEST_HOOK: LazyLock<Mutex<Option<Arc<dyn Observer>>>> =
+pub(crate) static RUN_OBSERVER_TEST_HOOK: LazyLock<Mutex<Option<Arc<dyn Observer>>>> =
     LazyLock::new(|| Mutex::new(None));
+
+// Re-export the cli_conversation_id test group's serialization lock so the
+// `send_message_to_peer` test module can share it: both groups set the global
+// RUN_OBSERVER_TEST_HOOK, so a parallel reader must not observe the other's
+// observer. The static itself lives in `tests` (where it is documented); this
+// only lifts a crate-visible name to the module path.
+#[cfg(test)]
+pub(crate) use tests::CLI_CID_TEST_GUARD;
 
 fn api_key_and_uri_for_provider(
     config: &zeroclaw_config::schema::Config,
@@ -2386,8 +2394,8 @@ async fn repl_loop<R: ReplInput>(
                 } else {
                     println!("Conversation cleared.\n");
                 }
-                if let Some(path) = session_state_file.as_deref() {
-                    save_interactive_session_history(path, &history)?;
+                if let Some(path) = session_state_file {
+                    save_interactive_session_history(path, history)?;
                 }
                 // Rotate to a fresh conversation id for the new
                 // conversation. This runs AFTER the history reset
@@ -2447,10 +2455,10 @@ async fn repl_loop<R: ReplInput>(
         // before the provider call; the system prompt is rebuilt from
         // this same set immediately before each attempt.
         let excluded_tools = compute_excluded_mcp_tools(
-            &tools_registry,
+            tools_registry,
             &agent.resolved.tool_filter_groups,
             &effective_input,
-            &mcp_tool_names,
+            mcp_tool_names,
         );
 
         let excluded_tool_names: HashSet<&str> =
@@ -2462,7 +2470,7 @@ async fn repl_loop<R: ReplInput>(
             .collect::<Vec<_>>();
         if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
             &effective_input,
-            &skills,
+            skills,
             &runtime_capability_names,
             &config.data_dir,
             &config.skills.extra_registries,
@@ -2470,7 +2478,7 @@ async fn repl_loop<R: ReplInput>(
         ) {
             *final_output = suggestion;
             if let Err(e) = zeroclaw_api::channel::Channel::send(
-                &*cli,
+                cli,
                 &zeroclaw_api::channel::SendMessage::new(format!("\n{final_output}\n"), "user"),
             )
             .await
@@ -2525,13 +2533,13 @@ async fn repl_loop<R: ReplInput>(
                     r,
                     &*observer,
                     &effective_input,
-                    &board_names,
+                    board_names,
                     rag_limit,
                     TurnMeta {
                         parent_agent_alias: None,
                         agent_alias: Some(agent_alias),
                         turn_id: &turn_id,
-                        conversation_id: Some(&conversation_id),
+                        conversation_id: Some(conversation_id),
                         channel_name,
                     },
                 )
@@ -2590,16 +2598,16 @@ async fn repl_loop<R: ReplInput>(
                 && sys_msg.role == "system"
             {
                 match build_system_prompt_for_turn(
-                    &agent_workspace,
-                    &model_name,
-                    &tool_descs,
-                    &deferred_section,
-                    &skills,
+                    agent_workspace,
+                    model_name,
+                    tool_descs,
+                    deferred_section,
+                    skills,
                     Some(&agent.identity),
                     bootstrap_max_chars,
-                    &risk_profile,
+                    risk_profile,
                     model_provider.as_ref(),
-                    &tools_registry,
+                    tools_registry,
                     &excluded_tools,
                     activated_handle.as_ref(),
                     agent.resolved.strict_tool_parsing,
@@ -2625,17 +2633,17 @@ async fn repl_loop<R: ReplInput>(
                             exec: ResolvedAgentExecution::resolve(
                                 ResolvedModelAccess {
                                     model_provider: model_provider.as_ref(),
-                                    provider_name: &provider_name,
-                                    model: &model_name,
+                                    provider_name,
+                                    model: model_name,
                                     temperature: turn_temperature,
                                 },
                                 ResolvedIo {
-                                    tools_registry: &tools_registry,
+                                    tools_registry,
                                     observer: observer.as_ref(),
                                     silent: true,
                                     approval: approval_manager.as_ref(),
                                     multimodal_config: &config.multimodal,
-                                    config: Some(&config),
+                                    config: Some(config),
                                     hooks: None,
                                     activated_tools: activated_handle.as_ref(),
                                     model_switch_callback: None,
@@ -2688,9 +2696,9 @@ async fn repl_loop<R: ReplInput>(
                             agent_alias: Some(agent_alias),
                             parent_agent_alias: None,
                             turn_id: &turn_id,
-                            conversation_id: Some(&conversation_id),
+                            conversation_id: Some(conversation_id),
                             sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
-                                config: &config,
+                                config,
                             }),
                         }),
                     ),
@@ -2720,13 +2728,13 @@ async fn repl_loop<R: ReplInput>(
                         );
 
                         let (switch_api_key2, switch_uri2) = api_key_and_uri_for_provider(
-                            &config,
+                            config,
                             &new_model_provider,
                             agent_model_provider,
                         );
                         *model_provider =
                             match zeroclaw_providers::create_routed_model_provider_with_options(
-                                &config,
+                                config,
                                 &new_model_provider,
                                 switch_api_key2.as_deref(),
                                 switch_uri2.as_deref(),
@@ -2734,10 +2742,10 @@ async fn repl_loop<R: ReplInput>(
                                 &config.model_routes,
                                 &new_model,
                                 &zeroclaw_providers::options_for_provider_ref(
-                                    &config,
+                                    config,
                                     &new_model_provider,
                                     &zeroclaw_providers::provider_runtime_options_for_agent(
-                                        &config,
+                                        config,
                                         agent_alias,
                                     ),
                                 ),
@@ -2820,7 +2828,7 @@ async fn repl_loop<R: ReplInput>(
                         }
                         *history = result.history;
                         let system_floor =
-                            crate::agent::history::estimate_system_floor_tokens(&history);
+                            crate::agent::history::estimate_system_floor_tokens(history);
                         let context_token_budget =
                             agent.resolved.effective_context_budget();
                         let floor_exceeds_budget = system_floor >= context_token_budget;
@@ -2892,7 +2900,7 @@ async fn repl_loop<R: ReplInput>(
         if content_was_streamed.load(std::sync::atomic::Ordering::Relaxed) {
             println!();
         } else if let Err(e) = zeroclaw_api::channel::Channel::send(
-            &*cli,
+            cli,
             &zeroclaw_api::channel::SendMessage::new(format!("\n{final_output}\n"), "user"),
         )
         .await
@@ -2963,8 +2971,8 @@ async fn repl_loop<R: ReplInput>(
         turn_guard.set_model_route(provider_name.clone(), model_name.clone());
         turn_guard.set_usage(tokens_used, None);
 
-        if let Some(path) = session_state_file.as_deref() {
-            save_interactive_session_history(path, &history)?;
+        if let Some(path) = session_state_file {
+            save_interactive_session_history(path, history)?;
         }
         turn_guard.finish();
     }
@@ -3032,8 +3040,23 @@ pub async fn process_message(
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
 
-        let observer: Arc<dyn Observer> =
-            Arc::from(observability::create_observer(&config.observability));
+        let observer: Arc<dyn Observer> = {
+            #[cfg(test)]
+            {
+                RUN_OBSERVER_TEST_HOOK
+                    .lock()
+                    .expect("process-message observer test hook lock should not be poisoned")
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Arc::from(observability::create_observer(&config.observability))
+                    })
+            }
+            #[cfg(not(test))]
+            {
+                Arc::from(observability::create_observer(&config.observability))
+            }
+        };
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
@@ -16262,7 +16285,7 @@ Let me check the result."#;
     /// Serializes the cli_conversation_id_* tests so the global
     /// RUN_OBSERVER_TEST_HOOK is never read by a sibling test running in
     /// parallel. `tokio::sync::Mutex` so the guard may cross the `run` await.
-    static CLI_CID_TEST_GUARD: LazyLock<tokio::sync::Mutex<()>> =
+    pub(crate) static CLI_CID_TEST_GUARD: LazyLock<tokio::sync::Mutex<()>> =
         LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     /// Minimal config whose agent resolves past risk-profile/provider setup so
