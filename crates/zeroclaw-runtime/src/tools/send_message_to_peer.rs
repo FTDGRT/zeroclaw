@@ -201,12 +201,11 @@ impl Tool for SendMessageToPeerTool {
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
             zeroclaw_spawn::spawn!(async move {
-                // RFC #8933: an independent caller mints its own one-shot
-                // conversation id for a detached delivery - it is never
-                // `None`. This peer-message delivery has no cross-turn
-                // reuse contract (the recipient's turn is unrelated to the
-                // sender's), so a fresh UUID per call is correct, not a
-                // reused/durable id.
+                // An independent caller mints its own one-shot conversation
+                // id for a detached delivery, so it is never `None`. Peer
+                // delivery has no cross-turn reuse contract (the recipient's
+                // turn is unrelated to the sender's), so a fresh UUID per
+                // call is correct rather than a reused or durable id.
                 let peer_conversation_id = uuid::Uuid::new_v4().to_string();
                 let turn = crate::agent::loop_::process_message(
                     cfg,
@@ -1098,7 +1097,7 @@ mod tests {
         server.abort();
     }
 
-    // ── Detached peer delivery attribution (RFC #8933) ───────────────────
+    // Detached peer delivery attribution.
     //
     // `send_message_to_peer` spawns the recipient's turn as a detached task
     // via `process_message`. An independent caller mints its own one-shot
@@ -1194,10 +1193,9 @@ mod tests {
 
     #[tokio::test]
     async fn send_to_peer_agent_detached_delivery_carries_minted_conversation_id() {
-        // Serialize with the cli_conversation_id test group: both set the
-        // global RUN_OBSERVER_TEST_HOOK, so a parallel reader must not see
-        // this invocation's observer (or vice versa).
-        let _guard = crate::agent::loop_::CLI_CID_TEST_GUARD.lock().await;
+        // Serialize all process-wide observer test state so this invocation's
+        // override cannot affect a parallel broadcast-hook test (or vice versa).
+        let _guard = crate::observability::HOOK_TEST_LOCK.lock().await;
         let capturing = Arc::new(CapturingObserver::default());
         {
             let mut slot = crate::agent::loop_::RUN_OBSERVER_TEST_HOOK

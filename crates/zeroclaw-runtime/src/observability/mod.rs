@@ -433,13 +433,12 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     }
 }
 
-/// Serializes tests (in this module and elsewhere in the crate, e.g. the
-/// `agent::loop_` lifecycle-bracket tests that drive `run()` end to end)
-/// that install the process-wide broadcast hook, so concurrent test runs
-/// don't observe each other's installations. A `tokio::sync::Mutex` (not
-/// `parking_lot`) so async tests can hold the guard across the `.await` on
-/// `run()` without tripping `clippy::await_holding_lock`; plain `#[test]`s
-/// use [`tokio::sync::Mutex::blocking_lock`].
+/// Serializes tests that modify process-wide observer state, including the
+/// broadcast hook and `agent::loop_`'s test-only observer override. Those
+/// globals affect the same observer-selection path and must not be changed by
+/// concurrent tests. A `tokio::sync::Mutex` (not `parking_lot`) lets async tests
+/// hold the guard across `.await`; plain `#[test]`s use
+/// [`tokio::sync::Mutex::blocking_lock`].
 #[cfg(test)]
 pub(crate) static HOOK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 

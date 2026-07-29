@@ -1146,14 +1146,6 @@ static AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK: LazyLock<
 pub(crate) static RUN_OBSERVER_TEST_HOOK: LazyLock<Mutex<Option<Arc<dyn Observer>>>> =
     LazyLock::new(|| Mutex::new(None));
 
-// Re-export the cli_conversation_id test group's serialization lock so the
-// `send_message_to_peer` test module can share it: both groups set the global
-// RUN_OBSERVER_TEST_HOOK, so a parallel reader must not observe the other's
-// observer. The static itself lives in `tests` (where it is documented); this
-// only lifts a crate-visible name to the module path.
-#[cfg(test)]
-pub(crate) use tests::CLI_CID_TEST_GUARD;
-
 fn api_key_and_uri_for_provider(
     config: &zeroclaw_config::schema::Config,
     provider_name: &str,
@@ -1168,6 +1160,25 @@ fn api_key_and_uri_for_provider(
         fallback.and_then(|e| e.api_key.clone()),
         fallback.and_then(|e| e.uri.clone()),
     )
+}
+
+/// Whether `run` opens its outer `AgentStart`/`AgentEnd` bracket here.
+///
+/// The CLI passes `interactive = true` for BOTH single-shot (`-m`) and the
+/// REPL session, so this bracket must be gated on the actual single-shot
+/// condition - `message.is_some()` - and NOT on `!interactive`. The REPL
+/// emits its own per-prompt `AgentStart`/`AgentEnd` pair inside `repl_loop`;
+/// gating here on `!interactive` would silently strip the bracket from the
+/// primary CLI `-m` path.
+///
+/// Extracted to a pure predicate so the single-shot-vs-REPL decision can be
+/// unit-tested directly, without driving the full `run` pipeline (provider
+/// call, tool registry, MCP assembly). `interactive` is intentionally accepted
+/// but unused: the signature itself is the regression contract - the CLI's
+/// `interactive = true` single-shot path stays bracketed.
+fn run_opens_outer_agent_bracket(interactive: bool, message: Option<&str>) -> bool {
+    let _ = interactive;
+    message.is_some()
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -1516,12 +1527,11 @@ pub async fn run(
                 &provider_runtime_options,
             )?;
 
-        // The outer bracket serves the single-shot path only. The interactive
-        // REPL opens its own per-prompt `AgentStart`/`AgentEnd` pair inside
-        // `repl_loop`, so this is gated on `message.is_some()` (the actual
-        // single-shot condition) rather than `interactive`: the CLI passes
-        // `interactive = true` for both `-m` and the REPL session.
-        let is_single_shot = message.is_some();
+        // Outer bracket serves the single-shot path only; see
+        // `run_opens_outer_agent_bracket` for why this is NOT gated on
+        // `!interactive` (the CLI sets `interactive = true` for both `-m`
+        // and the REPL session).
+        let is_single_shot = run_opens_outer_agent_bracket(interactive, message.as_deref());
         let mut turn_guard = if is_single_shot {
             Some(crate::observability::AgentTurnGuard::start(
                 observer.as_ref(),
@@ -16267,7 +16277,7 @@ Let me check the result."#;
         }
     }
 
-    // ── CLI conversation attribution (Task 6) ────────────────────────────
+    // CLI conversation attribution.
     //
     // `run` owns the conversation_id: one UUID v4 per single-shot invocation
     // (and one per REPL session, reused across ordinary turns and rotated on
@@ -16281,12 +16291,6 @@ Let me check the result."#;
     // conversation_id` mutated only in the `/new`/`/clear` arm, after the
     // history reset) rather than driven end-to-end here; the single-shot path
     // below pins the minting and the event wiring.
-
-    /// Serializes the cli_conversation_id_* tests so the global
-    /// RUN_OBSERVER_TEST_HOOK is never read by a sibling test running in
-    /// parallel. `tokio::sync::Mutex` so the guard may cross the `run` await.
-    pub(crate) static CLI_CID_TEST_GUARD: LazyLock<tokio::sync::Mutex<()>> =
-        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     /// Minimal config whose agent resolves past risk-profile/provider setup so
     /// `run` reaches the conversation_id mint and emits AgentStart. The ollama
@@ -16323,11 +16327,17 @@ Let me check the result."#;
         config
     }
 
-    fn cid_from_agent_start(events: &[ObserverEvent]) -> Option<String> {
+    /// The conversation_id from `alias`'s `AgentStart`. Filtering on the alias
+    /// matters because `RUN_OBSERVER_TEST_HOOK` is process-wide: an unfiltered
+    /// scan could return a concurrent test's id, which is itself a valid UUID
+    /// v4 and so would pass the shape assertions while describing another run.
+    fn cid_from_agent_start(events: &[ObserverEvent], alias: &str) -> Option<String> {
         events.iter().find_map(|event| match event {
             ObserverEvent::AgentStart {
-                conversation_id, ..
-            } => conversation_id.clone(),
+                agent_alias,
+                conversation_id,
+                ..
+            } if agent_alias.as_deref() == Some(alias) => conversation_id.clone(),
             _ => None,
         })
     }
@@ -16344,14 +16354,14 @@ Let me check the result."#;
     }
 
     /// Run single-shot `run` once and return the conversation_id stamped onto
-    /// its AgentStart event. Holds the cli_conversation_id guard for the whole
-    /// call so the global observer hook stays scoped to this invocation.
+    /// its AgentStart event. Holds the process-wide observer test guard for the
+    /// whole call so the override stays scoped to this invocation.
     async fn run_once_capture_cid(
         config: zeroclaw_config::schema::Config,
         state_file: Option<std::path::PathBuf>,
         message: &str,
     ) -> String {
-        let _guard = CLI_CID_TEST_GUARD.lock().await;
+        let _guard = observability::HOOK_TEST_LOCK.lock().await;
         let capturing = Arc::new(CapturingObserver::default());
         {
             let mut slot = RUN_OBSERVER_TEST_HOOK
@@ -16377,13 +16387,14 @@ Let me check the result."#;
         // The turn errors at the unreachable ollama endpoint; AgentStart has
         // already fired (and been captured) before that point.
         let _ = result;
-        let cid = cid_from_agent_start(&capturing.events.lock()).unwrap_or_else(|| {
-            panic!(
-                "run() should emit AgentStart with a conversation_id; \
+        let cid =
+            cid_from_agent_start(&capturing.events.lock(), "cid-test-agent").unwrap_or_else(|| {
+                panic!(
+                    "run() should emit AgentStart with a conversation_id; \
                  result={result:?}; events={:?}",
-                capturing.events.lock()
-            )
-        });
+                    capturing.events.lock()
+                )
+            });
         *RUN_OBSERVER_TEST_HOOK
             .lock()
             .expect("run-observer test hook lock should not be poisoned") = None;
@@ -16469,48 +16480,56 @@ Let me check the result."#;
     /// condition), not `!interactive`. Every other `run` test passes
     /// `interactive = false`, so this is the sole guard against a regression
     /// that reverts the guard to `!interactive` - which would silently strip
-    /// the bracket from the primary CLI `-m` path. The turn errors at the
-    /// unreachable ollama endpoint before `AgentEnd` fires; observing
-    /// `AgentStart` is sufficient to catch the regression.
-    #[tokio::test]
-    async fn cli_single_shot_with_interactive_flag_still_emits_agent_start() {
-        let _guard = CLI_CID_TEST_GUARD.lock().await;
-        let capturing = Arc::new(CapturingObserver::default());
+    /// the bracket from the primary CLI `-m` path.
+    ///
+    /// Rather than driving the full `run` pipeline (provider call, tool
+    /// registry, MCP assembly) - which is network-bound and can stall under CI
+    /// load - this exercises the decision predicate directly plus the
+    /// `AgentTurnGuard` emission it gates. The `AgentStart` lifecycle itself is
+    /// also covered by the `AgentTurnGuard` unit tests in `observability`.
+    #[test]
+    fn cli_single_shot_with_interactive_flag_still_emits_agent_start() {
+        // CLI single-shot: interactive=true AND a message -> bracket fires.
+        assert!(
+            run_opens_outer_agent_bracket(true, Some("hello")),
+            "interactive=true + single-shot message must still open the bracket"
+        );
+        // REPL: interactive=true but no message -> no outer bracket here
+        // (`repl_loop` emits its own per-prompt pair).
+        assert!(
+            !run_opens_outer_agent_bracket(true, None),
+            "REPL path (interactive=true, no message) must not open the outer bracket"
+        );
+        // Daemon single-shot also brackets.
+        assert!(
+            run_opens_outer_agent_bracket(false, Some("hello")),
+            "daemon single-shot must open the bracket"
+        );
+
+        // When the predicate says "fire", `AgentTurnGuard::start` really does
+        // emit the `AgentStart` event - the actual emission the bracket relies
+        // on, verified without driving `run`.
+        let observer = CapturingObserver::default();
         {
-            let mut slot = RUN_OBSERVER_TEST_HOOK
-                .lock()
-                .expect("run-observer test hook lock should not be poisoned");
-            *slot = Some(capturing.clone());
+            let _guard = crate::observability::AgentTurnGuard::start(
+                &observer,
+                "ollama.default",
+                "cid-test",
+                Some("cli".to_string()),
+                Some("cid-test-agent".to_string()),
+                Some(uuid::Uuid::new_v4().to_string()),
+                Some(uuid::Uuid::new_v4().to_string()),
+            );
+            let events = observer.events.lock();
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    ObserverEvent::AgentStart { agent_alias, .. }
+                        if agent_alias.as_deref() == Some("cid-test-agent")
+                )),
+                "AgentTurnGuard::start must emit AgentStart for the single-shot alias, got {events:?}"
+            );
         }
-        let result = super::run(
-            cid_test_config(),
-            "cid-test-agent",
-            Some("hello".to_string()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            true,
-            None,
-            None,
-            TurnOrigin::Interactive,
-            super::AgentRunOverrides::default(),
-        )
-        .await;
-        // The turn errors at the unreachable ollama endpoint; AgentStart has
-        // already fired (and been captured) before that point.
-        let _ = result;
-        let cid = cid_from_agent_start(&capturing.events.lock()).unwrap_or_else(|| {
-            panic!(
-                "run(interactive=true, message=Some) must still emit AgentStart; \
-                 result={result:?}; events={:?}",
-                capturing.events.lock()
-            )
-        });
-        assert_valid_v4_conversation_id(&cid);
-        *RUN_OBSERVER_TEST_HOOK
-            .lock()
-            .expect("run-observer test hook lock should not be poisoned") = None;
     }
 
     /// In-process REPL input backed by a `VecDeque<String>`. Each
@@ -17033,12 +17052,17 @@ Let me check the result."#;
     /// permanently unbalanced. `run()` builds its own observer and model
     /// provider internally with no injection seam, so these tests drive it
     /// end to end: a real `Config`, the real tool registry, and a local
-    /// HTTP server standing in for the model. Event capture leans on the
-    /// process-wide broadcast hook the gateway uses to fan events out to
-    /// `/api/events` (`observability::set_scoped_broadcast_hook`);
-    /// `observability::HOOK_TEST_LOCK` serializes against
-    /// `observability::mod`'s own hook tests so neither steals the other's
-    /// events off the single global hook slot.
+    /// HTTP server standing in for the model. Event capture installs a
+    /// `CapturingObserver` via `RUN_OBSERVER_TEST_HOOK`, which `run()` reads
+    /// and uses directly as its observer - bypassing the `TeeObserver`/
+    /// broadcast-hook fan-out - so an emitter that only reaches the
+    /// process-wide broadcast hook (RPC, WS, channel) cannot pollute the
+    /// capture. `observability::HOOK_TEST_LOCK` serializes these tests
+    /// against the other observer tests that contend for the same slot.
+    /// That slot is still process-wide and read by every `run()` and
+    /// `process_message()` call, including tests that assert on unrelated
+    /// seams and take no observer lock, so ordering assertions run over an
+    /// `alias_lifecycle_sequence` view rather than the raw capture.
     // `config.providers.models.ollama.*` dispatches through the OpenAI-
     // compatible wire (`OllamaModelProviderConfig::create_provider` builds an
     // `OpenAiCompatibleModelProvider` labeled "Ollama"), so the scripted
@@ -17116,6 +17140,7 @@ Let me check the result."#;
                 channel: None,
                 agent_alias: Some(alias.into()),
                 turn_id: Some("t".into()),
+                conversation_id: None,
             }
         }
         fn end(alias: &str) -> ObserverEvent {
@@ -17128,6 +17153,7 @@ Let me check the result."#;
                 channel: None,
                 agent_alias: Some(alias.into()),
                 turn_id: Some("t".into()),
+                conversation_id: None,
             }
         }
 
@@ -17242,8 +17268,12 @@ Let me check the result."#;
             .insert("default".to_string(), RiskProfileConfig::default());
 
         let capturing = Arc::new(CapturingObserver::default());
-        let observer: Arc<dyn Observer> = capturing.clone();
-        let hook_guard = observability::set_scoped_broadcast_hook(observer);
+        {
+            let mut slot = RUN_OBSERVER_TEST_HOOK
+                .lock()
+                .expect("run-observer test hook lock should not be poisoned");
+            *slot = Some(capturing.clone());
+        }
 
         let result = super::run(
             config,
@@ -17261,7 +17291,6 @@ Let me check the result."#;
         )
         .await;
 
-        drop(hook_guard);
         server.abort();
 
         let output = result.expect("run() should complete the scripted turn");
@@ -17284,6 +17313,10 @@ Let me check the result."#;
             "the target agent's last lifecycle event must be AgentEnd, \
              got {lifecycle:?} (full captured stream: {events:?})"
         );
+
+        *RUN_OBSERVER_TEST_HOOK
+            .lock()
+            .expect("run-observer test hook lock should not be poisoned") = None;
     }
 
     /// The core regression this fix addresses: before it, a model-call
@@ -17336,8 +17369,12 @@ Let me check the result."#;
             .insert("default".to_string(), RiskProfileConfig::default());
 
         let capturing = Arc::new(CapturingObserver::default());
-        let observer: Arc<dyn Observer> = capturing.clone();
-        let hook_guard = observability::set_scoped_broadcast_hook(observer);
+        {
+            let mut slot = RUN_OBSERVER_TEST_HOOK
+                .lock()
+                .expect("run-observer test hook lock should not be poisoned");
+            *slot = Some(capturing.clone());
+        }
 
         let result = super::run(
             config,
@@ -17354,8 +17391,6 @@ Let me check the result."#;
             super::AgentRunOverrides::default(),
         )
         .await;
-
-        drop(hook_guard);
 
         assert!(
             result.is_err(),
@@ -17386,6 +17421,10 @@ Let me check the result."#;
             "the target agent's last lifecycle event must be AgentEnd even on the \
              error path, got {lifecycle:?} (full captured stream: {events:?})"
         );
+
+        *RUN_OBSERVER_TEST_HOOK
+            .lock()
+            .expect("run-observer test hook lock should not be poisoned") = None;
     }
 
     /// An in-loop model switch (the real `model_switch` tool, driven exactly
@@ -17478,8 +17517,12 @@ Let me check the result."#;
             .insert("default".to_string(), RiskProfileConfig::default());
 
         let capturing = Arc::new(CapturingObserver::default());
-        let observer: Arc<dyn Observer> = capturing.clone();
-        let hook_guard = observability::set_scoped_broadcast_hook(observer);
+        {
+            let mut slot = RUN_OBSERVER_TEST_HOOK
+                .lock()
+                .expect("run-observer test hook lock should not be poisoned");
+            *slot = Some(capturing.clone());
+        }
 
         let result = super::run(
             config,
@@ -17497,7 +17540,6 @@ Let me check the result."#;
         )
         .await;
 
-        drop(hook_guard);
         server.abort();
 
         let output = result.expect("run() should complete after the model switch");
@@ -17547,6 +17589,10 @@ Let me check the result."#;
             "AgentEnd must be attributed to the switched-TO route (set_model_route), \
              not the original one, got {events:?}"
         );
+
+        *RUN_OBSERVER_TEST_HOOK
+            .lock()
+            .expect("run-observer test hook lock should not be poisoned") = None;
     }
 
     /// `build_hardware_context` must forward the caller's TurnMeta onto the

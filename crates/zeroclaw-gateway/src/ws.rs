@@ -2236,7 +2236,7 @@ mod tests {
     /// backend directly. All other trait methods delegate to the inner backend.
     struct RecordingBackend {
         inner: zeroclaw_infra::session_sqlite::SqliteSessionBackend,
-        resolve_calls: std::sync::Mutex<Vec<(String, String)>>, // (session_key, returned_id)
+        resolve_calls: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl zeroclaw_infra::session_backend::SessionBackend for RecordingBackend {
@@ -2408,37 +2408,12 @@ mod tests {
         ws
     }
 
-    /// Drain frames from `ws` until a terminal turn frame (`error`/`done`/
-    /// `aborted`) arrives, returning its parsed JSON. Proves a real turn ran.
-    async fn ws_next_terminal_frame(
-        ws: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    ) -> Option<serde_json::Value> {
-        use futures_util::StreamExt as _;
-        use tokio_tungstenite::tungstenite::Message as TMessage;
-        for _ in 0..50 {
-            match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
-                Ok(Some(Ok(TMessage::Text(text)))) => {
-                    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-                    if matches!(
-                        parsed["type"].as_str(),
-                        Some("error") | Some("done") | Some("aborted")
-                    ) {
-                        return Some(parsed);
-                    }
-                }
-                Ok(Some(Ok(_))) => continue,
-                _ => break,
-            }
-        }
-        None
-    }
-
-    /// Minimal gateway config whose agent builds and reaches the LLM call, then
-    /// errors at an unreachable ollama endpoint (1s timeout). Enough to drive a
-    /// real turn through `handle_socket` past `set_conversation_id`. Mirrors the
-    /// runtime CLI `cid_test_config` pattern.
+    /// Minimal gateway config whose agent builds successfully and points at an
+    /// unreachable ollama endpoint (1s timeout). Conversation identity is
+    /// resolved during connection setup, before any message is read, so these
+    /// tests never need the model to answer - the endpoint only has to exist in
+    /// config for the agent to construct. Mirrors the runtime CLI
+    /// `cid_test_config` pattern.
     fn ws_cid_test_config(data_dir: std::path::PathBuf) -> zeroclaw_config::schema::Config {
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, MemoryConfig, ModelProviderConfig,
@@ -2483,6 +2458,17 @@ mod tests {
         config
     }
 
+    /// A caller-supplied `session_id` is untrusted input that may be an email,
+    /// a routing token, or any other identity string. It must never become the
+    /// exported conversation id; `handle_socket` has to resolve an opaque
+    /// server-minted UUID v4 through the session backend instead.
+    ///
+    /// `handle_socket` resolves the id during connection setup, right after the
+    /// agent is built and before the first message is read, so completing the
+    /// handshake is enough to exercise the contract - no turn has to run and no
+    /// model has to be reachable. Assertions read what the backend recorded
+    /// rather than calling it directly, which is what proves the production path
+    /// performed the resolution.
     #[tokio::test]
     async fn handle_socket_resolves_opaque_conversation_id_not_raw_session_id() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2499,92 +2485,35 @@ mod tests {
         state.session_backend = Some(recording.clone());
 
         let (addr, server) = ws_serve(state).await;
-        let mut ws = ws_connect_and_handshake(addr, "attacker@example.com").await;
+        let ws = ws_connect_and_handshake(addr, "attacker@example.com").await;
 
-        // Drive a real turn; it errors at the unreachable ollama endpoint, but
-        // only after `handle_socket` stamped the resolved conversation id.
-        use futures_util::SinkExt as _;
-        use tokio_tungstenite::tungstenite::Message as TMessage;
-        ws.send(TMessage::Text(
-            serde_json::json!({"type": "message", "content": "hello"})
-                .to_string()
-                .into(),
-        ))
+        // Agent construction sits between the handshake ack and the resolve, so
+        // poll for the recorded call instead of assuming it already landed.
+        let expected_key = format!("{GW_SESSION_PREFIX}attacker@example.com");
+        let resolved = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some((_, id)) = recording
+                    .resolve_calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(key, _)| key == &expected_key)
+                    .cloned()
+                {
+                    return id;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
         .await
-        .unwrap();
-        let terminal = ws_next_terminal_frame(&mut ws).await;
-        assert!(
-            terminal.is_some(),
-            "a real turn must run and terminate with an error/done/aborted frame"
-        );
+        .expect("handle_socket must call resolve_or_create_conversation_id with the gw_ key");
 
-        // Assert from what `handle_socket` recorded - NOT by calling the backend
-        // ourselves. This proves the production path resolved the id.
-        let calls = recording.resolve_calls.lock().unwrap();
-        let (_key, resolved) = calls
-            .iter()
-            .find(|(k, _)| k == &format!("{GW_SESSION_PREFIX}attacker@example.com"))
-            .expect("handle_socket must call resolve_or_create_conversation_id with the gw_ key");
-        let parsed =
-            uuid::Uuid::parse_str(resolved).expect("resolved conversation id must be a valid UUID");
+        let parsed = uuid::Uuid::parse_str(&resolved)
+            .expect("resolved conversation id must be a valid UUID");
         assert_eq!(parsed.get_version_num(), 4, "must be UUID v4: {resolved}");
         assert_ne!(
             resolved, "attacker@example.com",
             "raw caller-supplied session_id must never become the conversation_id"
-        );
-
-        drop(ws);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn ws_real_dispatch_path_never_resolves_conversation_id_to_the_raw_session_id() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = ws_cid_test_config(tmp.path().join("workspace"));
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-
-        let recording = Arc::new(RecordingBackend {
-            inner: zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir)
-                .unwrap(),
-            resolve_calls: std::sync::Mutex::new(Vec::new()),
-        });
-
-        let mut state = crate::api::tests::test_state(config);
-        state.session_backend = Some(recording.clone());
-
-        let (addr, server) = ws_serve(state).await;
-        let mut ws = ws_connect_and_handshake(addr, "attacker@example.com").await;
-
-        // Drive a real turn to completion (it errors at the unreachable ollama
-        // endpoint after the id was stamped and the turn dispatched).
-        use futures_util::SinkExt as _;
-        use tokio_tungstenite::tungstenite::Message as TMessage;
-        ws.send(TMessage::Text(
-            serde_json::json!({"type": "message", "content": "hello"})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
-        let terminal = ws_next_terminal_frame(&mut ws).await;
-        assert!(
-            terminal.is_some(),
-            "the real dispatch path must run a turn and emit a terminal frame"
-        );
-
-        // Evidence the production path resolved the id: read what `handle_socket`
-        // recorded rather than calling the backend ourselves.
-        let calls = recording.resolve_calls.lock().unwrap();
-        let (_key, resolved) = calls
-            .iter()
-            .find(|(k, _)| k == &format!("{GW_SESSION_PREFIX}attacker@example.com"))
-            .expect("the real dispatch path must resolve the conversation id via the backend");
-        let parsed =
-            uuid::Uuid::parse_str(resolved).expect("resolved conversation id must be a valid UUID");
-        assert_eq!(parsed.get_version_num(), 4, "must be UUID v4: {resolved}");
-        assert_ne!(
-            resolved, "attacker@example.com",
-            "the raw caller-supplied session_id must never become the conversation_id"
         );
 
         drop(ws);
