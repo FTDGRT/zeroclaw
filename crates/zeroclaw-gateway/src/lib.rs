@@ -549,6 +549,12 @@ pub struct AppState {
     pub web_dist_dir: Option<std::path::PathBuf>,
     /// Session backend for persisting gateway WS chat sessions
     pub session_backend: Option<Arc<dyn SessionBackend>>,
+    /// Shared Channel conversation identity for the four Channel webhooks
+    /// (WhatsApp, Linq, WATI, Nextcloud Talk). Resolves one opaque id per
+    /// `conversation_history_key` so re-delivered or follow-up messages reuse
+    /// the same id. The gateway's own `session_backend` above only serves `gw_`
+    /// WS/API sessions and is NOT a Channel conversation fallback.
+    pub channel_sessions: Arc<zeroclaw_infra::channel_session::ChannelSessionState>,
     /// Per-session actor queue for serializing concurrent turns
     pub session_queue: Arc<session_queue::SessionActorQueue>,
     /// Device registry for paired device management
@@ -597,6 +603,11 @@ pub async fn run_gateway(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
+    // Shared Channel conversation identity for the four Channel webhooks.
+    // Constructed once per daemon iteration and cloned into the channel
+    // orchestrator too, so an inbound webhook and the orchestrator agree on
+    // one id per `conversation_history_key`.
+    channel_sessions: Arc<zeroclaw_infra::channel_session::ChannelSessionState>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -1619,6 +1630,7 @@ pub async fn run_gateway(
         node_registry,
         mdns_peer_registry,
         session_backend,
+        channel_sessions,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry,
         pending_pairings,
@@ -2579,11 +2591,8 @@ pub(crate) async fn run_gateway_chat_with_tools(
     // doesn't go through the cost-tracking scope.
     #[cfg(test)]
     {
-<<<<<<< HEAD
-        record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
-=======
-        let _ = (memory_session_id, agent_override, conversation_id);
->>>>>>> 2cd8358e1... feat(gateway): propagate canonical conversation IDs
+        record_gateway_chat_dispatch_for_test(message, memory_session_id, agent_override);
+        let _ = conversation_id;
         let response = state
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
@@ -2645,6 +2654,26 @@ pub(crate) async fn run_gateway_chat_with_tools(
 /// memory-session id, not the conversation attribution.
 pub(crate) fn mint_request_conversation_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+/// Resolve the opaque cross-turn conversation id for a Channel webhook message
+/// through the shared [`ChannelSessionState`]. Two inbound messages that share
+/// a `conversation_history_key` (same channel/alias/room/sender/thread) reuse
+/// one id; different senders or threads isolate. The returned id is never the
+/// `history_key` or any routing/sender value. On backend failure the error is
+/// propagated so the caller fails closed rather than minting a fresh id.
+#[cfg(any(
+    feature = "channel-whatsapp-cloud",
+    feature = "channel-linq",
+    feature = "channel-wati",
+    feature = "channel-nextcloud"
+))]
+fn resolve_webhook_channel_conversation_id(
+    state: &AppState,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> std::io::Result<String> {
+    let history_key = zeroclaw_channels::orchestrator::conversation_history_key(msg);
+    state.channel_sessions.resolve_conversation_id(&history_key)
 }
 
 fn resolve_gateway_chat_agent_alias(
@@ -3204,9 +3233,28 @@ async fn process_whatsapp_message(
                 .await;
         }
 
-        // Fresh per-message conversation id; the sender-derived `session_id`
-        // above stays scoped to memory.
-        let conversation_id = mint_request_conversation_id();
+        // Reuse the shared Channel conversation id for this history key so a
+        // re-delivered or follow-up message stays on the same conversation;
+        // the sender-derived `session_id` above stays scoped to memory.
+        let conversation_id = match resolve_webhook_channel_conversation_id(state, msg) {
+            Ok(id) => id,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "channel": msg.channel.as_str(),
+                            "error_kind": error.kind().to_string(),
+                        })),
+                    "CHANNEL_CONVERSATION_ID_RESOLVE_FAILED"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Conversation session unavailable"})),
+                );
+            }
+        };
         match Box::pin(run_gateway_chat_with_tools(
             state,
             &msg.content,
@@ -3433,17 +3481,31 @@ async fn process_linq_webhook(
         }
 
         // Call the LLM
-        let conversation_id = mint_request_conversation_id();
+        let conversation_id = match resolve_webhook_channel_conversation_id(state, msg) {
+            Ok(id) => id,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "channel": msg.channel.as_str(),
+                            "error_kind": error.kind().to_string(),
+                        })),
+                    "CHANNEL_CONVERSATION_ID_RESOLVE_FAILED"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Conversation session unavailable"})),
+                );
+            }
+        };
         match Box::pin(run_gateway_chat_with_tools(
             state,
             &msg.content,
             Some(&session_id),
-<<<<<<< HEAD
             agent_override.as_deref(),
-=======
-            None,
             Some(&conversation_id),
->>>>>>> 2cd8358e1... feat(gateway): propagate canonical conversation IDs
         ))
         .await
         {
@@ -3629,7 +3691,25 @@ async fn process_wati_webhook(
         }
 
         // Call the LLM
-        let conversation_id = mint_request_conversation_id();
+        let conversation_id = match resolve_webhook_channel_conversation_id(state, msg) {
+            Ok(id) => id,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "channel": msg.channel.as_str(),
+                            "error_kind": error.kind().to_string(),
+                        })),
+                    "CHANNEL_CONVERSATION_ID_RESOLVE_FAILED"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Conversation session unavailable"})),
+                );
+            }
+        };
         match Box::pin(run_gateway_chat_with_tools(
             state,
             &msg.content,
@@ -3830,9 +3910,28 @@ async fn process_nextcloud_talk_webhook(
                     .await;
             }
 
-            // Fresh per-message conversation id; the sender-derived
-            // `session_id` above stays scoped to memory.
-            let conversation_id = mint_request_conversation_id();
+            // Reuse the shared Channel conversation id for this history key so
+            // a re-delivered or follow-up message stays on the same
+            // conversation; the sender-derived `session_id` above stays scoped
+            // to memory. This runs in the fast-ack background task, so on
+            // failure we only log and bail: the outer handler already returned
+            // HTTP 200 and we must not call the model or send a fake reply.
+            let conversation_id = match resolve_webhook_channel_conversation_id(&state, &msg) {
+                Ok(id) => id,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel": msg.channel.as_str(),
+                                "error_kind": error.kind().to_string(),
+                            })),
+                        "CHANNEL_CONVERSATION_ID_RESOLVE_FAILED"
+                    );
+                    return;
+                }
+            };
             match Box::pin(run_gateway_chat_with_tools(
                 &state,
                 &msg.content,
@@ -4672,6 +4771,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -5077,6 +5179,9 @@ mod tests {
                 None,
                 None,
                 None,
+                Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                    None,
+                )),
             )
             .await
         });
@@ -5145,6 +5250,9 @@ mod tests {
                 None,
                 None,
                 None,
+                Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                    None,
+                )),
             )
             .await
         });
@@ -5198,6 +5306,9 @@ mod tests {
                 None,
                 None,
                 None,
+                Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                    None,
+                )),
             )
             .await
         });
@@ -5263,6 +5374,9 @@ mod tests {
                 None,
                 None,
                 Some(readiness),
+                Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                    None,
+                )),
             )
             .await
         });
@@ -5332,6 +5446,9 @@ mod tests {
             None,
             None,
             Some(readiness),
+            Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
         )
         .await;
 
@@ -5395,6 +5512,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -5484,6 +5604,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6160,6 +6283,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6267,6 +6393,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6389,6 +6518,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6491,6 +6623,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6612,6 +6747,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6699,6 +6837,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6791,6 +6932,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6890,6 +7034,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6985,6 +7132,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -7149,6 +7299,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -7995,6 +8148,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -8083,6 +8239,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -8406,6 +8565,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -8823,6 +8985,385 @@ mod tests {
         }
     }
 
+    /// Build a `ChannelMessage` with sender-scoped history and the given
+    /// routing fields, so tests can assert on `conversation_history_key`
+    /// isolation without constructing a real channel payload.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn channel_message(
+        channel: &str,
+        alias: &str,
+        sender: &str,
+        reply_target: &str,
+        thread_ts: Option<&str>,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: "m1".into(),
+            sender: sender.into(),
+            reply_target: reply_target.into(),
+            content: "hi".into(),
+            channel: channel.into(),
+            channel_alias: Some(alias.into()),
+            timestamp: 1,
+            thread_ts: thread_ts.map(str::to_string),
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            internal_sop_event: None,
+            passive_context: false,
+            explicitly_addressed: false,
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+        }
+    }
+
+    /// Build an `AppState` whose `channel_sessions` is the given shared state,
+    /// so the webhook resolver helper is observable in isolation.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn test_app_state_with_channel_sessions(
+        channel_sessions: zeroclaw_infra::channel_session::ChannelSessionState,
+    ) -> AppState {
+        let mut state = webhook_baseline_state();
+        state.channel_sessions = Arc::new(channel_sessions);
+        state
+    }
+
+    /// Minimal `SessionBackend` whose `resolve_or_create_conversation_id`
+    /// always fails, so a webhook's `conversation_history_key` routes through
+    /// the fail-closed error arm. `resolve_calls` lets the Nextcloud fast-ack
+    /// test observe that the spawned task actually reached the resolve before
+    /// asserting the model was never invoked.
+    #[cfg(any(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    #[derive(Default)]
+    struct FailingChannelSessionBackend {
+        resolve_calls: AtomicUsize,
+    }
+
+    #[cfg(any(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    impl SessionBackend for FailingChannelSessionBackend {
+        fn load(&self, _: &str) -> Vec<zeroclaw_api::model_provider::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            _: &str,
+            _: &zeroclaw_api::model_provider::ChatMessage,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn resolve_or_create_conversation_id(&self, _: &str) -> std::io::Result<String> {
+            self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other(
+                "injected channel session resolve failure",
+            ))
+        }
+        fn clear_and_rotate_conversation(&self, _: &str) -> std::io::Result<String> {
+            Err(std::io::Error::other(
+                "injected channel session rotate failure",
+            ))
+        }
+    }
+
+    /// A Channel webhook whose `conversation_history_key` routes through a
+    /// failing session backend must fail CLOSED: the sync WhatsApp handler
+    /// returns HTTP 500 with the `Conversation session unavailable` body and
+    /// never reaches the model.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn webhook_channel_conversation_resolve_failure_whatsapp_returns_500() {
+        let mut state = test_app_state_with_channel_sessions(
+            zeroclaw_infra::channel_session::ChannelSessionState::new(Some(Arc::new(
+                FailingChannelSessionBackend::default(),
+            )
+                as Arc<dyn SessionBackend>)),
+        );
+        // An allow-any peer resolver is required so the payload actually parses
+        // to an inbound message (and reaches the resolve) instead of being
+        // dropped by the sender allowlist.
+        let allow_any: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        let wa = Arc::new(WhatsAppChannel::new(
+            "access-token".into(),
+            "phone-number-id".into(),
+            "verify-token".into(),
+            "work".to_string(),
+            allow_any,
+        ));
+        state.whatsapp = HashMap::from([("work".to_string(), wa)]);
+        state.whatsapp_app_secret =
+            HashMap::from([("work".to_string(), Arc::<str>::from("app-secret"))]);
+
+        // Payload parses to exactly one inbound message so the handler reaches
+        // the conversation-id resolve instead of early-acking with 200.
+        let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"+15551234567","text":{"body":"Hello"}}]}}]}]}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&whatsapp_signature("app-secret", body)).unwrap(),
+        );
+
+        let response = Box::pin(handle_whatsapp_message_alias(
+            State(state),
+            Path("work".to_string()),
+            headers,
+            Bytes::from_static(body),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("whatsapp webhook response body")
+            .to_bytes();
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("whatsapp webhook response is JSON");
+        assert_eq!(
+            body_json,
+            serde_json::json!({"error": "Conversation session unavailable"}),
+            "sync webhook resolve failure must return the fail-closed body"
+        );
+    }
+
+    /// The Nextcloud Talk webhook fast-acks (HTTP 200) and processes each
+    /// message in a detached background task. When the conversation-id resolve
+    /// fails there, the task must log + bail WITHOUT invoking the model or
+    /// sending a fake reply - the outer handler already returned 200.
+    #[cfg(feature = "channel-nextcloud")]
+    #[tokio::test]
+    async fn webhook_channel_conversation_resolve_failure_nextcloud_fast_acks_without_model() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let backend = Arc::new(FailingChannelSessionBackend::default());
+
+        // Obviously-fake placeholder, never a real credential.
+        let secret = "fake-nextcloud-webhook-secret-not-real";
+        let random = "0123456789abcdef0123456789abcdef";
+        let channel = Arc::new(NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            Some(secret.to_string()),
+            String::new(),
+            "default",
+            Arc::new(|| vec!["*".to_string()]),
+        ));
+        let body = r#"{"type":"message","object":{"token":"room-token"},"actor":{"id":"user_a","name":"User A"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+        let signature = compute_nextcloud_signature_hex(secret, random, body);
+
+        let mut state = webhook_baseline_state();
+        state.model_provider = provider_impl.clone();
+        state.nextcloud_talk = HashMap::from([("default".to_string(), channel)]);
+        state.nextcloud_talk_webhook_secret =
+            HashMap::from([("default".to_string(), Arc::<str>::from(secret))]);
+        state.channel_sessions =
+            Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                Some(backend.clone() as Arc<dyn SessionBackend>),
+            ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Nextcloud-Talk-Random",
+            HeaderValue::from_str(random).unwrap(),
+        );
+        headers.insert(
+            "X-Nextcloud-Talk-Signature",
+            HeaderValue::from_str(&signature).unwrap(),
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            Box::pin(handle_nextcloud_talk_webhook(
+                State(state),
+                headers,
+                Bytes::from(body),
+            )),
+        )
+        .await
+        .expect("nextcloud webhook must fast-ack within 2s")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Wait for the spawned fast-ack task to reach the (failing) resolve so
+        // "zero model calls" is a meaningful assertion rather than a race on
+        // the detached task not having started yet.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backend.resolve_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("spawned task must attempt the conversation-id resolve within 2s");
+        assert_eq!(
+            provider_impl.calls.load(Ordering::SeqCst),
+            0,
+            "model provider must not be invoked when the resolve fails"
+        );
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn webhook_channel_conversation_resolver_reuses_id_and_isolates_sender_and_thread() {
+        let state = test_app_state_with_channel_sessions(
+            zeroclaw_infra::channel_session::ChannelSessionState::new(None),
+        );
+        let same_a = channel_message("whatsapp", "main", "alice@example.test", "room", None);
+        let same_b = channel_message("whatsapp", "main", "alice@example.test", "room", None);
+        let other_sender = channel_message("whatsapp", "main", "token-shaped-bob", "room", None);
+        let other_thread = channel_message(
+            "whatsapp",
+            "main",
+            "alice@example.test",
+            "room",
+            Some("/private/thread/token"),
+        );
+
+        let a = resolve_webhook_channel_conversation_id(&state, &same_a).unwrap();
+        let b = resolve_webhook_channel_conversation_id(&state, &same_b).unwrap();
+        let c = resolve_webhook_channel_conversation_id(&state, &other_sender).unwrap();
+        let d = resolve_webhook_channel_conversation_id(&state, &other_thread).unwrap();
+
+        assert_eq!(a, b, "same history key must reuse one conversation id");
+        assert_ne!(a, c, "different sender must isolate the conversation id");
+        assert_ne!(a, d, "different thread must isolate the conversation id");
+        for id in [&a, &b, &c, &d] {
+            assert_eq!(
+                uuid::Uuid::parse_str(id).unwrap().get_version(),
+                Some(uuid::Version::Random),
+                "conversation id must be a UUID v4: {id}"
+            );
+            assert!(!id.contains("example.test"), "sender leaked into id: {id}");
+            assert!(
+                !id.contains("token"),
+                "thread/sender token leaked into id: {id}"
+            );
+            assert!(!id.contains("/private"), "thread path leaked into id: {id}");
+        }
+    }
+
+    /// The four Channel webhook parsers must produce `ChannelMessage`s whose
+    /// `conversation_history_key` flows through the shared resolver. Two parses
+    /// of the same payload share one key, so they must reuse one id (not mint a
+    /// fresh UUID per call).
+    #[cfg(all(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
+    #[test]
+    fn webhook_channel_conversation_table_reuses_id_per_history_key() {
+        let state = test_app_state_with_channel_sessions(
+            zeroclaw_infra::channel_session::ChannelSessionState::new(None),
+        );
+        let allow_any: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        let mut pairs: Vec<(
+            zeroclaw_api::channel::ChannelMessage,
+            zeroclaw_api::channel::ChannelMessage,
+        )> = Vec::new();
+
+        let wa = WhatsAppChannel::new(
+            "access-token".into(),
+            "phone-number-id".into(),
+            "verify-token".into(),
+            "main".to_string(),
+            allow_any.clone(),
+        );
+        let wa_payload = serde_json::json!({
+            "entry": [{"changes": [{"value": {"messages": [
+                {"from": "+15551234567", "text": {"body": "Hello"}}
+            ]}}]}]
+        });
+        let wa_first = wa.parse_webhook_payload(&wa_payload);
+        let wa_second = wa.parse_webhook_payload(&wa_payload);
+        assert_eq!(
+            wa_first.len(),
+            1,
+            "whatsapp payload must parse to one message"
+        );
+        pairs.push((wa_first[0].clone(), wa_second[0].clone()));
+
+        let linq = LinqChannel::new(
+            "test-token".into(),
+            "+15550000000".into(),
+            "main",
+            allow_any.clone(),
+        );
+        let linq_payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "from": "+15551234567",
+                "message": {"parts": [{"type": "text", "value": "hello"}]}
+            }
+        });
+        let linq_first = linq.parse_webhook_payload(&linq_payload);
+        let linq_second = linq.parse_webhook_payload(&linq_payload);
+        assert_eq!(
+            linq_first.len(),
+            1,
+            "linq payload must parse to one message"
+        );
+        pairs.push((linq_first[0].clone(), linq_second[0].clone()));
+
+        let wati = WatiChannel::new(
+            "token".into(),
+            "https://wati.test".into(),
+            None,
+            "main",
+            allow_any.clone(),
+        );
+        let wati_payload = serde_json::json!({"text": "hello", "waId": "+15551234567"});
+        let wati_first = wati.parse_webhook_payload(&wati_payload);
+        let wati_second = wati.parse_webhook_payload(&wati_payload);
+        assert_eq!(
+            wati_first.len(),
+            1,
+            "wati payload must parse to one message"
+        );
+        pairs.push((wati_first[0].clone(), wati_second[0].clone()));
+
+        let nextcloud = NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            None,
+            String::new(),
+            "main",
+            allow_any,
+        );
+        let nc_payload = serde_json::json!({
+            "type": "message",
+            "object": {"token": "room-token"},
+            "message": {"actorType": "users", "actorId": "user_a", "message": "hello"}
+        });
+        let nc_first = nextcloud.parse_webhook_payload(&nc_payload);
+        let nc_second = nextcloud.parse_webhook_payload(&nc_payload);
+        assert_eq!(
+            nc_first.len(),
+            1,
+            "nextcloud talk payload must parse to one message"
+        );
+        pairs.push((nc_first[0].clone(), nc_second[0].clone()));
+
+        for (first, second) in pairs {
+            assert_eq!(
+                resolve_webhook_channel_conversation_id(&state, &first).unwrap(),
+                resolve_webhook_channel_conversation_id(&state, &second).unwrap(),
+                "two parses of the same payload must reuse one conversation id"
+            );
+        }
+    }
+
     /// WS sets the conversation id to the RAW protocol session id and reuses it
     /// across turns. The `gw_`-prefixed storage key and the connect-frame
     /// memory override must never be attributed as the conversation id.
@@ -9003,6 +9544,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
+            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+                None,
+            )),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),

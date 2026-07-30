@@ -13390,6 +13390,7 @@ version = "0.8.4"
 dependencies = [
  "anyhow",
  "chrono",
+ "lru",
  "parking_lot",
  "portable-atomic",
  "rusqlite",
