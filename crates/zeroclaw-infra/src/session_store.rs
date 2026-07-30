@@ -90,6 +90,23 @@ impl SessionStore {
         f()
     }
 
+    /// Classify a conditional write against the sidecar's current id, WITHOUT
+    /// taking the per-key lock (the caller already holds `with_key_lock`).
+    /// A missing sidecar (record deleted, or a never-resolved key) is
+    /// `Deleted`; a present-but-different id is `Stale`; a match is `Applied`.
+    fn classify_conversation_unlocked(
+        &self,
+        session_key: &str,
+        expected: &str,
+    ) -> std::io::Result<crate::session_backend::ConditionalSessionWrite> {
+        use crate::session_backend::ConditionalSessionWrite;
+        match self.read_conversation_id(session_key)? {
+            None => Ok(ConditionalSessionWrite::Deleted),
+            Some(current) if current != expected => Ok(ConditionalSessionWrite::Stale),
+            Some(_) => Ok(ConditionalSessionWrite::Applied),
+        }
+    }
+
     /// Read the persisted conversation id from the sidecar. `None` if the
     /// sidecar is absent (legacy `.jsonl` with no identity yet) or holds an
     /// empty value.
@@ -131,6 +148,14 @@ impl SessionStore {
     /// Load all messages for a session from its JSONL file.
     /// Returns an empty vec if the file does not exist or is unreadable.
     pub fn load(&self, session_key: &str) -> Vec<ChatMessage> {
+        self.load_unlocked(session_key)
+    }
+
+    /// `load` body without the per-key lock. The conditional writers already
+    /// hold `with_key_lock` and call this so they don't nest-lock; `load`
+    /// itself is lock-free (a read-only scan), so unlocking it is a no-op
+    /// safety-wise.
+    fn load_unlocked(&self, session_key: &str) -> Vec<ChatMessage> {
         let path = self.session_path(session_key);
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
@@ -159,19 +184,23 @@ impl SessionStore {
     /// append can never interleave with a `/clear` truncation mid-write.
     pub fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         let _guard = self.mutation_lock.lock();
-        self.with_key_lock(session_key, || {
-            let path = self.session_path(session_key);
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
+        self.with_key_lock(session_key, || self.append_unlocked(session_key, message))
+    }
 
-            let json = serde_json::to_string(message)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    /// `append` file-write body, without the per-key lock. Caller (the
+    /// conditional writers) already holds `with_key_lock`.
+    fn append_unlocked(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+        let path = self.session_path(session_key);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
 
-            writeln!(file, "{json}")?;
-            Ok(())
-        })
+        let json = serde_json::to_string(message)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        writeln!(file, "{json}")?;
+        Ok(())
     }
 
     /// Remove the last message from a session's JSONL file.
@@ -222,6 +251,12 @@ impl SessionStore {
     }
 
     fn rewrite(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        self.rewrite_with(session_key, messages, |temp, path| {
+            temp.persist(path).map(|_| ()).map_err(|error| error.error)
+        })
+    }
+
+    fn rewrite_unlocked(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
         self.rewrite_with(session_key, messages, |temp, path| {
             temp.persist(path).map(|_| ()).map_err(|error| error.error)
         })
@@ -444,6 +479,80 @@ impl SessionBackend for SessionStore {
                 file.sync_all()?;
             }
             Ok(id)
+        })
+    }
+
+    /// Append `message` iff the sidecar still carries `expected_conversation_id`,
+    /// all inside one per-key lock closure so the classify check and the file
+    /// write cannot interleave with a `/new` rotation or delete. A stale or
+    /// deleted record is left untouched: the data file is NOT recreated
+    /// (`.create(true)` only runs once classify returns `Applied`). A fresh but
+    /// empty session (sidecar present, no `.jsonl`) matching the id may create
+    /// its first message.
+    fn append_if_conversation_matches(
+        &self,
+        session_key: &str,
+        expected_conversation_id: &str,
+        message: &ChatMessage,
+    ) -> std::io::Result<crate::session_backend::ConditionalSessionWrite> {
+        use crate::session_backend::ConditionalSessionWrite;
+        self.with_key_lock(session_key, || {
+            let status =
+                self.classify_conversation_unlocked(session_key, expected_conversation_id)?;
+            if status != ConditionalSessionWrite::Applied {
+                return Ok(status);
+            }
+            self.append_unlocked(session_key, message)?;
+            Ok(ConditionalSessionWrite::Applied)
+        })
+    }
+
+    /// Remove the last message iff the sidecar still carries
+    /// `expected_conversation_id`, inside one per-key lock closure. A matching
+    /// record with no messages is a no-op that still reports `Applied`.
+    fn remove_last_if_conversation_matches(
+        &self,
+        session_key: &str,
+        expected_conversation_id: &str,
+    ) -> std::io::Result<crate::session_backend::ConditionalSessionWrite> {
+        use crate::session_backend::ConditionalSessionWrite;
+        self.with_key_lock(session_key, || {
+            let status =
+                self.classify_conversation_unlocked(session_key, expected_conversation_id)?;
+            if status != ConditionalSessionWrite::Applied {
+                return Ok(status);
+            }
+            let mut messages = self.load_unlocked(session_key);
+            if !messages.is_empty() {
+                messages.pop();
+                self.rewrite_unlocked(session_key, &messages)?;
+            }
+            Ok(ConditionalSessionWrite::Applied)
+        })
+    }
+
+    /// Update the last message in place iff the sidecar still carries
+    /// `expected_conversation_id`, inside one per-key lock closure. A matching
+    /// record with no messages is a no-op that still reports `Applied`.
+    fn update_last_if_conversation_matches(
+        &self,
+        session_key: &str,
+        expected_conversation_id: &str,
+        message: &ChatMessage,
+    ) -> std::io::Result<crate::session_backend::ConditionalSessionWrite> {
+        use crate::session_backend::ConditionalSessionWrite;
+        self.with_key_lock(session_key, || {
+            let status =
+                self.classify_conversation_unlocked(session_key, expected_conversation_id)?;
+            if status != ConditionalSessionWrite::Applied {
+                return Ok(status);
+            }
+            let mut messages = self.load_unlocked(session_key);
+            if let Some(last) = messages.last_mut() {
+                *last = message.clone();
+                self.rewrite_unlocked(session_key, &messages)?;
+            }
+            Ok(ConditionalSessionWrite::Applied)
         })
     }
 }
@@ -1142,5 +1251,61 @@ mod tests {
             data_path.exists(),
             "data file must survive when sidecar removal fails first"
         );
+    }
+
+    // ── conditional-write (conversation-id fence) tests ───────────────
+
+    #[test]
+    fn conditional_write_contract_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        crate::session_backend::assert_conditional_write_contract(backend);
+    }
+
+    #[test]
+    fn conditional_write_append_propagates_real_io_error() {
+        // Inject a REAL failure: resolve creates the sidecar (matching id), then
+        // a DIRECTORY is placed at the `.jsonl` path so `append_unlocked`'s
+        // `OpenOptions::append` fails. classify returns `Applied` first, so the
+        // error MUST surface as `Err` - it must NOT degrade to `Stale`/`Deleted`
+        // (which would hide a storage fault as a lifecycle race).
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "fail_append";
+        let id = store.resolve_or_create_conversation_id(key).unwrap();
+
+        // Block the data path with a directory so the append open fails.
+        let data_path = store.session_path(key);
+        std::fs::create_dir_all(&data_path).unwrap();
+
+        let result = store.append_if_conversation_matches(key, &id, &ChatMessage::user("boom"));
+        assert!(
+            result.is_err(),
+            "a real I/O error must propagate, not degrade to a lifecycle status"
+        );
+    }
+
+    #[test]
+    fn conditional_write_append_creates_first_message_for_fresh_session() {
+        // A fresh-but-empty session has a sidecar but no `.jsonl`; matching the
+        // current id allows creating the first message (does NOT resurrect a
+        // deleted record, whose sidecar is gone and would classify `Deleted`).
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "fresh";
+        let id = store.resolve_or_create_conversation_id(key).unwrap();
+        assert!(!store.session_path(key).exists(), "no data file yet");
+
+        use crate::session_backend::ConditionalSessionWrite;
+        assert_eq!(
+            store
+                .append_if_conversation_matches(key, &id, &ChatMessage::user("first"))
+                .unwrap(),
+            ConditionalSessionWrite::Applied
+        );
+        let messages = store.load(key);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "first");
     }
 }

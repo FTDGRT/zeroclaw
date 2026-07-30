@@ -13398,6 +13398,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "uuid",
  "zeroclaw-api",
  "zeroclaw-log",

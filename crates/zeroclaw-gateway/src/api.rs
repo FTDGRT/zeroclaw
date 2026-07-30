@@ -1860,33 +1860,64 @@ pub async fn handle_api_session_delete(
         format!("gw_{id}")
     };
 
-    let token = state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .remove(&session_key);
-    if let Some(token) = token {
-        token.cancel();
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"session_key": session_key})),
-            "cancelled in-flight turn for deleted session"
-        );
-    }
+    // Gateway dashboard sessions (`gw_` keys) are cancelled via the gateway's
+    // own per-session token and removed from the gateway backend. Channel-owned
+    // keys (WhatsApp/Linq/WATI/Nextcloud history keys, never `gw_`-prefixed) go
+    // through the shared Channel lifecycle so any active Channel turn is
+    // cancelled + waited before the record is removed; they must NOT touch the
+    // gateway cancel_tokens map, and a `gw_` key must NOT enter the Channel
+    // registry.
+    if session_key.starts_with("gw_") {
+        let token = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .remove(&session_key);
+        if let Some(token) = token {
+            token.cancel();
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"session_key": session_key})),
+                "cancelled in-flight turn for deleted session"
+            );
+        }
 
-    match backend.delete_session(&session_key) {
-        Ok(true) => Json(serde_json::json!({"deleted": true, "session_id": id})).into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
-        )
-            .into_response(),
+        match backend.delete_session(&session_key) {
+            Ok(true) => {
+                Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
+            }
+            Ok(false) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Session not found"})),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
+            )
+                .into_response(),
+        }
+    } else {
+        match state
+            .channel_sessions
+            .delete_session(&session_key, None)
+            .await
+        {
+            Ok(true) => {
+                Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
+            }
+            Ok(false) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Session not found"})),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
+            )
+                .into_response(),
+        }
     }
 }
 
@@ -5115,5 +5146,150 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(status_of(router, req).await, StatusCode::OK);
         }
+    }
+
+    // ── DELETE /api/sessions/{id} gateway vs Channel split ────────────
+
+    /// A `gw_` dashboard session delete cancels the gateway `cancel_tokens`
+    /// entry and removes the backend record; it must NOT touch the Channel
+    /// active-turn registry.
+    #[tokio::test]
+    async fn session_delete_gw_key_uses_cancel_tokens_not_channel_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        // Seed a gw_ session in the backend so delete reports it existed.
+        backend
+            .append(
+                "gw_test",
+                &zeroclaw_api::model_provider::ChatMessage::user("hi"),
+            )
+            .unwrap();
+
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(Arc::clone(&backend));
+        // Register an in-flight gw_ turn token (mirrors a live WS turn).
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert("gw_test".to_string(), token.clone());
+
+        let resp =
+            handle_api_session_delete(State(state), HeaderMap::new(), Path("gw_test".to_string()))
+                .await;
+        let status = resp.into_response().status();
+        assert_eq!(status, StatusCode::OK);
+        // The gateway token was removed + cancelled.
+        assert!(
+            token.is_cancelled(),
+            "gw_ delete must cancel the gateway cancel_token"
+        );
+        assert!(
+            backend.load("gw_test").is_empty(),
+            "gw_ delete must remove the backend record"
+        );
+    }
+
+    /// A Channel-owned key delete goes through the shared Channel lifecycle
+    /// (`channel_sessions.delete_session`); it must NOT consult the gateway
+    /// `cancel_tokens` map, and a `gw_` key must not enter the Channel path.
+    #[tokio::test]
+    async fn session_delete_channel_key_uses_shared_lifecycle_not_cancel_tokens() {
+        use zeroclaw_infra::session_backend::ConditionalSessionWrite;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let channel_sessions = Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
+            Some(Arc::clone(&backend)),
+        ));
+        let key = "whatsapp.main_room_alice";
+        let id = channel_sessions.resolve_conversation_id(key).unwrap();
+        // Seed a Channel turn so the record exists and an active lease can be
+        // cancelled by the shared delete.
+        channel_sessions
+            .append_history_if_current(
+                key,
+                &id,
+                zeroclaw_api::model_provider::ChatMessage::user("hi"),
+                50,
+            )
+            .unwrap();
+        let lease = channel_sessions.register_turn(key).await;
+        let token = lease.cancellation();
+        // The lease needs a driving task that bails on cancellation, so the
+        // shared delete's cancel+wait resolves (a real worker would abort).
+        let bailer_sessions = Arc::clone(&channel_sessions);
+        let bailer = zeroclaw_spawn::spawn!(async move {
+            lease.cancellation().cancelled().await;
+            bailer_sessions.complete_turn(&lease).await;
+        });
+
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(Arc::clone(&backend));
+        state.channel_sessions = channel_sessions;
+        // A gw_ token must NOT be consulted for a Channel key: insert a
+        // decoy entry under the Channel key to prove it is untouched.
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(key.to_string(), tokio_util::sync::CancellationToken::new());
+
+        let resp = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(key.to_string()),
+        )
+        .await;
+        let status = resp.into_response().status();
+        assert_eq!(status, StatusCode::OK);
+        // The Channel lease token was cancelled by the shared delete.
+        assert!(
+            token.is_cancelled(),
+            "Channel key delete must cancel the active Channel lease"
+        );
+        // The shared delete removed the record; a stale append is now Deleted.
+        assert_eq!(
+            backend
+                .append_if_conversation_matches(
+                    key,
+                    &id,
+                    &zeroclaw_api::model_provider::ChatMessage::assistant("gone"),
+                )
+                .unwrap(),
+            ConditionalSessionWrite::Deleted,
+            "Channel key delete must remove the backend record"
+        );
+        // The decoy gw_ cancel_tokens entry is still present (untouched).
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock")
+                .contains_key(key),
+            "Channel key delete must NOT touch the gateway cancel_tokens map"
+        );
+        // Join the bailer so the active map is clean.
+        bailer.await.unwrap();
+    }
+
+    /// A Channel key with no record deletes to 404 (no record to remove).
+    #[tokio::test]
+    async fn session_delete_channel_key_missing_returns_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let channel_sessions =
+            zeroclaw_infra::channel_session::ChannelSessionState::new(Some(Arc::clone(&backend)));
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(Arc::clone(&backend));
+        state.channel_sessions = Arc::new(channel_sessions);
+
+        let resp = handle_api_session_delete(
+            State(state),
+            HeaderMap::new(),
+            Path("whatsapp.main_room_nobody".to_string()),
+        )
+        .await;
+        assert_eq!(resp.into_response().status(), StatusCode::NOT_FOUND);
     }
 }

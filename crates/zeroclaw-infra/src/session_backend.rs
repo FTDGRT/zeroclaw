@@ -71,6 +71,28 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// Outcome of a conversation-id-fenced session write.
+///
+/// A history append / update / rollback / compaction is conditional on the
+/// session record still carrying the conversation id the turn captured before
+/// any async work began. The result distinguishes the three lifecycle states a
+/// stale writer can observe, so a real storage error (`Err`) is never confused
+/// with an expected lifecycle race:
+///
+/// - `Applied`: the record still carried the expected id; the mutation landed.
+/// - `Stale`: the record still exists but its id was rotated (`/new`/`/clear`);
+///   the caller's captured id no longer matches. An expected race, not retried,
+///   and must not recreate a record.
+/// - `Deleted`: the record was removed; same non-retry, non-recreate contract.
+///
+/// `bool` is intentionally avoided: `false` cannot tell stale from deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalSessionWrite {
+    Applied,
+    Stale,
+    Deleted,
+}
+
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
@@ -277,6 +299,48 @@ pub trait SessionBackend: Send + Sync {
     /// `compact`, and crash repair do NOT rotate the id. No default
     /// implementation is provided.
     fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String>;
+
+    /// Append `message` to the session ONLY if its record still carries
+    /// `expected_conversation_id`. The read of the current id, the message
+    /// write, and the metadata update MUST land in one record-scoped atomic
+    /// operation (a single transaction / per-key lock) so a concurrent
+    /// `/new` rotation or delete cannot interleave. Returns
+    /// [`ConditionalSessionWrite::Applied`] on match, `Stale` if the id was
+    /// rotated, `Deleted` if the record is gone. A real I/O / DB error stays
+    /// `Err` - it MUST NOT degrade to `Stale`/`Deleted`. Conditional methods
+    /// MUST NOT create the metadata record (`INSERT ... ON CONFLICT` to create
+    /// is forbidden); only the resolve path may backfill a legacy id. No
+    /// default implementation is provided so every mock declares its semantics.
+    fn append_if_conversation_matches(
+        &self,
+        session_key: &str,
+        expected_conversation_id: &str,
+        message: &ChatMessage,
+    ) -> std::io::Result<ConditionalSessionWrite>;
+
+    /// Remove the last message ONLY if the record still carries
+    /// `expected_conversation_id`. Same atomicity and error contract as
+    /// [`SessionBackend::append_if_conversation_matches`]. With no messages the
+    /// result is still `Applied` when the id matches (a no-op mutation), so the
+    /// caller's preconditions remain the source of truth. No default
+    /// implementation is provided.
+    fn remove_last_if_conversation_matches(
+        &self,
+        session_key: &str,
+        expected_conversation_id: &str,
+    ) -> std::io::Result<ConditionalSessionWrite>;
+
+    /// Update the last message in place ONLY if the record still carries
+    /// `expected_conversation_id`. Same atomicity and error contract as
+    /// [`SessionBackend::append_if_conversation_matches`]. With no messages the
+    /// result is still `Applied` when the id matches (caller decides via its
+    /// own preconditions). No default implementation is provided.
+    fn update_last_if_conversation_matches(
+        &self,
+        session_key: &str,
+        expected_conversation_id: &str,
+        message: &ChatMessage,
+    ) -> std::io::Result<ConditionalSessionWrite>;
 }
 
 /// Session state information.
@@ -288,6 +352,48 @@ pub struct SessionState {
     pub turn_id: Option<String>,
     /// When the current state was entered.
     pub turn_started_at: Option<DateTime<Utc>>,
+}
+
+/// Shared contract every `SessionBackend` conditional-write impl must
+/// satisfy. Lives at module level (not in each backend's test module) so the
+/// JSONL and SQLite backends are pinned to ONE identical semantics. Both call
+/// this from their own test modules plus a backend-specific error test.
+#[cfg(test)]
+pub(crate) fn assert_conditional_write_contract(backend: &dyn SessionBackend) {
+    let key = "channel.main_room_alice";
+    let current = backend.resolve_or_create_conversation_id(key).unwrap();
+
+    assert_eq!(
+        backend
+            .append_if_conversation_matches(key, &current, &ChatMessage::user("before"))
+            .unwrap(),
+        ConditionalSessionWrite::Applied,
+    );
+
+    let rotated = backend.clear_and_rotate_conversation(key).unwrap();
+    assert_ne!(current, rotated);
+    assert_eq!(
+        backend
+            .append_if_conversation_matches(key, &current, &ChatMessage::assistant("stale"))
+            .unwrap(),
+        ConditionalSessionWrite::Stale,
+    );
+    assert!(
+        backend.load(key).is_empty(),
+        "a stale append must not mutate history"
+    );
+
+    backend.delete_session(key).unwrap();
+    assert_eq!(
+        backend
+            .append_if_conversation_matches(key, &rotated, &ChatMessage::assistant("deleted"))
+            .unwrap(),
+        ConditionalSessionWrite::Deleted,
+    );
+    assert!(
+        !backend.session_exists(key),
+        "a deleted append must not recreate the record"
+    );
 }
 
 #[cfg(test)]

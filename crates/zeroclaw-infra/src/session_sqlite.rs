@@ -1,12 +1,13 @@
 //! SQLite-backed session persistence with FTS5 search.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+    ConditionalSessionWrite, SessionBackend, SessionContext, SessionMetadata, SessionQuery,
+    SessionState,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
 use zeroclaw_api::model_provider::ChatMessage;
 
@@ -297,6 +298,32 @@ impl SqliteSessionBackend {
 
         Ok(migrated)
     }
+}
+
+/// Classify a conditional write against the session record's current
+/// conversation id, inside the caller's already-open `IMMEDIATE` transaction.
+/// A missing metadata row or a NULL/empty id means the record is gone
+/// (`Deleted`); a present-but-different id means it was rotated (`Stale`);
+/// only an exact match is `Applied`. NULL/empty ids are treated as deleted
+/// here - ONLY the resolve path backfills legacy ids, never the conditional
+/// writers.
+fn classify_conversation(
+    tx: &rusqlite::Transaction<'_>,
+    session_key: &str,
+    expected: &str,
+) -> rusqlite::Result<ConditionalSessionWrite> {
+    let current = tx
+        .query_row(
+            "SELECT conversation_id FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(match current.flatten().filter(|id| !id.is_empty()) {
+        None => ConditionalSessionWrite::Deleted,
+        Some(current) if current != expected => ConditionalSessionWrite::Stale,
+        Some(_) => ConditionalSessionWrite::Applied,
+    })
 }
 
 impl SessionBackend for SqliteSessionBackend {
@@ -1100,6 +1127,138 @@ impl SessionBackend for SqliteSessionBackend {
 
         tx.commit().map_err(std::io::Error::other)?;
         Ok(new_id)
+    }
+
+    /// Append `message` iff the record still carries `expected_conversation_id`,
+    /// all in one `IMMEDIATE` transaction. The classify read, the message
+    /// INSERT, and the metadata UPDATE commit together; a stale or deleted
+    /// record is left untouched (the empty transaction rolls back on drop).
+    fn append_if_conversation_matches(
+        &self,
+        session_key: &str,
+        expected_conversation_id: &str,
+        message: &ChatMessage,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+
+        let status = classify_conversation(&tx, session_key, expected_conversation_id)
+            .map_err(std::io::Error::other)?;
+        if status != ConditionalSessionWrite::Applied {
+            // No writes: drop the transaction (rollback) and return the status.
+            return Ok(status);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO sessions (session_key, role, content, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_key, message.role, message.content, now],
+        )
+        .map_err(std::io::Error::other)?;
+        tx.execute(
+            "UPDATE session_metadata
+             SET last_activity = ?1, message_count = message_count + 1
+             WHERE session_key = ?2",
+            params![now, session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(ConditionalSessionWrite::Applied)
+    }
+
+    /// Remove the last message iff the record still carries
+    /// `expected_conversation_id`, in one `IMMEDIATE` transaction. A matching
+    /// record with no messages is a no-op mutation that still reports `Applied`
+    /// (the caller's preconditions remain authoritative).
+    fn remove_last_if_conversation_matches(
+        &self,
+        session_key: &str,
+        expected_conversation_id: &str,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+
+        let status = classify_conversation(&tx, session_key, expected_conversation_id)
+            .map_err(std::io::Error::other)?;
+        if status != ConditionalSessionWrite::Applied {
+            return Ok(status);
+        }
+
+        let last_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM sessions WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .flatten();
+        if let Some(id) = last_id {
+            tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])
+                .map_err(std::io::Error::other)?;
+            tx.execute(
+                "UPDATE session_metadata SET message_count = MAX(0, message_count - 1)
+                 WHERE session_key = ?1",
+                params![session_key],
+            )
+            .map_err(std::io::Error::other)?;
+        }
+
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(ConditionalSessionWrite::Applied)
+    }
+
+    /// Update the last message in place iff the record still carries
+    /// `expected_conversation_id`, in one `IMMEDIATE` transaction. A matching
+    /// record with no messages is a no-op that still reports `Applied`.
+    fn update_last_if_conversation_matches(
+        &self,
+        session_key: &str,
+        expected_conversation_id: &str,
+        message: &ChatMessage,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+
+        let status = classify_conversation(&tx, session_key, expected_conversation_id)
+            .map_err(std::io::Error::other)?;
+        if status != ConditionalSessionWrite::Applied {
+            return Ok(status);
+        }
+
+        let last_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM sessions WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .flatten();
+        if let Some(id) = last_id {
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "UPDATE sessions SET role = ?1, content = ?2 WHERE id = ?3",
+                params![message.role, message.content, id],
+            )
+            .map_err(std::io::Error::other)?;
+            tx.execute(
+                "UPDATE session_metadata SET last_activity = ?1 WHERE session_key = ?2",
+                params![now, session_key],
+            )
+            .map_err(std::io::Error::other)?;
+        }
+
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(ConditionalSessionWrite::Applied)
     }
 }
 
@@ -2061,5 +2220,63 @@ mod tests {
             "conversation_id must be unset when no sidecar is present"
         );
         assert_eq!(meta.message_count, 1);
+    }
+
+    // ── conditional-write (conversation-id fence) tests ───────────────
+
+    #[test]
+    fn conditional_write_contract_sqlite() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &backend;
+        crate::session_backend::assert_conditional_write_contract(backend);
+    }
+
+    #[test]
+    fn conditional_write_append_propagates_real_db_error() {
+        // Inject a REAL failure: a BEFORE INSERT trigger on `sessions` raises
+        // ABORT, so the message INSERT inside `append_if_conversation_matches`
+        // fails AFTER the classify read returned Applied. The error MUST
+        // propagate as `Err` - it must NOT degrade to `Stale` or `Deleted`
+        // (which would silently swallow a storage fault as a lifecycle race).
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let key = "fail_append";
+        let id = backend.resolve_or_create_conversation_id(key).unwrap();
+
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "CREATE TRIGGER fail_session_insert BEFORE INSERT ON sessions
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected failure');
+                 END",
+                [],
+            )
+            .unwrap();
+        }
+
+        let result = backend.append_if_conversation_matches(key, &id, &ChatMessage::user("boom"));
+        assert!(
+            result.is_err(),
+            "a real DB error must propagate, not degrade to a lifecycle status"
+        );
+    }
+
+    #[test]
+    fn conditional_write_update_last_is_noop_on_empty_matching_record() {
+        // A matching record with no messages reports `Applied` (no-op mutation);
+        // the caller's preconditions remain the source of truth.
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let key = "empty_match";
+        let id = backend.resolve_or_create_conversation_id(key).unwrap();
+        assert_eq!(
+            backend
+                .update_last_if_conversation_matches(key, &id, &ChatMessage::assistant("x"))
+                .unwrap(),
+            ConditionalSessionWrite::Applied
+        );
+        assert!(backend.load(key).is_empty());
     }
 }

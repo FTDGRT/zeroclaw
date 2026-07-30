@@ -7986,6 +7986,38 @@ mod tests {
         fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String> {
             self.inner.clear_and_rotate_conversation(session_key)
         }
+        fn append_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner.append_if_conversation_matches(
+                session_key,
+                expected_conversation_id,
+                message,
+            )
+        }
+        fn remove_last_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner
+                .remove_last_if_conversation_matches(session_key, expected_conversation_id)
+        }
+        fn update_last_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner.update_last_if_conversation_matches(
+                session_key,
+                expected_conversation_id,
+                message,
+            )
+        }
     }
 
     /// Build a dispatcher whose context wires a specific `session_backend`,

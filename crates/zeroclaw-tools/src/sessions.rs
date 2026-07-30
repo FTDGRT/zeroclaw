@@ -8,6 +8,7 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
+use zeroclaw_infra::channel_session::ChannelSessionState;
 use zeroclaw_infra::session_backend::SessionBackend;
 
 /// Validate that a session ID is non-empty and contains at least one
@@ -513,6 +514,12 @@ pub struct SessionResetTool {
     backend: Arc<dyn SessionBackend>,
     security: Arc<SecurityPolicy>,
     ownership_scope: Option<SessionOwnershipScope>,
+    /// Shared Channel session lifecycle. When the target key is a
+    /// Channel-owned session and this handle is present, reset goes through the
+    /// shared lifecycle (`reset_session`, which cancels + waits competing
+    /// workers and rotates the conversation id). Otherwise reset clears the
+    /// backend history via `clear_and_rotate_conversation`.
+    channel_sessions: Option<Arc<ChannelSessionState>>,
 }
 
 impl SessionResetTool {
@@ -521,6 +528,7 @@ impl SessionResetTool {
             backend,
             security,
             ownership_scope: None,
+            channel_sessions: None,
         }
     }
 
@@ -533,7 +541,16 @@ impl SessionResetTool {
             backend,
             security,
             ownership_scope: Some(ownership_scope),
+            channel_sessions: None,
         }
+    }
+
+    /// Wire the shared Channel session lifecycle so a Channel-owned target key
+    /// resets through `reset_session` (cancel + wait competing workers, rotate
+    /// the conversation id). Non-Channel targets keep the backend-only path.
+    pub fn with_channel_sessions(mut self, channel_sessions: Arc<ChannelSessionState>) -> Self {
+        self.channel_sessions = Some(channel_sessions);
+        self
     }
 }
 
@@ -605,23 +622,43 @@ impl Tool for SessionResetTool {
                 .unwrap_or_else(|| session_id.trim().to_string()),
         };
 
-        match self.backend.clear_messages(&target_session_key) {
-            Ok(0) => Ok(ToolResult {
-                success: true,
-                output: format!("Session '{target_session_key}' is already empty.").into(),
-                error: None,
-            }),
-            Ok(count) => Ok(ToolResult {
-                success: true,
-                output: format!("Session '{target_session_key}' reset ({count} messages cleared).")
-                    .into(),
-                error: None,
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("Failed to reset session: {e}")),
-            }),
+        // A Channel-owned key (not a `gw_` dashboard session) with the shared
+        // handle wired in resets through the lifecycle: cancel + wait competing
+        // workers, then rotate the conversation id and clear history. Other
+        // targets keep the backend-only clear-and-rotate path.
+        let is_channel_owned = !target_session_key.starts_with("gw_");
+        if is_channel_owned && let Some(ref channel_sessions) = self.channel_sessions {
+            match channel_sessions
+                .reset_session(&target_session_key, None)
+                .await
+            {
+                Ok(_) => Ok(ToolResult {
+                    success: true,
+                    output: format!("Session '{target_session_key}' reset.").into(),
+                    error: None,
+                }),
+                Err(e) => Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("Failed to reset session: {e}")),
+                }),
+            }
+        } else {
+            match self
+                .backend
+                .clear_and_rotate_conversation(&target_session_key)
+            {
+                Ok(_) => Ok(ToolResult {
+                    success: true,
+                    output: format!("Session '{target_session_key}' reset.").into(),
+                    error: None,
+                }),
+                Err(e) => Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("Failed to reset session: {e}")),
+                }),
+            }
         }
     }
 }
@@ -634,6 +671,11 @@ pub struct SessionDeleteTool {
     backend: Arc<dyn SessionBackend>,
     security: Arc<SecurityPolicy>,
     ownership_scope: Option<SessionOwnershipScope>,
+    /// Shared Channel session lifecycle. When the target key is a
+    /// Channel-owned session and this handle is present, delete goes through
+    /// the shared lifecycle (`delete_session`, which cancels + waits competing
+    /// workers). Otherwise delete uses the backend `delete_session`.
+    channel_sessions: Option<Arc<ChannelSessionState>>,
 }
 
 impl SessionDeleteTool {
@@ -642,6 +684,7 @@ impl SessionDeleteTool {
             backend,
             security,
             ownership_scope: None,
+            channel_sessions: None,
         }
     }
 
@@ -654,7 +697,16 @@ impl SessionDeleteTool {
             backend,
             security,
             ownership_scope: Some(ownership_scope),
+            channel_sessions: None,
         }
+    }
+
+    /// Wire the shared Channel session lifecycle so a Channel-owned target key
+    /// deletes through `delete_session` (cancel + wait competing workers).
+    /// Non-Channel targets keep the backend-only delete.
+    pub fn with_channel_sessions(mut self, channel_sessions: Arc<ChannelSessionState>) -> Self {
+        self.channel_sessions = Some(channel_sessions);
+        self
     }
 }
 
@@ -726,35 +778,65 @@ impl Tool for SessionDeleteTool {
                 .unwrap_or_else(|| session_id.trim().to_string()),
         };
 
-        let existed = !self.backend.load(&target_session_key).is_empty();
+        // A Channel-owned key (not a `gw_` dashboard session) with the shared
+        // handle wired in deletes through the lifecycle: cancel + wait competing
+        // workers, then remove the record. Other targets use the backend delete.
+        let is_channel_owned = !target_session_key.starts_with("gw_");
+        if is_channel_owned && let Some(ref channel_sessions) = self.channel_sessions {
+            match channel_sessions
+                .delete_session(&target_session_key, None)
+                .await
+            {
+                Ok(true) => Ok(ToolResult {
+                    success: true,
+                    output: format!("Session '{target_session_key}' deleted.").into(),
+                    error: None,
+                }),
+                Ok(false) => Ok(ToolResult {
+                    success: true,
+                    output: format!(
+                        "Session '{target_session_key}' not found (may have already been deleted)."
+                    )
+                    .into(),
+                    error: None,
+                }),
+                Err(e) => Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("Failed to delete session: {e}")),
+                }),
+            }
+        } else {
+            let existed = !self.backend.load(&target_session_key).is_empty();
 
-        match self.backend.delete_session(&target_session_key) {
-            Ok(true) => Ok(ToolResult {
-                success: true,
-                output: format!("Session '{target_session_key}' deleted.").into(),
-                error: None,
-            }),
-            Ok(false) if !existed => Ok(ToolResult {
-                success: true,
-                output: format!(
-                    "Session '{target_session_key}' not found (may have already been deleted)."
-                )
-                .into(),
-                error: None,
-            }),
-            Ok(false) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "Session '{target_session_key}' exists but could not be deleted \
+            match self.backend.delete_session(&target_session_key) {
+                Ok(true) => Ok(ToolResult {
+                    success: true,
+                    output: format!("Session '{target_session_key}' deleted.").into(),
+                    error: None,
+                }),
+                Ok(false) if !existed => Ok(ToolResult {
+                    success: true,
+                    output: format!(
+                        "Session '{target_session_key}' not found (may have already been deleted)."
+                    )
+                    .into(),
+                    error: None,
+                }),
+                Ok(false) => Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Session '{target_session_key}' exists but could not be deleted \
                      — the storage backend may not support this operation."
-                )),
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("Failed to delete session: {e}")),
-            }),
+                    )),
+                }),
+                Err(e) => Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("Failed to delete session: {e}")),
+                }),
+            }
         }
     }
 }
@@ -866,6 +948,41 @@ mod tests {
 
         fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String> {
             self.inner.clear_and_rotate_conversation(session_key)
+        }
+
+        fn append_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+            message: &ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner.append_if_conversation_matches(
+                session_key,
+                expected_conversation_id,
+                message,
+            )
+        }
+
+        fn remove_last_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner
+                .remove_last_if_conversation_matches(session_key, expected_conversation_id)
+        }
+
+        fn update_last_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+            message: &ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner.update_last_if_conversation_matches(
+                session_key,
+                expected_conversation_id,
+                message,
+            )
         }
     }
 
@@ -1320,7 +1437,8 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
-        assert!(result.output.contains("2 messages cleared"));
+        assert!(result.output.contains("reset"));
+        assert!(backend.load("telegram__alice").is_empty());
 
         // Verify messages are gone
         let messages = backend.load("telegram__alice");
@@ -1336,7 +1454,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
-        assert!(result.output.contains("already empty"));
+        assert!(result.output.contains("reset"));
     }
 
     #[tokio::test]
@@ -1372,7 +1490,7 @@ mod tests {
             .unwrap();
 
         assert!(result.success);
-        assert!(result.output.contains("2 messages cleared"));
+        assert!(result.output.contains("reset"));
         assert!(backend.load("telegram__alice").is_empty());
     }
 
@@ -1706,6 +1824,32 @@ mod tests {
         fn clear_and_rotate_conversation(&self, key: &str) -> std::io::Result<String> {
             self.0.clear_and_rotate_conversation(key)
         }
+        fn append_if_conversation_matches(
+            &self,
+            key: &str,
+            expected_conversation_id: &str,
+            message: &ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.0
+                .append_if_conversation_matches(key, expected_conversation_id, message)
+        }
+        fn remove_last_if_conversation_matches(
+            &self,
+            key: &str,
+            expected_conversation_id: &str,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.0
+                .remove_last_if_conversation_matches(key, expected_conversation_id)
+        }
+        fn update_last_if_conversation_matches(
+            &self,
+            key: &str,
+            expected_conversation_id: &str,
+            message: &ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.0
+                .update_last_if_conversation_matches(key, expected_conversation_id, message)
+        }
     }
 
     #[tokio::test]
@@ -1719,5 +1863,143 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("could not be deleted"));
+    }
+
+    // ── shared Channel lifecycle wiring (.with_channel_sessions) ──────
+
+    /// `sessions_reset` on a Channel-owned key with the shared handle wired
+    /// rotates the conversation id (UUID differs before/after) and clears
+    /// history.
+    #[tokio::test]
+    async fn sessions_reset_channel_key_rotates_id_and_clears_history() {
+        use zeroclaw_infra::channel_session::ChannelSessionState;
+        let (_tmp, backend) = test_backend();
+        let channel_sessions = Arc::new(ChannelSessionState::new(Some(Arc::clone(&backend))));
+        let key = "telegram__alice";
+        let id_before = channel_sessions.resolve_conversation_id(key).unwrap();
+        channel_sessions
+            .append_history_if_current(key, &id_before, ChatMessage::user("hello"), 50)
+            .unwrap();
+        assert_eq!(backend.load(key).len(), 1);
+
+        let tool = SessionResetTool::new(backend.clone(), test_security())
+            .with_channel_sessions(Arc::clone(&channel_sessions));
+        let result = tool.execute(json!({"session_id": key})).await.unwrap();
+        assert!(result.success, "reset must succeed");
+
+        // The id rotated and history is cleared.
+        let id_after = channel_sessions.resolve_conversation_id(key).unwrap();
+        assert_ne!(id_before, id_after, "reset must rotate the conversation id");
+        assert!(backend.load(key).is_empty(), "reset must clear history");
+    }
+
+    /// `sessions_delete` on a Channel-owned key with the shared handle wired
+    /// removes the record; a subsequent stale append gets Deleted.
+    #[tokio::test]
+    async fn sessions_delete_channel_key_removes_record() {
+        use zeroclaw_infra::channel_session::ChannelSessionState;
+        use zeroclaw_infra::session_backend::ConditionalSessionWrite;
+        let (_tmp, backend) = test_backend();
+        let channel_sessions = Arc::new(ChannelSessionState::new(Some(Arc::clone(&backend))));
+        let key = "telegram__alice";
+        let id = channel_sessions.resolve_conversation_id(key).unwrap();
+        channel_sessions
+            .append_history_if_current(key, &id, ChatMessage::user("hello"), 50)
+            .unwrap();
+
+        let tool = SessionDeleteTool::new(backend.clone(), test_security())
+            .with_channel_sessions(Arc::clone(&channel_sessions));
+        let result = tool.execute(json!({"session_id": key})).await.unwrap();
+        assert!(result.success, "delete must succeed");
+
+        // The record is gone; a stale append is Deleted (no recreation).
+        assert_eq!(
+            backend
+                .append_if_conversation_matches(key, &id, &ChatMessage::assistant("gone"))
+                .unwrap(),
+            ConditionalSessionWrite::Deleted
+        );
+    }
+
+    /// With an active Channel lease present, reset/delete cancel + wait for it,
+    /// and the stale conditional append gets Stale / Deleted respectively.
+    #[tokio::test]
+    async fn sessions_reset_with_active_lease_cancels_and_makes_append_stale() {
+        use zeroclaw_infra::channel_session::ChannelSessionState;
+        use zeroclaw_infra::session_backend::ConditionalSessionWrite;
+        let (_tmp, backend) = test_backend();
+        let channel_sessions = Arc::new(ChannelSessionState::new(Some(Arc::clone(&backend))));
+        let key = "telegram__alice";
+        let id = channel_sessions.resolve_conversation_id(key).unwrap();
+        channel_sessions
+            .append_history_if_current(key, &id, ChatMessage::user("hello"), 50)
+            .unwrap();
+
+        // Register an active lease and spawn a bailer so reset's cancel+wait
+        // resolves (a real worker would abort on cancellation).
+        let lease = channel_sessions.register_turn(key).await;
+        let token = lease.cancellation();
+        let bailer_sessions = Arc::clone(&channel_sessions);
+        let bailer = zeroclaw_spawn::spawn!(async move {
+            lease.cancellation().cancelled().await;
+            bailer_sessions.complete_turn(&lease).await;
+        });
+
+        let tool = SessionResetTool::new(backend.clone(), test_security())
+            .with_channel_sessions(Arc::clone(&channel_sessions));
+        let result = tool.execute(json!({"session_id": key})).await.unwrap();
+        assert!(
+            result.success,
+            "reset must succeed even with an active lease"
+        );
+        assert!(
+            token.is_cancelled(),
+            "reset must cancel the active Channel lease"
+        );
+        bailer.await.unwrap();
+
+        // The stale append (with the pre-rotation id) is Stale.
+        assert_eq!(
+            channel_sessions
+                .append_history_if_current(key, &id, ChatMessage::assistant("stale"), 50)
+                .unwrap(),
+            ConditionalSessionWrite::Stale
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_delete_with_active_lease_cancels_waits_and_makes_append_deleted() {
+        use zeroclaw_infra::channel_session::ChannelSessionState;
+        use zeroclaw_infra::session_backend::ConditionalSessionWrite;
+        let (_tmp, backend) = test_backend();
+        let channel_sessions = Arc::new(ChannelSessionState::new(Some(Arc::clone(&backend))));
+        let key = "telegram__alice";
+        let id = channel_sessions.resolve_conversation_id(key).unwrap();
+        channel_sessions
+            .append_history_if_current(key, &id, ChatMessage::user("hello"), 50)
+            .unwrap();
+        let lease = channel_sessions.register_turn(key).await;
+        let token = lease.cancellation();
+
+        let tool = SessionDeleteTool::new(backend.clone(), test_security())
+            .with_channel_sessions(Arc::clone(&channel_sessions));
+        let delete =
+            zeroclaw_spawn::spawn!(async move { tool.execute(json!({"session_id": key})).await });
+        token.cancelled().await;
+        assert!(token.is_cancelled());
+        channel_sessions.complete_turn(&lease).await;
+
+        let result = delete.await.unwrap().unwrap();
+        assert!(
+            result.success,
+            "delete must succeed after active turn drains"
+        );
+        assert!(!backend.session_exists(key));
+        assert_eq!(
+            channel_sessions
+                .append_history_if_current(key, &id, ChatMessage::assistant("gone"), 50)
+                .unwrap(),
+            ConditionalSessionWrite::Deleted
+        );
     }
 }

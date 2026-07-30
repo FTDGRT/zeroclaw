@@ -750,6 +750,7 @@ impl DelegateTool {
             None,
             None,
             None,
+            None,
         );
 
         let target_workspace = config.agent_workspace_dir(agent_name);

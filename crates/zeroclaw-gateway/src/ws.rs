@@ -2121,6 +2121,31 @@ mod tests {
         fn clear_and_rotate_conversation(&self, _session_key: &str) -> std::io::Result<String> {
             Ok(uuid::Uuid::new_v4().to_string())
         }
+        // This mock is about append-resurrection, not conditional writes.
+        // A fixed `Applied` is a compile-only placeholder; no test asserts on it.
+        fn append_if_conversation_matches(
+            &self,
+            _session_key: &str,
+            _expected_conversation_id: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            Ok(zeroclaw_infra::session_backend::ConditionalSessionWrite::Applied)
+        }
+        fn remove_last_if_conversation_matches(
+            &self,
+            _session_key: &str,
+            _expected_conversation_id: &str,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            Ok(zeroclaw_infra::session_backend::ConditionalSessionWrite::Applied)
+        }
+        fn update_last_if_conversation_matches(
+            &self,
+            _session_key: &str,
+            _expected_conversation_id: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            Ok(zeroclaw_infra::session_backend::ConditionalSessionWrite::Applied)
+        }
     }
 
     #[test]
@@ -2291,6 +2316,38 @@ mod tests {
         fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String> {
             self.inner.clear_and_rotate_conversation(session_key)
         }
+        fn append_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner.append_if_conversation_matches(
+                session_key,
+                expected_conversation_id,
+                message,
+            )
+        }
+        fn remove_last_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner
+                .remove_last_if_conversation_matches(session_key, expected_conversation_id)
+        }
+        fn update_last_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner.update_last_if_conversation_matches(
+                session_key,
+                expected_conversation_id,
+                message,
+            )
+        }
     }
 
     /// Wraps a real `SqliteSessionBackend` but injects a failure from
@@ -2348,6 +2405,38 @@ mod tests {
         }
         fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String> {
             self.inner.clear_and_rotate_conversation(session_key)
+        }
+        fn append_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner.append_if_conversation_matches(
+                session_key,
+                expected_conversation_id,
+                message,
+            )
+        }
+        fn remove_last_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner
+                .remove_last_if_conversation_matches(session_key, expected_conversation_id)
+        }
+        fn update_last_if_conversation_matches(
+            &self,
+            session_key: &str,
+            expected_conversation_id: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            self.inner.update_last_if_conversation_matches(
+                session_key,
+                expected_conversation_id,
+                message,
+            )
         }
     }
 

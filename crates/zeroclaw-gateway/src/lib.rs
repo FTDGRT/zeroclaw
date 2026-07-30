@@ -843,6 +843,7 @@ pub async fn run_gateway(
                 sop_engine.clone(),
                 sop_audit.clone(),
                 None,
+                None,
             );
             let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
                 config: &config,
@@ -976,6 +977,7 @@ pub async fn run_gateway(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
+            None,
             None,
         );
         // Same gated seam as the dashboard seed above, so this listing shows
@@ -9075,6 +9077,32 @@ mod tests {
             Err(std::io::Error::other(
                 "injected channel session rotate failure",
             ))
+        }
+        // This mock exists to inject a resolve failure; the conditional writers
+        // are unreachable once resolve fails, so a fixed `Applied` is a
+        // compile-only placeholder that no test asserts against.
+        fn append_if_conversation_matches(
+            &self,
+            _: &str,
+            _: &str,
+            _: &zeroclaw_api::model_provider::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            Ok(zeroclaw_infra::session_backend::ConditionalSessionWrite::Applied)
+        }
+        fn remove_last_if_conversation_matches(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            Ok(zeroclaw_infra::session_backend::ConditionalSessionWrite::Applied)
+        }
+        fn update_last_if_conversation_matches(
+            &self,
+            _: &str,
+            _: &str,
+            _: &zeroclaw_api::model_provider::ChatMessage,
+        ) -> std::io::Result<zeroclaw_infra::session_backend::ConditionalSessionWrite> {
+            Ok(zeroclaw_infra::session_backend::ConditionalSessionWrite::Applied)
         }
     }
 
