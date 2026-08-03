@@ -554,7 +554,7 @@ pub struct AppState {
     /// `conversation_history_key` so re-delivered or follow-up messages reuse
     /// the same id. The gateway's own `session_backend` above only serves `gw_`
     /// WS/API sessions and is NOT a Channel conversation fallback.
-    pub channel_sessions: Arc<zeroclaw_infra::channel_session::ChannelSessionState>,
+    pub channel_sessions: Arc<zeroclaw_infra::channel_conversation::ChannelConversationStore>,
     /// Per-session actor queue for serializing concurrent turns
     pub session_queue: Arc<session_queue::SessionActorQueue>,
     /// Device registry for paired device management
@@ -607,7 +607,7 @@ pub async fn run_gateway(
     // Constructed once per daemon iteration and cloned into the channel
     // orchestrator too, so an inbound webhook and the orchestrator agree on
     // one id per `conversation_history_key`.
-    channel_sessions: Arc<zeroclaw_infra::channel_session::ChannelSessionState>,
+    channel_sessions: Arc<zeroclaw_infra::channel_conversation::ChannelConversationStore>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -2659,7 +2659,7 @@ pub(crate) fn mint_request_conversation_id() -> String {
 }
 
 /// Resolve the opaque cross-turn conversation id for a Channel webhook message
-/// through the shared [`ChannelSessionState`]. Two inbound messages that share
+/// through the shared [`ChannelConversationStore`]. Two inbound messages that share
 /// a `conversation_history_key` (same channel/alias/room/sender/thread) reuse
 /// one id; different senders or threads isolate. The returned id is never the
 /// `history_key` or any routing/sender value. On backend failure the error is
@@ -4773,9 +4773,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -5181,9 +5181,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                    None,
-                )),
+                Arc::new(zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None)),
             )
             .await
         });
@@ -5252,9 +5250,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                    None,
-                )),
+                Arc::new(zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None)),
             )
             .await
         });
@@ -5308,9 +5304,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                    None,
-                )),
+                Arc::new(zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None)),
             )
             .await
         });
@@ -5376,9 +5370,7 @@ mod tests {
                 None,
                 None,
                 Some(readiness),
-                Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                    None,
-                )),
+                Arc::new(zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None)),
             )
             .await
         });
@@ -5448,9 +5440,7 @@ mod tests {
             None,
             None,
             Some(readiness),
-            Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            Arc::new(zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None)),
         )
         .await;
 
@@ -5514,9 +5504,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -5606,9 +5596,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6285,9 +6275,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6395,9 +6385,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6520,9 +6510,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6625,9 +6615,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6749,9 +6739,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6839,9 +6829,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -6934,9 +6924,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -7036,9 +7026,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -7134,9 +7124,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -7301,9 +7291,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -8150,9 +8140,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -8241,9 +8231,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -8567,9 +8557,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
@@ -9021,7 +9011,7 @@ mod tests {
     /// so the webhook resolver helper is observable in isolation.
     #[cfg(feature = "channel-whatsapp-cloud")]
     fn test_app_state_with_channel_sessions(
-        channel_sessions: zeroclaw_infra::channel_session::ChannelSessionState,
+        channel_sessions: zeroclaw_infra::channel_conversation::ChannelConversationStore,
     ) -> AppState {
         let mut state = webhook_baseline_state();
         state.channel_sessions = Arc::new(channel_sessions);
@@ -9114,7 +9104,7 @@ mod tests {
     #[tokio::test]
     async fn webhook_channel_conversation_resolve_failure_whatsapp_returns_500() {
         let mut state = test_app_state_with_channel_sessions(
-            zeroclaw_infra::channel_session::ChannelSessionState::new(Some(Arc::new(
+            zeroclaw_infra::channel_conversation::ChannelConversationStore::new(Some(Arc::new(
                 FailingChannelSessionBackend::default(),
             )
                 as Arc<dyn SessionBackend>)),
@@ -9195,10 +9185,11 @@ mod tests {
         state.nextcloud_talk = HashMap::from([("default".to_string(), channel)]);
         state.nextcloud_talk_webhook_secret =
             HashMap::from([("default".to_string(), Arc::<str>::from(secret))]);
-        state.channel_sessions =
-            Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                Some(backend.clone() as Arc<dyn SessionBackend>),
-            ));
+        state.channel_sessions = Arc::new(
+            zeroclaw_infra::channel_conversation::ChannelConversationStore::new(Some(
+                backend.clone() as Arc<dyn SessionBackend>,
+            )),
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -9244,7 +9235,7 @@ mod tests {
     #[test]
     fn webhook_channel_conversation_resolver_reuses_id_and_isolates_sender_and_thread() {
         let state = test_app_state_with_channel_sessions(
-            zeroclaw_infra::channel_session::ChannelSessionState::new(None),
+            zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
         );
         let same_a = channel_message("whatsapp", "main", "alice@example.test", "room", None);
         let same_b = channel_message("whatsapp", "main", "alice@example.test", "room", None);
@@ -9293,7 +9284,7 @@ mod tests {
     #[test]
     fn webhook_channel_conversation_table_reuses_id_per_history_key() {
         let state = test_app_state_with_channel_sessions(
-            zeroclaw_infra::channel_session::ChannelSessionState::new(None),
+            zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
         );
         let allow_any: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
             Arc::new(|| vec!["*".to_string()]);
@@ -9572,9 +9563,9 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),

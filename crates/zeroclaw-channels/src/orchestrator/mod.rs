@@ -456,7 +456,7 @@ struct ChannelRuntimeContext {
     /// competing workers. In durable mode the backend record is the single
     /// source of truth; in memory-only mode the shared state's bounded LRU owns
     /// the id and history as one record.
-    channel_sessions: Arc<zeroclaw_infra::channel_session::ChannelSessionState>,
+    channel_sessions: Arc<zeroclaw_infra::channel_conversation::ChannelConversationStore>,
     pending_new_sessions: PendingNewSessionSet,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
@@ -514,7 +514,7 @@ struct ChannelRuntimeContext {
 }
 
 /// Resolve the immutable cross-turn conversation id for a routing/storage
-/// `history_key`. Delegates to the shared [`ChannelSessionState`]: in durable
+/// `history_key`. Delegates to the shared [`ChannelConversationStore`]: in durable
 /// mode the backend record is the single source of truth (resolve-or-create,
 /// never mirrored); in memory-only mode the shared state's bounded LRU owns the
 /// id and reuses it across turns until `/new`/`/clear` rotates it.
@@ -530,56 +530,10 @@ fn resolve_channel_conversation_id(
     ctx.channel_sessions.resolve_conversation_id(history_key)
 }
 
-/// Atomically rotate the conversation id for a `/new`/`/clear` request, target
-/// only - a different sender's id is never touched. Delegates to the shared
-/// [`ChannelSessionState`]: in durable mode the backend clears history AND
-/// mints a fresh id in one record-scoped op (`clear_and_rotate_conversation`),
-/// never a caller-composed `delete + resolve`; in memory-only mode the shared
-/// state's bounded LRU is overwritten with a fresh UUID. Rollback/trim/compact
-/// do NOT call this - they leave the id stable. Returns the fresh id, or the
-/// backend error verbatim. Test-only: production `/new` goes through
-/// `ChannelSessionState::reset_session` (which also cancels + waits competing
-/// workers); this thin wrapper is retained for the resolve/rotate unit tests.
-#[cfg(test)]
-fn rotate_conversation_id(
-    ctx: &ChannelRuntimeContext,
-    sender_key: &str,
-) -> std::io::Result<String> {
-    ctx.channel_sessions
-        .clear_and_rotate_conversation(sender_key)
-}
-
 #[derive(Clone)]
 struct InFlightSenderTaskState {
     task_id: u64,
     cancellation: CancellationToken,
-    completion: Arc<InFlightTaskCompletion>,
-}
-
-struct InFlightTaskCompletion {
-    done: AtomicBool,
-    notify: tokio::sync::Notify,
-}
-
-impl InFlightTaskCompletion {
-    fn new() -> Self {
-        Self {
-            done: AtomicBool::new(false),
-            notify: tokio::sync::Notify::new(),
-        }
-    }
-
-    fn mark_done(&self) {
-        self.done.store(true, Ordering::Release);
-        self.notify.notify_waiters();
-    }
-
-    async fn wait(&self) {
-        if self.done.load(Ordering::Acquire) {
-            return;
-        }
-        self.notify.notified().await;
-    }
 }
 
 fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
@@ -2224,12 +2178,26 @@ fn compact_sender_history(
 /// Number of most-recent turns whose tool-result payloads are kept at full size
 /// when proactively trimming. The active exchange stays intact; only older
 /// tool results are shrunk to a bounded extract.
-fn append_sender_turn(
+async fn turn_may_continue(
+    ctx: &ChannelRuntimeContext,
+    history_key: &str,
+    conversation_id: &str,
+    cancellation: &CancellationToken,
+) -> std::io::Result<bool> {
+    if cancellation.is_cancelled() {
+        return Ok(false);
+    }
+    ctx.channel_sessions
+        .is_current(history_key, conversation_id)
+        .await
+}
+
+async fn append_sender_turn(
     ctx: &ChannelRuntimeContext,
     history_key: &str,
     conversation_id: &str,
     turn: ChatMessage,
-) {
+) -> std::io::Result<zeroclaw_infra::ConditionalSessionWrite> {
     // The conversation id captured before any async hook is the write fence:
     // the append lands only if the record still carries it. A stale (rotated)
     // or deleted result is an expected lifecycle race - no retry, no system
@@ -2244,25 +2212,34 @@ fn append_sender_turn(
             MAX_CHANNEL_HISTORY
         }
     };
-    use zeroclaw_infra::session_backend::ConditionalSessionWrite;
-    match ctx.channel_sessions.append_history_if_current(
-        history_key,
-        conversation_id,
-        turn,
-        max_history,
-    ) {
-        Ok(ConditionalSessionWrite::Applied) => {}
-        Ok(ConditionalSessionWrite::Stale | ConditionalSessionWrite::Deleted) => {}
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "Failed to persist session turn"
-            );
-        }
+    let status = ctx
+        .channel_sessions
+        .mutate_if_current(
+            history_key,
+            conversation_id,
+            zeroclaw_infra::SessionMutation::Append(&turn),
+        )
+        .await?;
+    // The mutation Append itself is unbounded (the backend durably stores the
+    // full history; memory-only pushes raw). Bound the retained tail here on
+    // Applied so memory-only history does not grow without limit between
+    // context-window compactions. Durable mode's cache sync already trims via
+    // push_bounded, so this compaction is a no-op there; it only matters for
+    // memory-only records, where compact_history_if_current drops the head
+    // beyond max_history in place.
+    if status == zeroclaw_infra::ConditionalSessionWrite::Applied
+        && ctx.channel_sessions.load_history(history_key).len() > max_history
+    {
+        let _ = ctx.channel_sessions.compact_history_if_current(
+            history_key,
+            conversation_id,
+            |history| {
+                let keep_from = history.len().saturating_sub(max_history);
+                history.drain(0..keep_from);
+            },
+        );
     }
+    Ok(status)
 }
 
 /// Extract tool-call (assistant with tool_call content) and tool-result
@@ -2300,32 +2277,22 @@ fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessag
 /// case). A stale/deleted result leaves the record untouched (the orphan is
 /// gone with the rotated/deleted history anyway) and reports `false` so the
 /// close marker is attempted (it will itself be a no-op stale/deleted write).
-fn rollback_orphan_user_turn(
+async fn rollback_orphan_user_turn(
     ctx: &ChannelRuntimeContext,
     history_key: &str,
     conversation_id: &str,
     expected_content: &str,
-) -> bool {
-    use zeroclaw_infra::session_backend::ConditionalSessionWrite;
-    match ctx.channel_sessions.rollback_last_if_current(
-        history_key,
-        conversation_id,
-        "user",
-        expected_content,
-    ) {
-        Ok(ConditionalSessionWrite::Applied) => true,
-        Ok(ConditionalSessionWrite::Stale | ConditionalSessionWrite::Deleted) => false,
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "Failed to rollback session store entry"
-            );
-            false
-        }
-    }
+) -> std::io::Result<zeroclaw_infra::ConditionalSessionWrite> {
+    ctx.channel_sessions
+        .mutate_if_current(
+            history_key,
+            conversation_id,
+            zeroclaw_infra::SessionMutation::RemoveLast {
+                expected_role: "user",
+                expected_content,
+            },
+        )
+        .await
 }
 
 fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
@@ -2855,7 +2822,8 @@ async fn handle_runtime_command_if_needed(
     msg: &zeroclaw_api::channel::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
     history_key: &str,
-    lease_id: u64,
+    conversation_id: &str,
+    cancellation: &CancellationToken,
 ) -> bool {
     let Some(command) = parse_runtime_command(&msg.channel, &msg.content) else {
         return false;
@@ -3057,25 +3025,27 @@ async fn handle_runtime_command_if_needed(
             }
         }
         ChannelRuntimeCommand::NewSession => {
-            // `/new` goes through the shared lifecycle: cancel and wait for any
-            // competing turn for this key (excluding this commanding turn via
-            // its lease id, so it never waits on itself), then rotate the
-            // record to a fresh id and clear history. On failure the session is
-            // NOT considered reset: `pending_new_sessions` is left untouched
-            // and the caller sees a reset-failed reply, so a durable error does
-            // not appear to succeed.
-            match ctx
-                .channel_sessions
-                .reset_session(&sender_key, Some(lease_id))
-                .await
-            {
+            ctx.channel_sessions
+                .unregister_in_flight(&sender_key, cancellation)
+                .await;
+            // `/new` deletes the current conversation record so the next ordinary
+            // message opens a fresh record with a new id. The commanding turn
+            // keeps its captured id A for the confirmation reply. On failure the
+            // session is NOT considered reset: `pending_new_sessions` is left
+            // untouched and the caller sees a reset-failed reply, so a durable
+            // error does not appear to succeed.
+            match ctx.channel_sessions.delete(&sender_key).await {
                 Ok(_) => {
                     ctx.thinking_overrides
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&sender_key);
                     mark_sender_for_new_session(ctx, &sender_key);
-                    channel_runtime_cli_string("channel-runtime-new-session")
+                    format!(
+                        "{} ({})",
+                        channel_runtime_cli_string("channel-runtime-new-session"),
+                        conversation_id
+                    )
                 }
                 Err(error) => {
                     ::zeroclaw_log::record!(
@@ -4517,13 +4487,12 @@ fn spawn_scoped_typing_task(
     })
 }
 
-async fn process_channel_message(
+async fn process_channel_message_with_record(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
     history_key: String,
     conversation_id: String,
-    lease_id: u64,
 ) {
     if cancellation_token.is_cancelled() {
         return;
@@ -4551,7 +4520,6 @@ async fn process_channel_message(
                 composite_for_body,
                 history_key,
                 conversation_id,
-                lease_id,
             )
             .await;
         }
@@ -4559,35 +4527,34 @@ async fn process_channel_message(
     .await;
 }
 
-/// Test-only wrapper mirroring `dispatch_worker`'s lifecycle: capture the
-/// history key + conversation id, register a turn lease, run
-/// `process_channel_message`, then complete the lease. Lets the many
-/// integration tests keep calling with `(ctx, msg, token)` while still
-/// exercising the fenced path. The caller's `cancellation_token` is plumbed
-/// into the turn body (the lease's own token is registered for cleanup only).
+#[cfg(test)]
+async fn process_channel_message(
+    ctx: Arc<ChannelRuntimeContext>,
+    msg: zeroclaw_api::channel::ChannelMessage,
+    cancellation_token: CancellationToken,
+) {
+    let history_key = conversation_history_key(&msg);
+    let conversation_id = match ctx.channel_sessions.open(&history_key).await {
+        Ok(record) => record.conversation_id,
+        Err(_) => return,
+    };
+    process_channel_message_with_record(
+        ctx.clone(),
+        msg,
+        cancellation_token,
+        history_key,
+        conversation_id,
+    )
+    .await;
+}
+
 #[cfg(test)]
 async fn run_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
 ) {
-    let history_key = conversation_history_key(&msg);
-    let channel_sessions = Arc::clone(&ctx.channel_sessions);
-    let conversation_id = channel_sessions
-        .resolve_conversation_id(&history_key)
-        .unwrap();
-    let lease = channel_sessions.register_turn(&history_key).await;
-    let lease_id = lease.id();
-    process_channel_message(
-        ctx,
-        msg,
-        cancellation_token,
-        history_key,
-        conversation_id,
-        lease_id,
-    )
-    .await;
-    channel_sessions.complete_turn(&lease).await;
+    process_channel_message(ctx, msg, cancellation_token).await;
 }
 
 fn resolve_channel_ack_reactions(
@@ -4692,7 +4659,7 @@ fn stamp_session_routing_context(
     }
 }
 
-fn record_passive_context(
+async fn record_passive_context(
     ctx: &ChannelRuntimeContext,
     msg: &ChannelMessage,
     history_key: &str,
@@ -4700,12 +4667,13 @@ fn record_passive_context(
 ) {
     let timestamped_content =
         timestamped_channel_user_history_content(msg, WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL);
-    append_sender_turn(
+    let _ = append_sender_turn(
         ctx,
         history_key,
         conversation_id,
         ChatMessage::user(&timestamped_content),
-    );
+    )
+    .await;
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
@@ -4725,7 +4693,6 @@ async fn process_channel_message_body(
     channel_composite: String,
     history_key: String,
     conversation_id: String,
-    lease_id: u64,
 ) {
     ::zeroclaw_log::record!(
         INFO,
@@ -4808,9 +4775,20 @@ async fn process_channel_message_body(
 
     // The history key was captured before any async hook in `dispatch_worker`;
     // reuse it verbatim (the turn never recomputes the key/UUID).
+    if !turn_may_continue(
+        ctx.as_ref(),
+        &history_key,
+        &conversation_id,
+        &cancellation_token,
+    )
+    .await
+    .unwrap_or(false)
+    {
+        return;
+    }
     stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
     if msg.passive_context {
-        record_passive_context(ctx.as_ref(), &msg, &history_key, &conversation_id);
+        record_passive_context(ctx.as_ref(), &msg, &history_key, &conversation_id).await;
         return;
     }
 
@@ -4925,6 +4903,18 @@ async fn process_channel_message_body(
         }
     }
 
+    if !turn_may_continue(
+        ctx.as_ref(),
+        &history_key,
+        &conversation_id,
+        &cancellation_token,
+    )
+    .await
+    .unwrap_or(false)
+    {
+        return;
+    }
+
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
         ::zeroclaw_log::record!(
             WARN,
@@ -4939,7 +4929,8 @@ async fn process_channel_message_body(
         &msg,
         target_channel.as_ref(),
         &history_key,
-        lease_id,
+        &conversation_id,
+        &cancellation_token,
     )
     .await
     {
@@ -5043,9 +5034,9 @@ async fn process_channel_message_body(
     let started_at = Instant::now();
 
     let force_fresh_session = take_pending_new_session(ctx.as_ref(), &history_key);
-    // `/new` already rotated the id and cleared history via `reset_session` when
-    // the `/new` turn ran; the pending flag only selects the fresh-prompt path
-    // here. No per-key lock or extra clear is needed - the shared state owns it.
+    // `/new` deleted the conversation record when the `/new` turn ran; the
+    // pending flag only selects the fresh-prompt path here. No per-key lock or
+    // extra clear is needed - the shared store owns the record.
 
     let had_prior_history = if force_fresh_session {
         false
@@ -5058,12 +5049,52 @@ async fn process_channel_message_body(
     // full content for every marker type so a later turn can re-load it.
     let timestamped_content =
         timestamped_channel_user_history_content(&msg, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
-    append_sender_turn(
+    match append_sender_turn(
         ctx.as_ref(),
         &history_key,
         &conversation_id,
         ChatMessage::user(&timestamped_content),
-    );
+    )
+    .await
+    {
+        Ok(zeroclaw_infra::ConditionalSessionWrite::Applied) => {}
+        Ok(
+            zeroclaw_infra::ConditionalSessionWrite::Stale
+            | zeroclaw_infra::ConditionalSessionWrite::Deleted,
+        ) => {
+            // The record was rotated/deleted before this turn could persist its
+            // user message. No draft/typing exists yet to cancel; just reconcile
+            // the early ack and silently end so no reply is sent for an
+            // unpersisted turn.
+            reconcile_early_ack(
+                ctx.as_ref(),
+                &msg,
+                target_channel.as_ref(),
+                early_ack_task,
+                Some("\u{26A0}\u{FE0F}"),
+            )
+            .await;
+            return;
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Failed to persist session turn"
+            );
+            reconcile_early_ack(
+                ctx.as_ref(),
+                &msg,
+                target_channel.as_ref(),
+                early_ack_task,
+                Some("\u{26A0}\u{FE0F}"),
+            )
+            .await;
+            return;
+        }
+    }
 
     // Build history from the shared session state.
     let prior_turns_raw = if force_fresh_session {
@@ -5389,12 +5420,13 @@ async fn process_channel_message_body(
             }
             .history_marker(),
         };
-        append_sender_turn(
+        let _ = append_sender_turn(
             ctx.as_ref(),
             &history_key,
             &conversation_id,
             ChatMessage::assistant(&history_response),
-        );
+        )
+        .await;
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
@@ -5664,6 +5696,17 @@ async fn process_channel_message_body(
     );
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
+            if !turn_may_continue(
+                ctx.as_ref(),
+                &history_key,
+                &conversation_id,
+                &cancellation_token,
+            )
+            .await
+            .unwrap_or(false)
+            {
+                break LlmExecutionResult::Cancelled;
+            }
             let thread_scope_id = msg
                 .interruption_scope_id
                 .clone()
@@ -5778,6 +5821,18 @@ async fn process_channel_message_body(
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
                 result = timed_tool_loop => LlmExecutionResult::Completed(result),
             };
+
+            if !turn_may_continue(
+                ctx.as_ref(),
+                &history_key,
+                &conversation_id,
+                &cancellation_token,
+            )
+            .await
+            .unwrap_or(false)
+            {
+                break LlmExecutionResult::Cancelled;
+            }
 
             if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result
                 && let Some((new_model_provider, new_model)) = is_model_switch_requested(e)
@@ -5960,6 +6015,23 @@ async fn process_channel_message_body(
         log_worker_join_result(handle.await);
     }
 
+    if !turn_may_continue(
+        ctx.as_ref(),
+        &history_key,
+        &conversation_id,
+        &cancellation_token,
+    )
+    .await
+    .unwrap_or(false)
+    {
+        if let (Some(channel), Some(draft_id)) =
+            (target_channel.as_ref(), draft_message_id.as_deref())
+        {
+            let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
+        }
+        return;
+    }
+
     let reaction_done_emoji = match &llm_result {
         LlmExecutionResult::Completed(Ok(Ok(_))) => "\u{2705}", // ✅
         _ => "\u{26A0}\u{FE0F}",                                // ⚠️
@@ -6122,17 +6194,30 @@ async fn process_channel_message_body(
                 // assistant response that matches our delivered text.
                 let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
                 for tool_msg in tool_messages {
-                    append_sender_turn(ctx.as_ref(), &history_key, &conversation_id, tool_msg);
+                    if append_sender_turn(ctx.as_ref(), &history_key, &conversation_id, tool_msg)
+                        .await
+                        .map_or(true, |status| {
+                            status != zeroclaw_infra::ConditionalSessionWrite::Applied
+                        })
+                    {
+                        return;
+                    }
                 }
             }
 
             let history_response = delivered_response.clone();
-            append_sender_turn(
+            if append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
                 &conversation_id,
                 ChatMessage::assistant(&history_response),
-            );
+            )
+            .await
+            .map_or(true, |status| {
+                status != zeroclaw_infra::ConditionalSessionWrite::Applied
+            }) {
+                return;
+            }
 
             // Fire-and-forget LLM-driven memory consolidation. Passes the
             // agent's resolved temperature through unchanged — `None`
@@ -6483,24 +6568,69 @@ async fn process_channel_message_body(
                         })),
                     "channel_message_error"
                 );
-                let should_rollback_user_turn = should_rollback_failed_user_turn(&e);
-                let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(
-                        ctx.as_ref(),
-                        &history_key,
-                        &conversation_id,
-                        &timestamped_content,
-                    );
+                let rolled_back = if should_rollback_failed_user_turn(&e) {
+                    matches!(
+                        rollback_orphan_user_turn(
+                            ctx.as_ref(),
+                            &history_key,
+                            &conversation_id,
+                            &timestamped_content,
+                        )
+                        .await,
+                        Ok(zeroclaw_infra::ConditionalSessionWrite::Applied)
+                    )
+                } else {
+                    false
+                };
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
                     // inherit this failed request as unfinished context.
-                    append_sender_turn(
+                    match append_sender_turn(
                         ctx.as_ref(),
                         &history_key,
                         &conversation_id,
                         ChatMessage::assistant("[Task failed — not continuing this request]"),
-                    );
+                    )
+                    .await
+                    {
+                        Ok(zeroclaw_infra::ConditionalSessionWrite::Applied) => {}
+                        Ok(
+                            zeroclaw_infra::ConditionalSessionWrite::Stale
+                            | zeroclaw_infra::ConditionalSessionWrite::Deleted,
+                        ) => {
+                            if let Some(token) = typing_cancellation.as_ref() {
+                                token.cancel();
+                            }
+                            if let (Some(channel), Some(draft_id)) =
+                                (target_channel.as_ref(), draft_message_id.as_deref())
+                            {
+                                let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "Failed to persist failure marker"
+                            );
+                            if let Some(token) = typing_cancellation.as_ref() {
+                                token.cancel();
+                            }
+                            if let (Some(channel), Some(draft_id)) =
+                                (target_channel.as_ref(), draft_message_id.as_deref())
+                            {
+                                let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
+                            }
+                            return;
+                        }
+                    }
                 }
                 if let Some(channel) = target_channel.as_ref() {
                     let user_msg = zeroclaw_providers::reliable::transient_error_hint(&e)
@@ -6549,12 +6679,48 @@ async fn process_channel_message_body(
             );
             // Close the orphan user turn so subsequent messages don't
             // inherit this timed-out request as unfinished context.
-            append_sender_turn(
+            match append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
                 &conversation_id,
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
-            );
+            )
+            .await
+            {
+                Ok(zeroclaw_infra::ConditionalSessionWrite::Applied) => {}
+                Ok(
+                    zeroclaw_infra::ConditionalSessionWrite::Stale
+                    | zeroclaw_infra::ConditionalSessionWrite::Deleted,
+                ) => {
+                    if let Some(token) = typing_cancellation.as_ref() {
+                        token.cancel();
+                    }
+                    if let (Some(channel), Some(draft_id)) =
+                        (target_channel.as_ref(), draft_message_id.as_deref())
+                    {
+                        let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
+                    }
+                    return;
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "Failed to persist timeout marker"
+                    );
+                    if let Some(token) = typing_cancellation.as_ref() {
+                        token.cancel();
+                    }
+                    if let (Some(channel), Some(draft_id)) =
+                        (target_channel.as_ref(), draft_message_id.as_deref())
+                    {
+                        let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
+                    }
+                    return;
+                }
+            }
             if let Some(channel) = target_channel.as_ref() {
                 // Localized error text (master) delivered with suppress_voice
                 // (RFCerror-path fix): cancel the draft, then send as
@@ -6611,12 +6777,12 @@ async fn dispatch_worker(
     // Capture the immutable history key + conversation id BEFORE any async hook,
     // SOP dispatch, media/link enrichment, or provider work. The same id fences
     // every history mutation and attaches to every observer event for the turn.
-    // Fail CLOSED on resolve: no hook, no model, no history write, and NO
+    // Fail CLOSED on open: no hook, no model, no history write, and NO
     // sender/key/fresh-UUID fallback. The log carries only the channel + error
     // kind (the history_key may carry sender/thread).
     let history_key = conversation_history_key(&msg);
-    let conversation_id = match ctx.channel_sessions.resolve_conversation_id(&history_key) {
-        Ok(id) => id,
+    let conversation_id = match ctx.channel_sessions.open(&history_key).await {
+        Ok(record) => record.conversation_id,
         Err(error) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -6632,13 +6798,10 @@ async fn dispatch_worker(
         }
     };
 
-    // Register the turn so `/new`/`/clear` and delete can cancel + wait for
-    // competing workers (excluding this turn via its lease id). The lease's
-    // cancellation token doubles as the turn's interrupt/cancel token.
-    let lease = ctx.channel_sessions.register_turn(&history_key).await;
-    let cancellation_token = lease.cancellation();
-    let lease_id = lease.id();
-    let completion = Arc::new(InFlightTaskCompletion::new());
+    let cancellation_token = CancellationToken::new();
+    ctx.channel_sessions
+        .register_in_flight(&history_key, cancellation_token.clone())
+        .await;
     let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
 
     let register_in_flight = msg.channel != "cli" && !msg.passive_context;
@@ -6651,7 +6814,6 @@ async fn dispatch_worker(
                 InFlightSenderTaskState {
                     task_id,
                     cancellation: cancellation_token.clone(),
-                    completion: Arc::clone(&completion),
                 },
             )
         };
@@ -6664,18 +6826,16 @@ async fn dispatch_worker(
                 "interrupting previous in-flight request for sender"
             );
             previous.cancellation.cancel();
-            previous.completion.wait().await;
         }
     }
 
     let channel_sessions = Arc::clone(&ctx.channel_sessions);
-    process_channel_message(
+    process_channel_message_with_record(
         ctx,
         msg,
-        cancellation_token,
-        history_key,
+        cancellation_token.clone(),
+        history_key.clone(),
         conversation_id,
-        lease_id,
     )
     .await;
 
@@ -6689,13 +6849,9 @@ async fn dispatch_worker(
         }
     }
 
-    // Complete the turn lease after the body returns (covering every body
-    // return path, including early bails, without auditing each one). A
-    // `reset_session`/`delete_session` that copied this lease's completion
-    // before the body returned unblocks here; the conditional write remains the
-    // final correctness boundary.
-    channel_sessions.complete_turn(&lease).await;
-    completion.mark_done();
+    channel_sessions
+        .unregister_in_flight(&history_key, &cancellation_token)
+        .await;
 }
 
 #[derive(Clone)]
@@ -10845,7 +11001,7 @@ pub async fn start_channels(
     cancel: tokio_util::sync::CancellationToken,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
-    channel_sessions: Arc<zeroclaw_infra::channel_session::ChannelSessionState>,
+    channel_sessions: Arc<zeroclaw_infra::channel_conversation::ChannelConversationStore>,
 ) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
     let config: Config = config_arc.read().clone();
@@ -12475,9 +12631,9 @@ temperature = 0.3
             auto_save_memory: false,
             max_tool_iterations: 0,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -13098,9 +13254,9 @@ temperature = 0.3
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -13558,9 +13714,9 @@ api_key = "anthropic-key"
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -13639,8 +13795,8 @@ api_key = "anthropic-key"
         }));
     }
 
-    #[test]
-    fn append_sender_turn_stores_single_turn_per_call() {
+    #[tokio::test]
+    async fn append_sender_turn_stores_single_turn_per_call() {
         let sender = "telegram_u2".to_string();
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
@@ -13664,9 +13820,9 @@ api_key = "anthropic-key"
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -13721,7 +13877,7 @@ api_key = "anthropic-key"
             .channel_sessions
             .resolve_conversation_id(&sender)
             .unwrap();
-        append_sender_turn(&ctx, &sender, &id, ChatMessage::user("hello"));
+        let _ = append_sender_turn(&ctx, &sender, &id, ChatMessage::user("hello")).await;
 
         let turns = ctx.channel_sessions.load_history(&sender);
         assert!(!turns.is_empty(), "sender history should exist");
@@ -13744,8 +13900,8 @@ api_key = "anthropic-key"
         );
     }
 
-    #[test]
-    fn rollback_orphan_user_turn_removes_only_latest_matching_user_turn() {
+    #[tokio::test]
+    async fn rollback_orphan_user_turn_removes_only_latest_matching_user_turn() {
         let sender = "telegram_u3".to_string();
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
@@ -13769,9 +13925,9 @@ api_key = "anthropic-key"
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -13836,7 +13992,12 @@ api_key = "anthropic-key"
                 .unwrap();
         }
 
-        assert!(rollback_orphan_user_turn(&ctx, &sender, &id, "pending"));
+        assert_eq!(
+            rollback_orphan_user_turn(&ctx, &sender, &id, "pending")
+                .await
+                .unwrap(),
+            zeroclaw_infra::ConditionalSessionWrite::Applied
+        );
 
         let turns = ctx.channel_sessions.load_history(&sender);
         assert!(!turns.is_empty(), "sender history should remain");
@@ -13845,8 +14006,8 @@ api_key = "anthropic-key"
         assert_eq!(turns[1].content, "ok");
     }
 
-    #[test]
-    fn rollback_orphan_user_turn_also_removes_from_session_store() {
+    #[tokio::test]
+    async fn rollback_orphan_user_turn_also_removes_from_session_store() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
             Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
@@ -13887,9 +14048,11 @@ api_key = "anthropic-key"
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                Some(Arc::clone(&store)),
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(Some(
+                    Arc::clone(&store),
+                )),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -13944,12 +14107,17 @@ api_key = "anthropic-key"
             .channel_sessions
             .resolve_conversation_id(&sender)
             .unwrap();
-        assert!(rollback_orphan_user_turn(
-            &ctx,
-            &sender,
-            &id,
-            "[IMAGE:/tmp/photo.jpg]\n\nDescribe this"
-        ));
+        assert_eq!(
+            rollback_orphan_user_turn(
+                &ctx,
+                &sender,
+                &id,
+                "[IMAGE:/tmp/photo.jpg]\n\nDescribe this"
+            )
+            .await
+            .unwrap(),
+            zeroclaw_infra::ConditionalSessionWrite::Applied
+        );
 
         // History view should have 2 turns remaining.
         let turns = ctx.channel_sessions.load_history(&sender);
@@ -14613,9 +14781,9 @@ api_key = "anthropic-key"
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -14750,6 +14918,294 @@ api_key = "anthropic-key"
         fn flush(&self) {}
     }
 
+    /// Provider that blocks inside the LLM call until released, and counts how
+    /// many times the provider was actually entered. Used by the
+    /// `ChannelTurnHarness` to prove a turn blocked in a hook never reaches the
+    /// provider, and a turn blocked in the provider never persists/replies after
+    /// delete.
+    struct CountingBlockingProvider {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        call_count: Arc<AtomicUsize>,
+        reply: String,
+    }
+
+    impl CountingBlockingProvider {
+        fn new(
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            call_count: Arc<AtomicUsize>,
+            reply: &str,
+        ) -> Self {
+            Self {
+                entered,
+                release,
+                call_count,
+                reply: reply.to_string(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CountingBlockingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(self.reply.clone())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(self.reply.clone())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CountingBlockingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CountingBlockingProvider"
+        }
+    }
+
+    /// Hook that blocks inside `on_message_received` until released. Lets the
+    /// harness drive a turn through the real dispatch path and then mutate the
+    /// record (reset/delete) while the turn is still parked in the hook, before
+    /// any provider call or history mutation.
+    struct BlockingMessageReceivedHook {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::hook::HookHandler for BlockingMessageReceivedHook {
+        fn name(&self) -> &str {
+            "blocking-message-received"
+        }
+        async fn on_message_received(
+            &self,
+            message: zeroclaw_api::channel::ChannelMessage,
+        ) -> zeroclaw_api::hook::HookResult<zeroclaw_api::channel::ChannelMessage> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            zeroclaw_api::hook::HookResult::Continue(message)
+        }
+    }
+
+    /// Real-path harness: builds a `ChannelRuntimeContext` wired to a
+    /// `RecordingChannel`, a `RecordingObserver`, an optional blocking hook,
+    /// and an optional counting/blocking provider. Turns are driven through
+    /// `process_channel_message` (the same wrapper `run_channel_message` uses),
+    /// which opens the record, registers the in-flight token, and runs the full
+    /// body — so the hook/provider barriers exercise the real orchestrator path,
+    /// not direct store calls.
+    #[derive(Clone)]
+    struct ChannelTurnHarness {
+        ctx: Arc<ChannelRuntimeContext>,
+        channel: Arc<RecordingChannel>,
+        observer: Arc<RecordingObserver>,
+        hook_entered: Option<Arc<tokio::sync::Notify>>,
+        hook_release: Option<Arc<tokio::sync::Notify>>,
+        provider_entered: Option<Arc<tokio::sync::Notify>>,
+        provider_release: Option<Arc<tokio::sync::Notify>>,
+        provider_call_count: Option<Arc<AtomicUsize>>,
+    }
+
+    impl ChannelTurnHarness {
+        /// Build a harness with a blocking `on_message_received` hook. The turn
+        /// parks in the hook after entering; `release_hook()` unblocks it.
+        fn with_blocking_hook() -> Self {
+            let channel = Arc::new(RecordingChannel::default());
+            let observer = Arc::new(RecordingObserver::default());
+            let hook_entered = Arc::new(tokio::sync::Notify::new());
+            let hook_release = Arc::new(tokio::sync::Notify::new());
+            let mut hook_runner = zeroclaw_runtime::hooks::HookRunner::new();
+            hook_runner.register(Box::new(BlockingMessageReceivedHook {
+                entered: Arc::clone(&hook_entered),
+                release: Arc::clone(&hook_release),
+            }));
+            let ctx = test_runtime_ctx_with_observer(
+                channel.clone(),
+                Arc::new(DummyModelProvider),
+                zeroclaw_config::schema::Config::default(),
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                Some(Arc::new(hook_runner)),
+                observer.clone(),
+            );
+            Self {
+                ctx,
+                channel,
+                observer,
+                hook_entered: Some(hook_entered),
+                hook_release: Some(hook_release),
+                provider_entered: None,
+                provider_release: None,
+                provider_call_count: None,
+            }
+        }
+
+        /// Build a harness with a non-blocking `DummyModelProvider`. Turns run
+        /// to completion synchronously inside `drive()`, so the test can assert
+        /// on history/replies without orchestrating release barriers.
+        fn with_dummy_provider() -> Self {
+            let channel = Arc::new(RecordingChannel::default());
+            let observer = Arc::new(RecordingObserver::default());
+            let ctx = test_runtime_ctx_with_observer(
+                channel.clone(),
+                Arc::new(DummyModelProvider),
+                zeroclaw_config::schema::Config::default(),
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+                observer.clone(),
+            );
+            Self {
+                ctx,
+                channel,
+                observer,
+                hook_entered: None,
+                hook_release: None,
+                provider_entered: None,
+                provider_release: None,
+                provider_call_count: None,
+            }
+        }
+
+        /// Build a harness whose `ChannelConversationStore` is backed by a REAL
+        /// durable JSONL `SessionStore` at `tmp`. Used to regression-test that
+        /// `is_current` / `existing_record_for_test` do not silently drop
+        /// durable JSONL turns (the trait-default `get_session_metadata` leaves
+        /// `conversation_id` unset for JSONL).
+        fn with_jsonl_backend(tmp: &tempfile::TempDir) -> Self {
+            let mut harness = Self::with_dummy_provider();
+            let backend: Arc<dyn SessionBackend> =
+                Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+            let store = Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(Some(
+                    Arc::clone(&backend),
+                )),
+            );
+            let mut ctx = (*harness.ctx).clone();
+            ctx.session_store = Some(backend);
+            ctx.channel_sessions = store;
+            harness.ctx = Arc::new(ctx);
+            harness
+        }
+
+        /// Build a harness with a counting/blocking provider (no hook). The
+        /// turn enters the provider and parks; `release_provider()` unblocks it.
+        fn with_blocking_provider(reply: &str) -> Self {
+            let channel = Arc::new(RecordingChannel::default());
+            let observer = Arc::new(RecordingObserver::default());
+            let provider_entered = Arc::new(tokio::sync::Notify::new());
+            let provider_release = Arc::new(tokio::sync::Notify::new());
+            let call_count = Arc::new(AtomicUsize::new(0));
+            let provider = CountingBlockingProvider::new(
+                Arc::clone(&provider_entered),
+                Arc::clone(&provider_release),
+                Arc::clone(&call_count),
+                reply,
+            );
+            let ctx = test_runtime_ctx_with_observer(
+                channel.clone(),
+                Arc::new(provider),
+                zeroclaw_config::schema::Config::default(),
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+                observer.clone(),
+            );
+            Self {
+                ctx,
+                channel,
+                observer,
+                hook_entered: None,
+                hook_release: None,
+                provider_entered: Some(provider_entered),
+                provider_release: Some(provider_release),
+                provider_call_count: Some(call_count),
+            }
+        }
+
+        async fn provider_call_count(&self) -> usize {
+            self.provider_call_count
+                .as_ref()
+                .map(|c| c.load(Ordering::SeqCst))
+                .unwrap_or(0)
+        }
+
+        fn msg(content: &str, id: &str) -> zeroclaw_api::channel::ChannelMessage {
+            zeroclaw_api::channel::ChannelMessage {
+                id: id.to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-42".to_string(),
+                content: content.to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            }
+        }
+
+        async fn drive(&self, content: &str, id: &str, token: CancellationToken) {
+            process_channel_message(self.ctx.clone(), Self::msg(content, id), token).await;
+        }
+
+        async fn wait_hook_entered(&self) {
+            self.hook_entered
+                .as_ref()
+                .expect("harness has no blocking hook")
+                .notified()
+                .await;
+        }
+
+        fn release_hook(&self) {
+            self.hook_release
+                .as_ref()
+                .expect("harness has no blocking hook")
+                .notify_one();
+        }
+
+        async fn wait_provider_entered(&self) {
+            self.provider_entered
+                .as_ref()
+                .expect("harness has no blocking provider")
+                .notified()
+                .await;
+        }
+
+        fn release_provider(&self) {
+            self.provider_release
+                .as_ref()
+                .expect("harness has no blocking provider")
+                .notify_one();
+        }
+    }
+
     /// Provider stub that cancels the turn's `CancellationToken` from inside
     /// the LLM call and then parks forever, so the orchestrator's
     /// `tokio::select!` deterministically takes the cancelled arm mid-turn.
@@ -14792,60 +15248,6 @@ api_key = "anthropic-key"
         }
         fn alias(&self) -> &str {
             "CancelMidTurnModelProvider"
-        }
-    }
-
-    struct BlockingModelProvider {
-        entered: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-        blocked: std::sync::atomic::AtomicBool,
-    }
-
-    impl BlockingModelProvider {
-        async fn block_once(&self) {
-            if !self.blocked.swap(true, Ordering::AcqRel) {
-                let released = self.release.notified();
-                self.entered.notify_one();
-                released.await;
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ModelProvider for BlockingModelProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> anyhow::Result<String> {
-            self.block_once().await;
-            Ok("old response".to_string())
-        }
-
-        async fn chat_with_history(
-            &self,
-            _messages: &[ChatMessage],
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> anyhow::Result<String> {
-            self.block_once().await;
-            Ok("old response".to_string())
-        }
-    }
-
-    impl ::zeroclaw_api::attribution::Attributable for BlockingModelProvider {
-        fn role(&self) -> ::zeroclaw_api::attribution::Role {
-            ::zeroclaw_api::attribution::Role::Provider(
-                ::zeroclaw_api::attribution::ProviderKind::Model(
-                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
-                ),
-            )
-        }
-
-        fn alias(&self) -> &str {
-            "BlockingModelProvider"
         }
     }
 
@@ -16954,9 +17356,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -17038,9 +17440,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -17156,9 +17558,11 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                Some(Arc::clone(&session_store)),
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(Some(
+                    Arc::clone(&session_store),
+                )),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -17269,9 +17673,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -17419,9 +17823,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -17541,9 +17945,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -17682,9 +18086,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -17806,9 +18210,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -17918,9 +18322,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -18050,9 +18454,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -18206,9 +18610,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
@@ -18381,9 +18785,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -18866,9 +19270,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -18973,9 +19377,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 12,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -19090,9 +19494,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 3,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -19457,9 +19861,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -19600,9 +20004,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -19758,9 +20162,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -19926,9 +20330,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -20070,9 +20474,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -20203,9 +20607,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -20315,9 +20719,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -20442,9 +20846,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -20572,9 +20976,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
-            ))),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -20620,7 +21024,6 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
-            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
         });
@@ -20695,9 +21098,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
-            ))),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -20743,7 +21146,6 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
-            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
         });
@@ -20818,9 +21220,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
-            ))),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -20866,7 +21268,6 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
-            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
         });
@@ -20996,13 +21397,9 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(runtime_ctx.clone(), msg, CancellationToken::new()).await;
 
         let expected_notice = channel_runtime_cli_string("channel-runtime-no-reply-refused");
-        let histories = runtime_ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let turns = histories
-            .peek(history_key.as_str())
-            .expect("history should be stored for sender");
+        let turns = runtime_ctx
+            .channel_sessions
+            .load_history(history_key.as_str());
         let marker = turns
             .iter()
             .rev()
@@ -21058,13 +21455,9 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(runtime_ctx.clone(), msg, CancellationToken::new()).await;
 
         let expected_notice = channel_runtime_cli_string("channel-runtime-no-reply-refused");
-        let histories = runtime_ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let turns = histories
-            .peek(history_key.as_str())
-            .expect("history should be stored for sender");
+        let turns = runtime_ctx
+            .channel_sessions
+            .load_history(history_key.as_str());
         let marker = turns
             .iter()
             .rev()
@@ -21115,13 +21508,13 @@ BTC is currently around $65,000 based on latest tool output."#
             "the orchestrator must not call send on an input-only channel"
         );
         let expected_notice = channel_runtime_cli_string("channel-runtime-no-reply-refused");
-        let histories = runtime_ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let marker = histories
-            .peek(history_key.as_str())
-            .and_then(|turns| turns.iter().rev().find(|turn| turn.role == "assistant"))
+        let turns = runtime_ctx
+            .channel_sessions
+            .load_history(history_key.as_str());
+        let marker = turns
+            .iter()
+            .rev()
+            .find(|turn| turn.role == "assistant")
             .expect("an input-only no-reply turn should retain an internal history marker");
         assert_ne!(
             marker.content, expected_notice,
@@ -21218,9 +21611,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -22872,7 +23265,8 @@ BTC is currently around $65,000 based on latest tool output."#
             &agent_msg,
             Some(&target),
             &agent_history_key,
-            0,
+            "test-id",
+            &CancellationToken::new(),
         )
         .await;
         assert!(handled, "agent-scope command must be handled by dispatch");
@@ -22906,7 +23300,8 @@ BTC is currently around $65,000 based on latest tool output."#
             &agent_msg,
             Some(&target),
             &agent_history_key,
-            0,
+            "test-id",
+            &CancellationToken::new(),
         )
         .await;
         assert!(handled, "command must be handled even when rejected");
@@ -22938,7 +23333,8 @@ BTC is currently around $65,000 based on latest tool output."#
             &user_msg,
             Some(&target),
             &user_history_key,
-            0,
+            "test-id",
+            &CancellationToken::new(),
         )
         .await;
         assert!(handled, "user-scope command must be handled");
@@ -22969,7 +23365,8 @@ BTC is currently around $65,000 based on latest tool output."#
             &agent_msg,
             Some(&target),
             &agent_history_key,
-            0,
+            "test-id",
+            &CancellationToken::new(),
         )
         .await;
         assert!(handled);
@@ -23542,9 +23939,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -23716,9 +24113,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -24171,9 +24568,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -24647,9 +25044,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -24788,9 +25185,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -26652,9 +27049,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -26771,9 +27168,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -26929,9 +27326,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -27185,9 +27582,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -27337,9 +27734,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -27481,9 +27878,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -27645,9 +28042,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -28209,9 +28606,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -30398,9 +30795,8 @@ Done."#;
     fn conversation_id_test_ctx(store: Option<Arc<dyn SessionBackend>>) -> ChannelRuntimeContext {
         let mut ctx = (*router_test_ctx()).clone();
         ctx.session_store = store.clone();
-        ctx.channel_sessions = Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-            store,
-        ));
+        ctx.channel_sessions =
+            Arc::new(zeroclaw_infra::channel_conversation::ChannelConversationStore::new(store));
         ctx.pending_new_sessions = Arc::new(Mutex::new(HashSet::new()));
         ctx
     }
@@ -30447,11 +30843,14 @@ Done."#;
             // mirroring the backend contract (stable once written).
             Ok(format!("stable-{key}"))
         }
+        fn delete_session(&self, _key: &str) -> std::io::Result<bool> {
+            if self.fail_rotate.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected delete failure"));
+            }
+            Ok(true)
+        }
         fn clear_and_rotate_conversation(&self, key: &str) -> std::io::Result<String> {
             self.rotate_calls.fetch_add(1, Ordering::SeqCst);
-            if self.fail_rotate.load(Ordering::SeqCst) {
-                return Err(std::io::Error::other("injected rotate failure"));
-            }
             Ok(format!("rotated-{key}"))
         }
         // Test mock: the stable-id invariant under test is about resolve/rotate,
@@ -30482,24 +30881,91 @@ Done."#;
         }
     }
 
-    #[test]
-    fn channel_conversation_id_memory_only_reuses_same_key_across_turns() {
-        // Same history_key must resolve to the SAME id across turns (different
-        // turn_ids are irrelevant - the id is per-key, not per-turn).
-        let ctx = conversation_id_test_ctx(None);
-        let key = "discord.clamps_123456_alice";
-        let turn_a = uuid::Uuid::new_v4().to_string();
-        let turn_b = uuid::Uuid::new_v4().to_string();
-        assert_ne!(turn_a, turn_b, "test premise: distinct turn ids");
+    #[tokio::test]
+    async fn two_normal_turns_reuse_one_conversation_record() {
+        // Drive two ordinary messages through the real dispatch path and assert
+        // both user turns land in one shared conversation record, the provider
+        // saw "first" in its history, and every observer event carries the same
+        // conversation id.
+        let harness = ChannelTurnHarness::with_dummy_provider();
+        let key = conversation_history_key(&ChannelTurnHarness::msg("first", "m1"));
 
-        let id1 = resolve_channel_conversation_id(&ctx, key).unwrap();
-        let id2 = resolve_channel_conversation_id(&ctx, key).unwrap();
-        assert_eq!(id1, id2, "same key must reuse the same conversation id");
-        assert_ne!(id1, key, "conversation id must never be the history_key");
-        // A valid UUID, not a routing value.
+        harness.drive("first", "m1", CancellationToken::new()).await;
+        harness
+            .drive("second", "m2", CancellationToken::new())
+            .await;
+
+        let record = harness
+            .ctx
+            .channel_sessions
+            .existing_record_for_test(&key)
+            .await
+            .expect("record must exist after two turns");
+        let user_turns: Vec<&ChatMessage> =
+            record.history.iter().filter(|m| m.role == "user").collect();
+        assert_eq!(
+            user_turns.len(),
+            2,
+            "two ordinary turns must persist two user messages"
+        );
         assert!(
-            uuid::Uuid::parse_str(&id1).is_ok(),
-            "memory-only id must be a UUID, got {id1}"
+            record.history.iter().any(|m| m.content.contains("first")),
+            "provider history must contain the first turn: {:?}",
+            record.history
+        );
+
+        let events = harness.observer.events.lock().unwrap();
+        let attributed: Vec<&str> = events
+            .iter()
+            .filter_map(observer_event_conversation_id)
+            .collect();
+        assert!(!attributed.is_empty(), "turns must emit observer events");
+        assert!(
+            attributed.iter().all(|id| *id == record.conversation_id),
+            "every observer event must carry the same conversation id: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_jsonl_turn_persists_and_replies_through_turn_may_continue() {
+        // Regression: the JSONL SessionStore does NOT override
+        // get_session_metadata, so the trait default returns
+        // conversation_id: None. is_current / existing_record_for_test must NOT
+        // rely on that path, or every durable JSONL turn is silently dropped
+        // (turn_may_continue returns false before the provider/reply). Drive a
+        // full turn through the real dispatch path on a JSONL backend and assert
+        // the reply is sent and the history persists.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let harness = ChannelTurnHarness::with_jsonl_backend(&tmp);
+        let ctx = harness.ctx.clone();
+        let key = conversation_history_key(&ChannelTurnHarness::msg("hello", "m1"));
+
+        harness.drive("hello", "m1", CancellationToken::new()).await;
+
+        let sent = harness.channel.sent_messages.lock().await;
+        assert!(
+            sent.iter().any(|m| m.contains("ok")),
+            "durable JSONL turn must send a reply: {sent:?}"
+        );
+        drop(sent);
+
+        // turn_may_continue must report the record current (not silently false).
+        let record = ctx
+            .channel_sessions
+            .existing_record_for_test(&key)
+            .await
+            .expect("durable JSONL record must persist after the turn");
+        assert!(
+            ctx.channel_sessions
+                .is_current(&key, &record.conversation_id)
+                .await
+                .unwrap(),
+            "is_current must be true for the current durable JSONL record"
+        );
+        assert!(
+            record.history.iter().any(|m| m.content.contains("hello")),
+            "durable JSONL history must persist the user turn: {:?}",
+            record.history
         );
     }
 
@@ -30595,33 +31061,76 @@ Done."#;
         assert_ne!(id, key);
     }
 
-    #[test]
-    fn channel_conversation_id_new_session_rotates_target_only_memory() {
-        let ctx = Arc::new(conversation_id_test_ctx(None));
-        let key_a = "discord.clamps_room_alice";
-        let key_b = "discord.clamps_room_bob";
-        let id_a0 = resolve_channel_conversation_id(&ctx, key_a).unwrap();
-        let id_b0 = resolve_channel_conversation_id(&ctx, key_b).unwrap();
+    #[tokio::test]
+    async fn new_deletes_record_and_next_message_creates_new_id() {
+        // Drive a first message through the real dispatch path to mint record A
+        // (with "first" content), then drive `/new` through
+        // `handle_runtime_command_if_needed`. The `/new` reply must carry id_a,
+        // the record must be gone, and the next ordinary message must open a
+        // fresh record B with no "first" content.
+        let harness = ChannelTurnHarness::with_dummy_provider();
+        let ctx = harness.ctx.clone();
+        let key = conversation_history_key(&ChannelTurnHarness::msg("first", "m1"));
 
-        // Acquire the per-key persist lock like the real /new path, then rotate.
-        rotate_conversation_id(&ctx, key_a).unwrap();
+        harness.drive("first", "m1", CancellationToken::new()).await;
 
-        let id_a1 = resolve_channel_conversation_id(&ctx, key_a).unwrap();
-        assert_ne!(id_a0, id_a1, "rotation must mint a fresh id");
+        let id_a = ctx
+            .channel_sessions
+            .existing_record_for_test(&key)
+            .await
+            .expect("record must exist after first turn")
+            .conversation_id;
+
+        let new_msg = ChannelTurnHarness::msg("/new", "m-new");
+        let channel: Arc<dyn Channel> = harness.channel.clone();
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &new_msg,
+            Some(&channel),
+            &key,
+            &id_a,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(handled, "/new must be handled as a runtime command");
+
+        let sent = harness.channel.sent_messages.lock().await;
         assert!(
-            uuid::Uuid::parse_str(&id_a1).is_ok(),
-            "rotated id must be a UUID"
+            sent.iter().any(|m| m.contains(&id_a)),
+            "/new confirmation reply must carry id_a {id_a}: {sent:?}"
         );
-        // B is untouched (target-only rotation).
-        assert_eq!(
-            resolve_channel_conversation_id(&ctx, key_b).unwrap(),
-            id_b0,
-            "rotation must be target-only"
+        drop(sent);
+
+        assert!(
+            ctx.channel_sessions
+                .existing_record_for_test(&key)
+                .await
+                .is_none(),
+            "record must be gone after /new"
+        );
+
+        harness
+            .drive("second", "m2", CancellationToken::new())
+            .await;
+
+        let record_b = ctx
+            .channel_sessions
+            .existing_record_for_test(&key)
+            .await
+            .expect("fresh record must exist after second message");
+        assert_ne!(
+            record_b.conversation_id, id_a,
+            "second message must open a fresh record id"
+        );
+        assert!(
+            !record_b.history.iter().any(|m| m.content.contains("first")),
+            "fresh record must NOT contain the deleted first turn: {:?}",
+            record_b.history
         );
     }
 
-    #[test]
-    fn channel_conversation_id_new_session_rotates_target_only_durable() {
+    #[tokio::test]
+    async fn channel_conversation_id_new_session_rotates_target_only_durable() {
         let tmp = TempDir::new().unwrap();
         let store: Arc<dyn SessionBackend> =
             Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
@@ -30631,7 +31140,7 @@ Done."#;
         let id_a0 = resolve_channel_conversation_id(&ctx, key_a).unwrap();
         let id_b0 = resolve_channel_conversation_id(&ctx, key_b).unwrap();
 
-        rotate_conversation_id(&ctx, key_a).unwrap();
+        ctx.channel_sessions.reset_session(key_a).await.unwrap();
 
         let id_a1 = resolve_channel_conversation_id(&ctx, key_a).unwrap();
         assert_ne!(id_a0, id_a1, "durable rotation must mint a fresh id");
@@ -30690,7 +31199,15 @@ Done."#;
         backend.fail_rotate.store(true, Ordering::SeqCst);
         let recording = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = recording.clone();
-        let handled = handle_runtime_command_if_needed(&ctx, &msg, Some(&channel), &key, 0).await;
+        let handled = handle_runtime_command_if_needed(
+            &ctx,
+            &msg,
+            Some(&channel),
+            &key,
+            &pre_rotate_id,
+            &CancellationToken::new(),
+        )
+        .await;
         backend.fail_rotate.store(false, Ordering::SeqCst);
         assert!(handled, "`/new` must be handled as a runtime command");
 
@@ -30828,9 +31345,10 @@ Done."#;
             let barrier = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
-                // The shared state serializes rotations internally (SQLite
-                // IMMEDIATE tx / JSONL per-key lock), so no external lock.
-                rotate_conversation_id(&ctx, &key).unwrap();
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime
+                    .block_on(ctx.channel_sessions.reset_session(&key))
+                    .unwrap();
             }));
         }
         for h in handles {
@@ -30862,7 +31380,10 @@ Done."#;
             let barrier = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
-                rotate_conversation_id(&ctx, &key).unwrap();
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime
+                    .block_on(ctx.channel_sessions.reset_session(&key))
+                    .unwrap();
             }));
         }
         for h in handles {
@@ -30900,11 +31421,10 @@ Done."#;
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
 
-        // Register the "old turn" lease. Its id is captured before the lease
-        // moves into the spawned turn body (so the test can exclude it from the
-        // reset's cancel+wait, mirroring `/new` excluding the commanding turn).
-        let lease = ctx.channel_sessions.register_turn(key).await;
-        let lease_id = lease.id();
+        let token = CancellationToken::new();
+        ctx.channel_sessions
+            .register_in_flight(key, token.clone())
+            .await;
         let ctx_c = Arc::clone(&ctx);
         let entered_c = Arc::clone(&entered);
         let release_c = Arc::clone(&release);
@@ -30918,7 +31438,6 @@ Done."#;
                 ChatMessage::assistant("stale"),
                 50,
             );
-            ctx_c.channel_sessions.complete_turn(&lease).await;
         });
 
         // Wait until the old turn is blocked inside its body.
@@ -30927,11 +31446,8 @@ Done."#;
         // Reset while the old turn is blocked, excluding it (its lease id) so
         // the reset does not wait on the still-blocked turn (which would
         // deadlock) - mirroring `/new` excluding the commanding turn.
-        let id_b = ctx
-            .channel_sessions
-            .reset_session(key, Some(lease_id))
-            .await
-            .unwrap();
+        let id_b = ctx.channel_sessions.reset_session(key).await.unwrap();
+        assert!(token.is_cancelled());
         assert_ne!(id_a_captured, id_b, "reset must mint a fresh id");
 
         // Release the old turn; its append uses the stale id A.
@@ -30961,76 +31477,59 @@ Done."#;
     }
 
     #[tokio::test]
-    async fn session_lifecycle_old_turn_observer_events_keep_captured_id_after_reset() {
-        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
-        let observer = Arc::new(RecordingObserver::default());
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let ctx = test_runtime_ctx_with_observer(
-            channel,
-            Arc::new(BlockingModelProvider {
-                entered: Arc::clone(&entered),
-                release: Arc::clone(&release),
-                blocked: std::sync::atomic::AtomicBool::new(false),
-            }),
-            zeroclaw_config::schema::Config::default(),
-            zeroclaw_config::schema::AliasedAgentConfig::default(),
-            "test-provider",
-            None,
-            observer.clone(),
-        );
-        let msg = message_sent_hook_test_message();
-        let key = conversation_history_key(&msg);
-        let id_a = ctx.channel_sessions.resolve_conversation_id(&key).unwrap();
-        let lease = ctx.channel_sessions.register_turn(&key).await;
-        let lease_id = lease.id();
-        let worker_ctx = Arc::clone(&ctx);
-        let worker_key = key.clone();
-        let worker_id = id_a.clone();
+    async fn reset_during_hook_prevents_old_turn_from_calling_provider() {
+        // The turn blocks inside the `on_message_received` hook (real dispatch
+        // path). While it is parked there — before any provider call or history
+        // mutation — drive `/new` (reset) on the same key. The old turn must
+        // never call the provider and must never send a reply.
+        let harness = ChannelTurnHarness::with_blocking_hook();
+        let ctx = harness.ctx.clone();
+        let key = conversation_history_key(&ChannelTurnHarness::msg("stale reply", "m1"));
+
+        let worker_harness = harness.clone();
         let worker = zeroclaw_spawn::spawn!(async move {
-            process_channel_message(
-                worker_ctx,
-                msg,
-                CancellationToken::new(),
-                worker_key,
-                worker_id,
-                lease_id,
-            )
-            .await;
+            worker_harness
+                .drive("stale reply", "m1", CancellationToken::new())
+                .await;
         });
+        harness.wait_hook_entered().await;
 
-        entered.notified().await;
-        let id_b = ctx
-            .channel_sessions
-            .reset_session(&key, Some(lease_id))
-            .await
-            .unwrap();
-        assert_ne!(id_a, id_b);
-        release.notify_one();
+        let id_b = ctx.channel_sessions.reset_session(&key).await.unwrap();
+
+        harness.release_hook();
         worker.await.unwrap();
-        ctx.channel_sessions.complete_turn(&lease).await;
 
-        let events = observer.events.lock().unwrap();
-        let attributed: Vec<&str> = events
-            .iter()
-            .filter_map(observer_event_conversation_id)
-            .collect();
-        assert!(!attributed.is_empty(), "old turn must emit observer events");
+        assert_eq!(
+            harness.provider_call_count().await,
+            0,
+            "old turn must never call the provider after reset during the hook"
+        );
+        let sent = harness.channel.sent_messages.lock().await;
         assert!(
-            attributed.iter().all(|id| *id == id_a),
-            "every old-turn observer event must keep UUID A: {events:?}"
+            sent.is_empty(),
+            "old turn must not send any reply: {sent:?}"
         );
-        assert!(ctx.channel_sessions.load_history(&key).is_empty());
-        assert_eq!(
+        drop(sent);
+
+        assert!(
             ctx.channel_sessions
-                .append_history_if_current(&key, &id_a, ChatMessage::assistant("still stale"), 50,)
-                .unwrap(),
-            zeroclaw_infra::session_backend::ConditionalSessionWrite::Stale
+                .existing_record_for_test(&key)
+                .await
+                .is_none()
+                || ctx
+                    .channel_sessions
+                    .existing_record_for_test(&key)
+                    .await
+                    .map(|r| r.conversation_id == id_b)
+                    .unwrap_or(true),
+            "reset must leave no stale record content from the old turn"
         );
-        assert!(ctx.channel_sessions.load_history(&key).is_empty());
-        assert_eq!(
-            ctx.channel_sessions.resolve_conversation_id(&key).unwrap(),
-            id_b
+        assert!(
+            ctx.channel_sessions
+                .load_history(&key)
+                .iter()
+                .all(|m| !m.content.contains("stale reply")),
+            "old turn content must not leak after reset"
         );
     }
 
@@ -31040,73 +31539,54 @@ Done."#;
     /// provider is released, the append gets Deleted and the record is not
     /// recreated.
     #[tokio::test]
-    async fn session_lifecycle_delete_during_blocked_turn_makes_append_deleted() {
-        use zeroclaw_infra::session_backend::ConditionalSessionWrite;
-        let ctx = Arc::new(conversation_id_test_ctx(None));
-        let key = "telegram_alice";
-        let id = ctx.channel_sessions.resolve_conversation_id(key).unwrap();
-        let id_captured = id.clone();
+    async fn delete_during_provider_prevents_old_turn_from_persisting_or_replying() {
+        // Drive a turn with a real blocking provider through the dispatch path.
+        // While the provider is parked, delete the conversation record. The old
+        // turn must not persist a reply and must not send "stale reply".
+        let harness = ChannelTurnHarness::with_blocking_provider("stale reply");
+        let ctx = harness.ctx.clone();
+        let key = conversation_history_key(&ChannelTurnHarness::msg("stale reply", "m1"));
 
-        let release = Arc::new(tokio::sync::Notify::new());
-
-        // The blocked turn races its cancellation token against `release`. On
-        // cancellation it bails (a real worker stops mid-flight) and completes
-        // its lease, so a delete that cancels+waits competing workers resolves.
-        let lease = ctx.channel_sessions.register_turn(key).await;
-        let cancellation_token = lease.cancellation();
-        let ctx_c = Arc::clone(&ctx);
-        let release_c = Arc::clone(&release);
-        let handle = zeroclaw_spawn::spawn!(async move {
-            tokio::select! {
-                _ = release_c.notified() => {
-                    // Released late: append with the captured id (will be Deleted).
-                    let _ = ctx_c
-                        .channel_sessions
-                        .append_history_if_current(key, &id, ChatMessage::assistant("gone"), 50);
-                }
-                _ = cancellation_token.cancelled() => {
-                    // Cancelled by delete: bail without appending.
-                }
-            }
-            ctx_c.channel_sessions.complete_turn(&lease).await;
+        let worker_harness = harness.clone();
+        let worker = zeroclaw_spawn::spawn!(async move {
+            worker_harness
+                .drive("stale reply", "m1", CancellationToken::new())
+                .await;
         });
+        harness.wait_provider_entered().await;
 
-        // Delete cancels + waits for the competing turn (no exclusion - this is
-        // an external delete, not the commanding turn). The turn bails on
-        // cancellation and completes its lease, so delete's wait resolves
-        // deterministically (no sleep).
-        let existed = ctx
-            .channel_sessions
-            .delete_session(key, None)
-            .await
-            .unwrap();
-        assert!(existed, "the record existed before delete");
-
-        // Release the turn (no-op now - it already bailed on cancellation) and
-        // join so the active map is clean.
-        release.notify_one();
-        handle.await.unwrap();
-
-        // An append with the deleted turn's id gets Deleted, not Applied, and
-        // must not recreate the record.
-        assert_eq!(
-            ctx.channel_sessions
-                .append_history_if_current(key, &id_captured, ChatMessage::assistant("again"), 50)
-                .unwrap(),
-            ConditionalSessionWrite::Deleted
+        assert!(
+            ctx.channel_sessions.delete(&key).await.unwrap(),
+            "record must exist before delete"
         );
-        assert!(ctx.channel_sessions.load_history(key).is_empty());
-        // A genuinely new resolve mints a fresh id (the deleted turn cannot
-        // resurrect the old one).
-        let id_after = ctx.channel_sessions.resolve_conversation_id(key).unwrap();
-        assert_ne!(id_captured, id_after);
+
+        harness.release_provider();
+        worker.await.unwrap();
+
+        let sent = harness.channel.sent_messages.lock().await;
+        assert!(
+            sent.iter().all(|m| !m.contains("stale reply")),
+            "old turn must not deliver a stale reply after delete: {sent:?}"
+        );
+        drop(sent);
+
+        let record = ctx.channel_sessions.existing_record_for_test(&key).await;
+        assert!(
+            record.is_none()
+                || record
+                    .clone()
+                    .map(|r| r.history.iter().all(|m| !m.content.contains("stale reply")))
+                    .unwrap_or(true),
+            "old turn reply must not persist after delete: {:?}",
+            record.map(|r| r.history)
+        );
     }
 
     /// Test 3: independent keys. Two different keys each register a turn;
     /// deleting A cancels A's token (and waits for A to bail) but does NOT
     /// cancel B's token and does not change B's id/history.
     #[tokio::test]
-    async fn session_lifecycle_delete_one_key_does_not_cancel_independent_key() {
+    async fn different_history_keys_do_not_block_each_other() {
         let ctx = Arc::new(conversation_id_test_ctx(None));
         let key_a = "discord.clamps_roomA_alice";
         let key_b = "discord.clamps_roomB_bob";
@@ -31117,28 +31597,23 @@ Done."#;
             .append_history_if_current(key_b, &id_b0, ChatMessage::user("b-turn"), 50)
             .unwrap();
 
-        // A's turn bails on cancellation (a real worker stops mid-flight) and
-        // completes its lease, so a delete that cancels+waits A resolves.
-        let lease_a = ctx.channel_sessions.register_turn(key_a).await;
-        let token_a = lease_a.cancellation();
-        let lease_b = ctx.channel_sessions.register_turn(key_b).await;
-        let token_b = lease_b.cancellation();
-        let ctx_c = Arc::clone(&ctx);
+        let token_a = CancellationToken::new();
+        let token_b = CancellationToken::new();
+        ctx.channel_sessions
+            .register_in_flight(key_a, token_a.clone())
+            .await;
+        ctx.channel_sessions
+            .register_in_flight(key_b, token_b.clone())
+            .await;
         let token_a_wait = token_a.clone();
         let handle_a = zeroclaw_spawn::spawn!(async move {
-            // Wait for cancellation; a real worker would abort mid-flight here.
             token_a_wait.cancelled().await;
-            ctx_c.channel_sessions.complete_turn(&lease_a).await;
         });
 
         // Delete A (external delete, no exclusion). A's token is cancelled and
         // A's turn bails; B's token must remain uncancelled and B's id/history
         // unchanged.
-        let existed = ctx
-            .channel_sessions
-            .delete_session(key_a, None)
-            .await
-            .unwrap();
+        let existed = ctx.channel_sessions.delete_session(key_a).await.unwrap();
         assert!(existed, "A existed before delete");
         assert!(token_a.is_cancelled(), "A's token is cancelled by delete");
         assert!(
@@ -31156,9 +31631,10 @@ Done."#;
             "B's history is unchanged"
         );
 
-        // Join A's bailer and clean up B's lease so the active map is empty.
         handle_a.await.unwrap();
-        ctx.channel_sessions.complete_turn(&lease_b).await;
+        ctx.channel_sessions
+            .unregister_in_flight(key_b, &token_b)
+            .await;
     }
 }
 

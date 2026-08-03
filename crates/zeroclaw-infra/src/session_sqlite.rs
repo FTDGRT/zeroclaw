@@ -646,6 +646,22 @@ impl SessionBackend for SqliteSessionBackend {
         .is_ok()
     }
 
+    fn current_conversation_id(&self, session_key: &str) -> std::io::Result<Option<String>> {
+        // Read the column directly instead of routing through get_session_metadata,
+        // so is_current / existing_record_for_test do not depend on every metadata
+        // field being populated and remain efficient on the JSONL parity path.
+        let conn = self.conn.lock();
+        let id: Option<Option<String>> = conn
+            .query_row(
+                "SELECT conversation_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?;
+        Ok(id.flatten())
+    }
+
     fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
         let conn = self.conn.lock();
         let name_val = if name.is_empty() { None } else { Some(name) };

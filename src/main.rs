@@ -4235,7 +4235,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     None
                 };
                 let channel_sessions = Arc::new(
-                    zeroclaw_infra::channel_session::ChannelSessionState::new(channel_backend),
+                    zeroclaw_infra::channel_conversation::ChannelConversationStore::new(
+                        channel_backend,
+                    ),
                 );
 
                 #[cfg(feature = "gateway")]
@@ -5024,7 +5026,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     None
                 };
                 let channel_sessions = Arc::new(
-                    zeroclaw_infra::channel_session::ChannelSessionState::new(channel_backend),
+                    zeroclaw_infra::channel_conversation::ChannelConversationStore::new(
+                        channel_backend,
+                    ),
                 );
                 let result = Box::pin(channels::start_channels(
                     config,
@@ -8077,9 +8081,9 @@ async fn run_gateway_if_enabled(
     } else {
         None
     };
-    let channel_sessions = Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-        channel_backend,
-    ));
+    let channel_sessions = Arc::new(
+        zeroclaw_infra::channel_conversation::ChannelConversationStore::new(channel_backend),
+    );
     let result = Box::pin(gateway::run_gateway(
         host,
         port,

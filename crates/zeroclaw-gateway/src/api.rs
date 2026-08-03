@@ -1899,11 +1899,7 @@ pub async fn handle_api_session_delete(
                 .into_response(),
         }
     } else {
-        match state
-            .channel_sessions
-            .delete_session(&session_key, None)
-            .await
-        {
+        match state.channel_sessions.delete_session(&session_key).await {
             Ok(true) => {
                 Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
             }
@@ -2336,9 +2332,9 @@ pub(crate) mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             session_backend: None,
-            channel_sessions: Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-                None,
-            )),
+            channel_sessions: Arc::new(
+                zeroclaw_infra::channel_conversation::ChannelConversationStore::new(None),
+            ),
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
             device_registry: None,
             pending_pairings: None,
@@ -5199,13 +5195,16 @@ pub(crate) mod tests {
         use zeroclaw_infra::session_backend::ConditionalSessionWrite;
         let tmp = tempfile::TempDir::new().unwrap();
         let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
-        let channel_sessions = Arc::new(zeroclaw_infra::channel_session::ChannelSessionState::new(
-            Some(Arc::clone(&backend)),
-        ));
+        let channel_sessions = Arc::new(
+            zeroclaw_infra::channel_conversation::ChannelConversationStore::new(Some(Arc::clone(
+                &backend,
+            ))),
+        );
         let key = "whatsapp.main_room_alice";
         let id = channel_sessions.resolve_conversation_id(key).unwrap();
-        // Seed a Channel turn so the record exists and an active lease can be
+        // Seed a Channel turn so the record exists and its token can be
         // cancelled by the shared delete.
+        let token = tokio_util::sync::CancellationToken::new();
         channel_sessions
             .append_history_if_current(
                 key,
@@ -5214,15 +5213,10 @@ pub(crate) mod tests {
                 50,
             )
             .unwrap();
-        let lease = channel_sessions.register_turn(key).await;
-        let token = lease.cancellation();
-        // The lease needs a driving task that bails on cancellation, so the
-        // shared delete's cancel+wait resolves (a real worker would abort).
-        let bailer_sessions = Arc::clone(&channel_sessions);
-        let bailer = zeroclaw_spawn::spawn!(async move {
-            lease.cancellation().cancelled().await;
-            bailer_sessions.complete_turn(&lease).await;
-        });
+        channel_sessions
+            .register_in_flight(key, token.clone())
+            .await;
+        // The worker may continue independently after cancellation.
 
         let mut state = test_state(zeroclaw_config::schema::Config::default());
         state.session_backend = Some(Arc::clone(&backend));
@@ -5269,8 +5263,6 @@ pub(crate) mod tests {
                 .contains_key(key),
             "Channel key delete must NOT touch the gateway cancel_tokens map"
         );
-        // Join the bailer so the active map is clean.
-        bailer.await.unwrap();
     }
 
     /// A Channel key with no record deletes to 404 (no record to remove).
@@ -5278,8 +5270,9 @@ pub(crate) mod tests {
     async fn session_delete_channel_key_missing_returns_404() {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
-        let channel_sessions =
-            zeroclaw_infra::channel_session::ChannelSessionState::new(Some(Arc::clone(&backend)));
+        let channel_sessions = zeroclaw_infra::channel_conversation::ChannelConversationStore::new(
+            Some(Arc::clone(&backend)),
+        );
         let mut state = test_state(zeroclaw_config::schema::Config::default());
         state.session_backend = Some(Arc::clone(&backend));
         state.channel_sessions = Arc::new(channel_sessions);

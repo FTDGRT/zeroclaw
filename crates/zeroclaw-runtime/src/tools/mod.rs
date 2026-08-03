@@ -502,7 +502,7 @@ pub fn all_tools(
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
-    channel_sessions: Option<Arc<zeroclaw_infra::channel_session::ChannelSessionState>>,
+    channel_sessions: Option<Arc<zeroclaw_infra::channel_conversation::ChannelConversationStore>>,
 ) -> AllToolsResult {
     all_tools_with_runtime(
         config,
@@ -579,7 +579,7 @@ pub fn all_tools_with_runtime(
     // `Some` from the channel orchestrator (so a Channel-owned target key resets
     // / deletes through the fenced lifecycle); `None` for non-channel callers,
     // which keep the backend-only behavior.
-    channel_sessions: Option<Arc<zeroclaw_infra::channel_session::ChannelSessionState>>,
+    channel_sessions: Option<Arc<zeroclaw_infra::channel_conversation::ChannelConversationStore>>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();

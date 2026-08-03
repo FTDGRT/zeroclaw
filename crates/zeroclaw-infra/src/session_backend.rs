@@ -332,6 +332,17 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
+    /// Read the current conversation id for `session_key` WITHOUT creating a
+    /// record on miss. Returns `None` when the record is absent. Implementations
+    /// MUST be independent of `get_session_metadata` (whose trait default leaves
+    /// `conversation_id` unset for backends like JSONL), otherwise durable
+    /// `is_current`/`existing_record_for_test` checks silently drop every turn.
+    fn current_conversation_id(&self, _session_key: &str) -> std::io::Result<Option<String>> {
+        Ok(self
+            .get_session_metadata(_session_key)
+            .and_then(|metadata| metadata.conversation_id))
+    }
+
     #[doc(hidden)]
     fn resolve_or_create_conversation_id(&self, _key: &str) -> std::io::Result<String> {
         Err(std::io::Error::new(

@@ -76,7 +76,6 @@ impl SessionStore {
         self.sessions_dir
             .join(format!("{}{}", sanitize_session_key(key), META_SUFFIX))
     }
-    #[cfg(test)]
     fn read_conversation_id(&self, key: &str) -> std::io::Result<Option<String>> {
         Ok(self
             .read_record_unlocked(key, false)?
@@ -412,6 +411,13 @@ impl SessionBackend for SessionStore {
     }
     fn session_exists(&self, k: &str) -> bool {
         self.session_path(k).exists()
+    }
+    fn current_conversation_id(&self, k: &str) -> std::io::Result<Option<String>> {
+        // Read the header id directly rather than via get_session_metadata
+        // (whose trait default leaves conversation_id unset for JSONL), so
+        // durable is_current / existing_record_for_test work on the JSONL
+        // backend.
+        self.read_conversation_id(k)
     }
     fn open_conversation(&self, k: &str) -> std::io::Result<ChannelConversationRecord> {
         let _guard = self.mutation_lock.lock();

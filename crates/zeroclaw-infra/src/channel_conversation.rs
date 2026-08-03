@@ -21,10 +21,9 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
-use tokio::sync::{Mutex as TokioMutex, Notify};
+use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::model_provider::ChatMessage;
 
@@ -53,87 +52,6 @@ enum CachedChannelSession {
     DurableHistory(Vec<ChatMessage>),
 }
 
-/// Completion signal for one in-flight turn. A reset/delete that has copied a
-/// turn's `Arc<TurnCompletion>` awaits [`TurnCompletion::wait`]; the worker or
-/// lease drop signals [`TurnCompletion::mark_done`]. Wait registers for
-/// notification before checking the flag, closing the lost-wakeup window while
-/// still allowing a late waiter to return immediately.
-struct TurnCompletion {
-    done: std::sync::atomic::AtomicBool,
-    notify: Notify,
-}
-
-impl TurnCompletion {
-    fn new() -> Self {
-        Self {
-            done: std::sync::atomic::AtomicBool::new(false),
-            notify: Notify::new(),
-        }
-    }
-
-    fn mark_done(&self) {
-        self.done.store(true, Ordering::Release);
-        self.notify.notify_waiters();
-    }
-
-    fn is_done(&self) -> bool {
-        self.done.load(Ordering::Acquire)
-    }
-
-    async fn wait(&self) {
-        let notified = self.notify.notified();
-        if self.is_done() {
-            return;
-        }
-        notified.await;
-    }
-}
-
-/// Registered state for one in-flight turn under a given history key.
-#[derive(Clone)]
-struct ActiveTurnState {
-    cancellation: CancellationToken,
-    completion: Arc<TurnCompletion>,
-}
-
-/// `history_key -> turn_id -> state`. A turn is registered under the key it
-/// captured so reset/delete can find and cancel competing workers for that key
-/// only (independent keys never interfere).
-type ActiveTurnMap = HashMap<String, HashMap<u64, ActiveTurnState>>;
-
-/// Handle returned by [`ChannelSessionState::register_turn`]. The worker keeps
-/// it for the turn's lifetime and calls [`ChannelSessionState::complete_turn`]
-/// on normal return paths for prompt map cleanup. Synchronous `Drop` marks the
-/// completion as a panic/abort safety net; registry operations prune that stale
-/// completed entry later. The commanding turn passes its `id` to
-/// `reset_session`/`delete_session` so the lifecycle op cancels and waits for
-/// the OTHER workers but never itself (which would deadlock).
-pub struct ChannelTurnLease {
-    key: String,
-    id: u64,
-    cancellation: CancellationToken,
-    completion: Arc<TurnCompletion>,
-}
-
-impl ChannelTurnLease {
-    /// Monotonic id of this turn within the active map.
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    /// Cancellation token for this turn. Plumbed into the turn body so a
-    /// competing reset/delete can cancel it mid-flight.
-    pub fn cancellation(&self) -> CancellationToken {
-        self.cancellation.clone()
-    }
-}
-
-impl Drop for ChannelTurnLease {
-    fn drop(&mut self) {
-        self.completion.mark_done();
-    }
-}
-
 /// Shared Channel conversation identity, history, and turn lifecycle for one
 /// daemon iteration.
 ///
@@ -141,14 +59,195 @@ impl Drop for ChannelTurnLease {
 /// (`Arc`) into both the gateway and the channel orchestrator, so an inbound
 /// webhook and the orchestrator's own turn mint site agree on the same id for
 /// a given `conversation_history_key`.
-pub struct ChannelSessionState {
+pub struct ChannelConversationStore {
     backend: Option<Arc<dyn SessionBackend>>,
     cache: Mutex<lru::LruCache<String, CachedChannelSession>>,
-    active_turns: TokioMutex<ActiveTurnMap>,
-    next_turn_id: AtomicU64,
+    persistence_locks: TokioMutex<HashMap<String, Arc<TokioMutex<()>>>>,
+    in_flight: TokioMutex<HashMap<String, Vec<CancellationToken>>>,
 }
 
-impl ChannelSessionState {
+impl ChannelConversationStore {
+    async fn persistence_lock(&self, history_key: &str) -> Arc<TokioMutex<()>> {
+        let mut locks = self.persistence_locks.lock().await;
+        Arc::clone(
+            locks
+                .entry(history_key.to_string())
+                .or_insert_with(|| Arc::new(TokioMutex::new(()))),
+        )
+    }
+
+    /// Open the complete current record, creating it when absent.
+    pub async fn open(
+        &self,
+        history_key: &str,
+    ) -> std::io::Result<crate::ChannelConversationRecord> {
+        let lock = self.persistence_lock(history_key).await;
+        let _guard = lock.lock().await;
+        if let Some(backend) = &self.backend {
+            return backend.open_conversation(history_key);
+        }
+        let mut cache = self.cache.lock();
+        if let Some(CachedChannelSession::Memory(record)) = cache.get(history_key) {
+            return Ok(crate::ChannelConversationRecord {
+                conversation_id: record.conversation_id.clone(),
+                history: record.history.clone(),
+            });
+        }
+        let record = MemorySessionRecord {
+            history: Vec::new(),
+            conversation_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let opened = crate::ChannelConversationRecord {
+            conversation_id: record.conversation_id.clone(),
+            history: Vec::new(),
+        };
+        cache.put(
+            history_key.to_string(),
+            CachedChannelSession::Memory(record),
+        );
+        Ok(opened)
+    }
+
+    /// Check whether an existing record still carries `conversation_id`.
+    pub async fn is_current(
+        &self,
+        history_key: &str,
+        conversation_id: &str,
+    ) -> std::io::Result<bool> {
+        let lock = self.persistence_lock(history_key).await;
+        let _guard = lock.lock().await;
+        if let Some(backend) = &self.backend {
+            return Ok(backend
+                .current_conversation_id(history_key)?
+                .is_some_and(|current| current == conversation_id));
+        }
+        let cache = self.cache.lock();
+        Ok(
+            matches!(cache.peek(history_key), Some(CachedChannelSession::Memory(rec)) if rec.conversation_id == conversation_id),
+        )
+    }
+
+    /// Apply a record-scoped mutation and synchronize the cached history.
+    pub async fn mutate_if_current(
+        &self,
+        history_key: &str,
+        conversation_id: &str,
+        mutation: crate::SessionMutation<'_>,
+    ) -> std::io::Result<crate::ConditionalSessionWrite> {
+        let lock = self.persistence_lock(history_key).await;
+        let _guard = lock.lock().await;
+        if let Some(backend) = &self.backend {
+            let status =
+                backend.mutate_conversation_if_current(history_key, conversation_id, mutation)?;
+            if status == crate::ConditionalSessionWrite::Applied {
+                self.cache.lock().pop(history_key);
+            }
+            return Ok(status);
+        }
+        let mut cache = self.cache.lock();
+        match cache.get_mut(history_key) {
+            Some(CachedChannelSession::Memory(record))
+                if record.conversation_id == conversation_id =>
+            {
+                match mutation {
+                    crate::SessionMutation::Append(message) => record.history.push(message.clone()),
+                    crate::SessionMutation::RemoveLast {
+                        expected_role,
+                        expected_content,
+                    } => {
+                        if record.history.last().is_some_and(|message| {
+                            message.role == expected_role && message.content == expected_content
+                        }) {
+                            record.history.pop();
+                        }
+                    }
+                    crate::SessionMutation::UpdateLast(message) => {
+                        if let Some(last) = record.history.last_mut() {
+                            *last = message.clone();
+                        }
+                    }
+                }
+                Ok(crate::ConditionalSessionWrite::Applied)
+            }
+            Some(CachedChannelSession::Memory(_)) => Ok(crate::ConditionalSessionWrite::Stale),
+            _ => Ok(crate::ConditionalSessionWrite::Deleted),
+        }
+    }
+
+    /// Delete the complete conversation record.
+    pub async fn delete(&self, history_key: &str) -> std::io::Result<bool> {
+        self.cancel_in_flight(history_key).await;
+        let lock = self.persistence_lock(history_key).await;
+        let _guard = lock.lock().await;
+        let existed = if let Some(backend) = &self.backend {
+            backend.delete_session(history_key)?
+        } else {
+            self.cache.lock().pop(history_key).is_some()
+        };
+        if self.backend.is_some() {
+            self.cache.lock().pop(history_key);
+        }
+        Ok(existed)
+    }
+
+    pub async fn register_in_flight(&self, history_key: &str, token: CancellationToken) {
+        self.in_flight
+            .lock()
+            .await
+            .entry(history_key.to_string())
+            .or_default()
+            .push(token);
+    }
+
+    pub async fn unregister_in_flight(&self, history_key: &str, token: &CancellationToken) {
+        token.cancel();
+        let mut in_flight = self.in_flight.lock().await;
+        if let Some(tokens) = in_flight.get_mut(history_key) {
+            tokens.retain(|registered| !registered.is_cancelled());
+            if tokens.is_empty() {
+                in_flight.remove(history_key);
+            }
+        }
+    }
+
+    pub async fn cancel_in_flight(&self, history_key: &str) {
+        let tokens = self
+            .in_flight
+            .lock()
+            .await
+            .get(history_key)
+            .cloned()
+            .unwrap_or_default();
+        for token in tokens {
+            token.cancel();
+        }
+    }
+
+    pub async fn reset_session(&self, history_key: &str) -> std::io::Result<String> {
+        self.cancel_in_flight(history_key).await;
+        let lock = self.persistence_lock(history_key).await;
+        let _guard = lock.lock().await;
+        if let Some(backend) = &self.backend {
+            let id = backend.clear_and_rotate_conversation(history_key)?;
+            self.cache.lock().pop(history_key);
+            return Ok(id);
+        }
+        let mut cache = self.cache.lock();
+        let id = uuid::Uuid::new_v4().to_string();
+        cache.put(
+            history_key.to_string(),
+            CachedChannelSession::Memory(MemorySessionRecord {
+                history: Vec::new(),
+                conversation_id: id.clone(),
+            }),
+        );
+        Ok(id)
+    }
+
+    pub async fn delete_session(&self, history_key: &str) -> std::io::Result<bool> {
+        self.delete(history_key).await
+    }
+
     /// Wrap an optional durable backend. `None` selects memory-only mode.
     pub fn new(backend: Option<Arc<dyn SessionBackend>>) -> Self {
         Self {
@@ -157,8 +256,8 @@ impl ChannelSessionState {
                 NonZeroUsize::new(MAX_CHANNEL_SESSIONS)
                     .expect("channel session capacity is non-zero"),
             )),
-            active_turns: TokioMutex::new(HashMap::new()),
-            next_turn_id: AtomicU64::new(0),
+            persistence_locks: TokioMutex::new(HashMap::new()),
+            in_flight: TokioMutex::new(HashMap::new()),
         }
     }
 
@@ -172,8 +271,8 @@ impl ChannelSessionState {
             cache: Mutex::new(lru::LruCache::new(
                 NonZeroUsize::new(capacity).expect("test capacity is non-zero"),
             )),
-            active_turns: TokioMutex::new(HashMap::new()),
-            next_turn_id: AtomicU64::new(0),
+            persistence_locks: TokioMutex::new(HashMap::new()),
+            in_flight: TokioMutex::new(HashMap::new()),
         }
     }
 
@@ -425,126 +524,6 @@ impl ChannelSessionState {
         }
     }
 
-    // ── active-turn lease / lifecycle fencing ──────────────────────────
-
-    /// Register a new in-flight turn for `key` and return a lease. The worker
-    /// keeps the lease for the turn's lifetime and calls
-    /// [`ChannelSessionState::complete_turn`] on EVERY return path. The
-    /// returned [`ChannelTurnLease::cancellation`] is plumbed into the turn
-    /// body so a competing reset/delete can cancel it mid-flight.
-    pub async fn register_turn(&self, key: &str) -> ChannelTurnLease {
-        let id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
-        let cancellation = CancellationToken::new();
-        let completion = Arc::new(TurnCompletion::new());
-        let state = ActiveTurnState {
-            cancellation: cancellation.clone(),
-            completion: Arc::clone(&completion),
-        };
-        {
-            let mut turns = self.active_turns.lock().await;
-            let per_key = turns.entry(key.to_string()).or_default();
-            per_key.retain(|_, active| !active.completion.is_done());
-            per_key.insert(id, state);
-        }
-        ChannelTurnLease {
-            key: key.to_string(),
-            id,
-            cancellation,
-            completion,
-        }
-    }
-
-    /// Remove the turn from the active map and signal its completion so any
-    /// reset/delete waiting on it proceeds. Every worker return path MUST call
-    /// this. The active-map lock is released before `mark_done` (sync) so the
-    /// signaling never blocks on the map.
-    pub async fn complete_turn(&self, lease: &ChannelTurnLease) {
-        {
-            let mut turns = self.active_turns.lock().await;
-            if let Some(per_key) = turns.get_mut(&lease.key) {
-                per_key.remove(&lease.id);
-                if per_key.is_empty() {
-                    turns.remove(&lease.key);
-                }
-            }
-        }
-        lease.completion.mark_done();
-    }
-
-    /// Cancel every in-flight turn for `key` except `exclude_turn_id`, then
-    /// await each one's completion. Used by `reset_session`/`delete_session`
-    /// to drain competing workers before mutating. The active-map lock is held
-    /// only long enough to COPY the tokens/completions; cancel and await happen
-    /// after release so no mutex is held across `.await` and a turn completing
-    /// concurrently with the copy still resolves correctly (it is either
-    /// copied-then-awaited, or already removed and absent from the copy).
-    async fn cancel_and_wait(&self, key: &str, exclude_turn_id: Option<u64>) {
-        let to_cancel: Vec<(CancellationToken, Arc<TurnCompletion>)> = {
-            let mut turns = self.active_turns.lock().await;
-            let mut remove_key = false;
-            let to_cancel = turns
-                .get_mut(key)
-                .map(|per_key| {
-                    per_key.retain(|_, state| !state.completion.is_done());
-                    remove_key = per_key.is_empty();
-                    per_key
-                        .iter()
-                        .filter(|(id, _)| Some(**id) != exclude_turn_id)
-                        .map(|(_, state)| {
-                            (state.cancellation.clone(), Arc::clone(&state.completion))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if remove_key {
-                turns.remove(key);
-            }
-            to_cancel
-        };
-        for (token, _) in &to_cancel {
-            token.cancel();
-        }
-        for (_, completion) in &to_cancel {
-            completion.wait().await;
-        }
-    }
-
-    /// Rotate the record to a fresh id (clearing history), after cancelling and
-    /// waiting for every competing turn for `key` except `exclude_turn_id`. The
-    /// commanding `/new`/`/clear` turn passes `Some(its own id)` so it never
-    /// waits on itself (which would deadlock); gateway API and sessions tools
-    /// pass `None`. Returns the fresh id, or the backend error verbatim.
-    pub async fn reset_session(
-        &self,
-        key: &str,
-        exclude_turn_id: Option<u64>,
-    ) -> std::io::Result<String> {
-        self.cancel_and_wait(key, exclude_turn_id).await;
-        self.clear_and_rotate_conversation(key)
-    }
-
-    /// Remove the record entirely, after cancelling and waiting for every
-    /// competing turn for `key` except `exclude_turn_id`. Returns `Ok(false)`
-    /// if the record was absent; a subsequent stale-worker expected-id write
-    /// then gets `Deleted`. Durable deletes the backend record and drops the
-    /// cache entry; memory-only drops the cache entry.
-    pub async fn delete_session(
-        &self,
-        key: &str,
-        exclude_turn_id: Option<u64>,
-    ) -> std::io::Result<bool> {
-        self.cancel_and_wait(key, exclude_turn_id).await;
-        let existed = if let Some(backend) = &self.backend {
-            backend.delete_session(key)?
-        } else {
-            self.cache.lock().pop(key).is_some()
-        };
-        if self.backend.is_some() {
-            self.cache.lock().pop(key);
-        }
-        Ok(existed)
-    }
-
     /// Number of `Memory` records in the cache. Test-only observable for the
     /// "durable mode never creates a Memory record" invariant; not production
     /// API.
@@ -557,16 +536,6 @@ impl ChannelSessionState {
             .count()
     }
 
-    #[cfg(test)]
-    async fn active_turn_count_for_test(&self) -> usize {
-        self.active_turns
-            .lock()
-            .await
-            .values()
-            .map(HashMap::len)
-            .sum()
-    }
-
     /// All cached history keys (memory or durable). Test-intended observable so
     /// integration tests in downstream crates that previously iterated the
     /// orchestrator's history map can still enumerate which senders have a
@@ -575,6 +544,37 @@ impl ChannelSessionState {
     /// production callers.
     pub fn cached_keys_for_test(&self) -> Vec<String> {
         self.cache.lock().iter().map(|(k, _)| k.clone()).collect()
+    }
+
+    /// Test-only snapshot of the current record for `history_key`, returning
+    /// `None` when the record is absent. Mirrors the open path's id+history view
+    /// WITHOUT creating a record on miss, so a harness can assert "gone after
+    /// delete" without recreating it. Durable mode reads the backend id via
+    /// metadata (no create); memory-only peeks the LRU. Kept `pub` (not
+    /// `cfg(test)`) because downstream test crates compile this crate in non-test
+    /// mode; it is a read-only accessor with no production callers.
+    pub async fn existing_record_for_test(
+        &self,
+        history_key: &str,
+    ) -> Option<crate::ChannelConversationRecord> {
+        if let Some(backend) = &self.backend {
+            let id = backend
+                .current_conversation_id(history_key)
+                .ok()
+                .flatten()?;
+            return Some(crate::ChannelConversationRecord {
+                conversation_id: id,
+                history: backend.load(history_key),
+            });
+        }
+        let cache = self.cache.lock();
+        match cache.peek(history_key) {
+            Some(CachedChannelSession::Memory(rec)) => Some(crate::ChannelConversationRecord {
+                conversation_id: rec.conversation_id.clone(),
+                history: rec.history.clone(),
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn memory_only_reuses_one_uuid_per_history_key() {
-        let state = ChannelSessionState::new(None);
+        let state = ChannelConversationStore::new(None);
 
         let first = state
             .resolve_conversation_id("whatsapp.main_room_alice")
@@ -723,7 +723,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend: Arc<dyn SessionBackend> =
             Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
-        let state = ChannelSessionState::new(Some(Arc::clone(&backend)));
+        let state = ChannelConversationStore::new(Some(Arc::clone(&backend)));
 
         let first = state
             .resolve_conversation_id("linq.main_chat_alice")
@@ -756,7 +756,7 @@ mod tests {
         // N threads resolve the same fresh key concurrently: the mutex around
         // the LRU serializes them so exactly ONE UUID wins and is reused, with
         // no duplicate entry materialized under contention.
-        let state = Arc::new(ChannelSessionState::new(None));
+        let state = Arc::new(ChannelConversationStore::new(None));
         let key = Arc::new("whatsapp.main_room_alice".to_string());
         let n = 8;
         let barrier = Arc::new(std::sync::Barrier::new(n));
@@ -790,7 +790,7 @@ mod tests {
         // capacity-2 cache: insert A/B, touch A, insert C -> B's WHOLE record is
         // evicted. Re-resolving B mints a fresh id + empty history, never a
         // fresh id + old history.
-        let state = ChannelSessionState::with_capacity(None, 2);
+        let state = ChannelConversationStore::with_capacity(None, 2);
         let key_a = "k_a";
         let key_b = "k_b";
         let key_c = "k_c";
@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn memory_rollback_keeps_record_and_does_not_rotate_id() {
-        let state = ChannelSessionState::new(None);
+        let state = ChannelConversationStore::new(None);
         let key = "rollback_key";
         let id = state.resolve_conversation_id(key).unwrap();
         state
@@ -836,7 +836,7 @@ mod tests {
 
     #[test]
     fn memory_append_after_rotate_is_stale_and_does_not_recreate() {
-        let state = ChannelSessionState::new(None);
+        let state = ChannelConversationStore::new(None);
         let key = "stale_key";
         let id_a = state.resolve_conversation_id(key).unwrap();
         let id_b = state.clear_and_rotate_conversation(key).unwrap();
@@ -857,12 +857,12 @@ mod tests {
 
     #[test]
     fn memory_append_after_delete_is_deleted() {
-        let state = ChannelSessionState::new(None);
+        let state = ChannelConversationStore::new(None);
         let key = "deleted_key";
         let id = state.resolve_conversation_id(key).unwrap();
         // Memory-only delete drops the cache entry.
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let existed = runtime.block_on(state.delete_session(key, None)).unwrap();
+        let existed = runtime.block_on(state.delete_session(key)).unwrap();
         assert!(existed);
         assert_eq!(
             state
@@ -877,64 +877,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_completion_wait_returns_when_already_done() {
-        let completion = TurnCompletion::new();
-        completion.mark_done();
-        tokio::time::timeout(std::time::Duration::from_secs(1), completion.wait())
-            .await
-            .expect("late waiter must observe completed turn");
-    }
-
-    #[tokio::test]
-    async fn aborted_turn_lease_does_not_block_reset_and_is_pruned() {
-        let state = Arc::new(ChannelSessionState::new(None));
-        let key = "aborted_reset";
+    async fn reset_cancels_without_waiting_for_worker() {
+        let state = ChannelConversationStore::new(None);
+        let key = "reset_without_wait";
         let id_a = state.resolve_conversation_id(key).unwrap();
-        let lease = state.register_turn(key).await;
-        let entered = Arc::new(Notify::new());
-        let entered_task = Arc::clone(&entered);
-        let task = zeroclaw_spawn::spawn!(async move {
-            let _lease = lease;
-            entered_task.notify_one();
-            std::future::pending::<()>().await;
-        });
-        entered.notified().await;
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        let token = CancellationToken::new();
+        state.register_in_flight(key, token.clone()).await;
 
-        let id_b = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            state.reset_session(key, None),
-        )
-        .await
-        .expect("aborted lease must not wedge reset")
-        .unwrap();
+        let id_b = state.reset_session(key).await.unwrap();
+        assert!(token.is_cancelled());
         assert_ne!(id_a, id_b);
-        assert_eq!(state.active_turn_count_for_test().await, 0);
     }
 
     #[tokio::test]
-    async fn aborted_turn_lease_does_not_block_delete_and_is_pruned() {
-        let state = Arc::new(ChannelSessionState::new(None));
-        let key = "aborted_delete";
+    async fn delete_cancels_without_waiting_for_worker() {
+        let state = ChannelConversationStore::new(None);
+        let key = "delete_without_wait";
         state.resolve_conversation_id(key).unwrap();
-        let lease = state.register_turn(key).await;
-        let task = zeroclaw_spawn::spawn!(async move {
-            let _lease = lease;
-            std::future::pending::<()>().await;
-        });
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        let token = CancellationToken::new();
+        state.register_in_flight(key, token.clone()).await;
 
-        let existed = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            state.delete_session(key, None),
-        )
-        .await
-        .expect("aborted lease must not wedge delete")
-        .unwrap();
-        assert!(existed);
-        assert_eq!(state.active_turn_count_for_test().await, 0);
+        assert!(state.delete_session(key).await.unwrap());
+        assert!(token.is_cancelled());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -958,7 +922,7 @@ mod tests {
             lifecycle_done: lifecycle_tx,
         });
         let backend: Arc<dyn SessionBackend> = backend_impl;
-        let state = Arc::new(ChannelSessionState::new(Some(backend)));
+        let state = Arc::new(ChannelConversationStore::new(Some(backend)));
 
         let loader_state = Arc::clone(&state);
         let loader = tokio::task::spawn_blocking(move || loader_state.load_history(key));
@@ -966,8 +930,7 @@ mod tests {
             .await
             .unwrap();
         let reset_state = Arc::clone(&state);
-        let reset =
-            zeroclaw_spawn::spawn!(async move { reset_state.reset_session(key, None).await });
+        let reset = zeroclaw_spawn::spawn!(async move { reset_state.reset_session(key).await });
         tokio::task::spawn_blocking(move || lifecycle_rx.recv().unwrap())
             .await
             .unwrap();
@@ -999,7 +962,7 @@ mod tests {
             lifecycle_done: lifecycle_tx,
         });
         let backend: Arc<dyn SessionBackend> = backend_impl;
-        let state = Arc::new(ChannelSessionState::new(Some(backend)));
+        let state = Arc::new(ChannelConversationStore::new(Some(backend)));
 
         let compact_state = Arc::clone(&state);
         let expected = id_a.clone();
@@ -1010,8 +973,7 @@ mod tests {
             .await
             .unwrap();
         let reset_state = Arc::clone(&state);
-        let reset =
-            zeroclaw_spawn::spawn!(async move { reset_state.reset_session(key, None).await });
+        let reset = zeroclaw_spawn::spawn!(async move { reset_state.reset_session(key).await });
         tokio::task::spawn_blocking(move || lifecycle_rx.recv().unwrap())
             .await
             .unwrap();
@@ -1027,7 +989,7 @@ mod tests {
 
     #[test]
     fn memory_compact_is_conditional_on_id() {
-        let state = ChannelSessionState::new(None);
+        let state = ChannelConversationStore::new(None);
         let key = "compact_key";
         let id = state.resolve_conversation_id(key).unwrap();
         for content in ["one", "two", "three", "four"] {
