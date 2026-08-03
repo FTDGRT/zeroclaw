@@ -1,8 +1,8 @@
 //! SQLite-backed session persistence with FTS5 search.
 
 use crate::session_backend::{
-    ConditionalSessionWrite, SessionBackend, SessionContext, SessionMetadata, SessionQuery,
-    SessionState,
+    ChannelConversationRecord, ConditionalSessionWrite, SessionBackend, SessionContext,
+    SessionMetadata, SessionMutation, SessionQuery, SessionState,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -14,6 +14,21 @@ use zeroclaw_api::model_provider::ChatMessage;
 /// SQLite-backed session store with FTS5 and WAL mode.
 pub struct SqliteSessionBackend {
     conn: Mutex<Connection>,
+}
+
+fn ensure_column(conn: &Connection, column: &str, ddl: &str) -> Result<()> {
+    let present: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') WHERE name = ?1",
+            params![column],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("Failed to probe session_metadata.{column}"))?;
+    if !present {
+        conn.execute(ddl, [])
+            .with_context(|| format!("Failed to add session_metadata.{column}"))?;
+    }
+    Ok(())
 }
 
 impl SqliteSessionBackend {
@@ -74,59 +89,24 @@ impl SqliteSessionBackend {
         )
         .context("Failed to initialize session schema")?;
 
-        // Migration: add name column to existing databases
-        let has_name: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') WHERE name = 'name'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        if !has_name {
-            let _ = conn.execute("ALTER TABLE session_metadata ADD COLUMN name TEXT", []);
-        }
-
-        // Migration: add state tracking columns
-        let has_state: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') WHERE name = 'state'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        if !has_state {
-            let _ = conn.execute(
-                "ALTER TABLE session_metadata ADD COLUMN state TEXT NOT NULL DEFAULT 'idle'",
-                [],
-            );
-            let _ = conn.execute("ALTER TABLE session_metadata ADD COLUMN turn_id TEXT", []);
-            let _ = conn.execute(
-                "ALTER TABLE session_metadata ADD COLUMN turn_started_at TEXT",
-                [],
-            );
-        }
-
-        // Migration: add agent_alias column for per-agent attribution
-        let has_agent_alias: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') WHERE name = 'agent_alias'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        if !has_agent_alias {
-            let _ = conn.execute(
-                "ALTER TABLE session_metadata ADD COLUMN agent_alias TEXT",
-                [],
-            );
-            let _ = conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_session_metadata_agent_alias \
-                 ON session_metadata(agent_alias)",
-                [],
-            );
-        }
-
         for (column, ddl) in [
+            ("name", "ALTER TABLE session_metadata ADD COLUMN name TEXT"),
+            (
+                "state",
+                "ALTER TABLE session_metadata ADD COLUMN state TEXT NOT NULL DEFAULT 'idle'",
+            ),
+            (
+                "turn_id",
+                "ALTER TABLE session_metadata ADD COLUMN turn_id TEXT",
+            ),
+            (
+                "turn_started_at",
+                "ALTER TABLE session_metadata ADD COLUMN turn_started_at TEXT",
+            ),
+            (
+                "agent_alias",
+                "ALTER TABLE session_metadata ADD COLUMN agent_alias TEXT",
+            ),
             (
                 "channel_id",
                 "ALTER TABLE session_metadata ADD COLUMN channel_id TEXT",
@@ -139,42 +119,21 @@ impl SqliteSessionBackend {
                 "sender_id",
                 "ALTER TABLE session_metadata ADD COLUMN sender_id TEXT",
             ),
-            // Cross-turn conversation identity. Nullable: legacy rows keep
-            // NULL until first `resolve_or_create_conversation_id`
-            // backfills it. The UUID is a fact of record creation, persisted
-            // by the backend - never computed from `session_key`.
             (
                 "conversation_id",
                 "ALTER TABLE session_metadata ADD COLUMN conversation_id TEXT",
             ),
         ] {
-            let present: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') \
-                     WHERE name = ?1",
-                    params![column],
-                    |row| row.get(0),
-                )
-                .unwrap_or(false);
-            if !present {
-                let _ = conn.execute(ddl, []);
-            }
+            ensure_column(&conn, column, ddl)?;
         }
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_session_metadata_channel_id \
-             ON session_metadata(channel_id)",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_session_metadata_room_id \
-             ON session_metadata(room_id)",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_session_metadata_sender_id \
-             ON session_metadata(sender_id)",
-            [],
-        );
+        for ddl in [
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_agent_alias ON session_metadata(agent_alias)",
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_channel_id ON session_metadata(channel_id)",
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_room_id ON session_metadata(room_id)",
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_sender_id ON session_metadata(sender_id)",
+        ] {
+            conn.execute(ddl, [])?;
+        }
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -190,143 +149,155 @@ impl SqliteSessionBackend {
     /// increments `migrated`). Idempotent: a session already present in the
     /// DB is skipped so a retried migration does not duplicate messages.
     pub fn migrate_from_jsonl(&self, workspace_dir: &Path) -> Result<usize> {
-        let sessions_dir = workspace_dir.join("sessions");
-        let entries = match std::fs::read_dir(&sessions_dir) {
-            Ok(e) => e,
-            Err(_) => return Ok(0),
-        };
-
+        let source = crate::session_store::SessionStore::new(workspace_dir)?;
         let mut migrated = 0;
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let name = match entry.file_name().into_string() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            let Some(key) = name.strip_suffix(".jsonl") else {
-                continue;
-            };
-
-            let path = entry.path();
-            let file = match std::fs::File::open(&path) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-
-            // Read the sidecar's conversation_id (if any) BEFORE the message
-            // loop so it is written in the same commit as the messages.
-            let sidecar_path = path.with_extension("meta.json");
-            let sidecar_conversation_id = std::fs::read_to_string(&sidecar_path)
-                .ok()
-                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-                .and_then(|v| {
-                    v.get("conversation_id")
-                        .and_then(|x| x.as_str().map(str::to_string))
-                })
-                .filter(|s| !s.is_empty());
-
-            // Parse all messages first so the insert runs in one transaction.
-            let reader = std::io::BufReader::new(file);
-            let mut messages: Vec<ChatMessage> = Vec::new();
-            for line in std::io::BufRead::lines(reader) {
-                let Ok(line) = line else { continue };
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
+        for key in source.list_sessions() {
+            let imported = source.with_locked_conversation(&key, |load, path| {
+                let mut conn = self.conn.lock();
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(std::io::Error::other)?;
+                let already: bool = tx
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM session_metadata WHERE session_key = ?1",
+                        params![key],
+                        |row| row.get(0),
+                    )
+                    .map_err(std::io::Error::other)?;
+                if already {
+                    return Ok(false);
                 }
-                if let Ok(msg) = serde_json::from_str::<ChatMessage>(trimmed) {
-                    messages.push(msg);
-                }
-            }
-            if messages.is_empty() {
-                continue;
-            }
-
-            let mut conn = self.conn.lock();
-            // Idempotency: skip sessions already present in the DB. A real DB
-            // error here MUST propagate (not be masked as "absent"): the
-            // message inserts below are plain `INSERT INTO sessions` with no
-            // ON CONFLICT (the `sessions` table has no unique constraint), so
-            // a false "absent" would duplicate every message.
-            let already: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM session_metadata WHERE session_key = ?1",
-                    params![key],
-                    |row| row.get(0),
-                )
-                .context("Failed to read idempotency probe")?;
-            if already {
-                continue;
-            }
-
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .context("Failed to begin migration transaction")?;
-            let now = Utc::now().to_rfc3339();
-            // Upsert metadata with the sidecar id (if any) and the correct
-            // message_count, in the same transaction as the messages.
-            tx.execute(
-                "INSERT INTO session_metadata
-                    (session_key, created_at, last_activity, message_count, conversation_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(session_key) DO UPDATE SET
-                    last_activity = excluded.last_activity,
-                    message_count = excluded.message_count,
-                    conversation_id = COALESCE(excluded.conversation_id, session_metadata.conversation_id)",
-                params![key, now, now, messages.len() as i64, sidecar_conversation_id],
-            )?;
-            for msg in &messages {
+                let Some(record) = load()? else {
+                    return Ok(false);
+                };
+                let now = Utc::now().to_rfc3339();
                 tx.execute(
-                    "INSERT INTO sessions (session_key, role, content, created_at)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![key, msg.role, msg.content, now],
-                )?;
+                    "INSERT INTO session_metadata
+                        (session_key, created_at, last_activity, message_count, conversation_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        key,
+                        now,
+                        now,
+                        record.history.len() as i64,
+                        record.conversation_id
+                    ],
+                )
+                .map_err(std::io::Error::other)?;
+                for message in record.history {
+                    tx.execute(
+                        "INSERT INTO sessions (session_key, role, content, created_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![key, message.role, message.content, now],
+                    )
+                    .map_err(std::io::Error::other)?;
+                }
+                tx.commit().map_err(std::io::Error::other)?;
+                drop(conn);
+                std::fs::rename(path, path.with_extension("jsonl.migrated"))?;
+                Ok(true)
+            })?;
+            if imported {
+                migrated += 1;
             }
-            tx.commit()
-                .context("Failed to commit migration transaction")?;
-            drop(conn);
-
-            // Rename ONLY after commit; a rename failure is an error.
-            let migrated_path = path.with_extension("jsonl.migrated");
-            std::fs::rename(&path, &migrated_path)
-                .with_context(|| format!("Failed to rename migrated file {:?}", path))?;
-            migrated += 1;
         }
-
         Ok(migrated)
     }
 }
 
-/// Classify a conditional write against the session record's current
-/// conversation id, inside the caller's already-open `IMMEDIATE` transaction.
-/// A missing metadata row or a NULL/empty id means the record is gone
-/// (`Deleted`); a present-but-different id means it was rotated (`Stale`);
-/// only an exact match is `Applied`. NULL/empty ids are treated as deleted
-/// here - ONLY the resolve path backfills legacy ids, never the conditional
-/// writers.
-fn classify_conversation(
-    tx: &rusqlite::Transaction<'_>,
-    session_key: &str,
-    expected: &str,
-) -> rusqlite::Result<ConditionalSessionWrite> {
-    let current = tx
-        .query_row(
-            "SELECT conversation_id FROM session_metadata WHERE session_key = ?1",
-            params![session_key],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?;
-    Ok(match current.flatten().filter(|id| !id.is_empty()) {
-        None => ConditionalSessionWrite::Deleted,
-        Some(current) if current != expected => ConditionalSessionWrite::Stale,
-        Some(_) => ConditionalSessionWrite::Applied,
-    })
-}
-
 impl SessionBackend for SqliteSessionBackend {
+    fn resolve_or_create_conversation_id(&self, key: &str) -> std::io::Result<String> {
+        Ok(self.open_conversation(key)?.conversation_id)
+    }
+    fn clear_and_rotate_conversation(&self, key: &str) -> std::io::Result<String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute("INSERT INTO session_metadata(session_key,created_at,last_activity,message_count) VALUES(?1,?2,?3,0) ON CONFLICT(session_key) DO NOTHING", params![key,now,now]).map_err(std::io::Error::other)?;
+        tx.execute("DELETE FROM sessions WHERE session_key=?1", params![key])
+            .map_err(std::io::Error::other)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        tx.execute("UPDATE session_metadata SET message_count=0,last_activity=?1,conversation_id=?2 WHERE session_key=?3", params![now,id,key]).map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(id)
+    }
+    fn append_if_conversation_matches(
+        &self,
+        key: &str,
+        id: &str,
+        message: &ChatMessage,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        self.mutate_conversation_if_current(key, id, SessionMutation::Append(message))
+    }
+    fn remove_last_if_conversation_matches(
+        &self,
+        key: &str,
+        expected: &str,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let current: Option<Option<String>> = tx
+            .query_row(
+                "SELECT conversation_id FROM session_metadata WHERE session_key=?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?;
+        let Some(Some(current)) = current else {
+            return Ok(ConditionalSessionWrite::Deleted);
+        };
+        let valid = |id: &str| uuid::Uuid::parse_str(id).is_ok_and(|u| u.get_version_num() == 4);
+        if !valid(&current) || !valid(expected) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "conversation identity is not UUID v4",
+            ));
+        }
+        if current != expected {
+            return Ok(ConditionalSessionWrite::Stale);
+        }
+        let last: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM sessions WHERE session_key=?1 ORDER BY id DESC LIMIT 1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?;
+        if let Some(id) = last {
+            tx.execute("DELETE FROM sessions WHERE id=?1", params![id])
+                .map_err(std::io::Error::other)?;
+        }
+        let count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE session_key=?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        tx.execute(
+            "UPDATE session_metadata SET message_count=?1 WHERE session_key=?2",
+            params![count, key],
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(ConditionalSessionWrite::Applied)
+    }
+
+    fn update_last_if_conversation_matches(
+        &self,
+        key: &str,
+        id: &str,
+        message: &ChatMessage,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        self.mutate_conversation_if_current(key, id, SessionMutation::UpdateLast(message))
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
         let mut stmt = match conn
@@ -1019,244 +990,123 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(())
     }
 
-    /// Atomically resolve-or-create the conversation id for a session record.
-    ///
-    /// Runs in a single `IMMEDIATE` transaction so that two independent
-    /// connections (or processes) that hit a never-resolved key converge on
-    /// one id: the first writer to acquire the RESERVED lock backfills the
-    /// column; every later transaction reads the committed value. The
-    /// `busy_timeout` pragma makes a contended `BEGIN IMMEDIATE` block instead
-    /// of returning `SQLITE_BUSY`, so convergence is deterministic.
-    fn resolve_or_create_conversation_id(&self, session_key: &str) -> std::io::Result<String> {
+    fn open_conversation(&self, session_key: &str) -> std::io::Result<ChannelConversationRecord> {
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(std::io::Error::other)?;
         let now = Utc::now().to_rfc3339();
-
-        // Ensure a metadata row exists so the conversation id has a home.
-        // `resolve` may be called before the first `append`, so we can't rely
-        // on a prior row. `ON CONFLICT DO NOTHING` keeps `created_at` stable
-        // for existing rows.
-        tx.execute(
-            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
-             VALUES (?1, ?2, ?3, 0)
-             ON CONFLICT(session_key) DO NOTHING",
-            params![session_key, now, now],
-        )
-        .map_err(std::io::Error::other)?;
-
-        // Read the committed value (NULL/empty for a legacy or fresh row).
+        tx.execute("INSERT INTO session_metadata(session_key,created_at,last_activity,message_count) VALUES(?1,?2,?3,0) ON CONFLICT(session_key) DO NOTHING",params![session_key,now,now]).map_err(std::io::Error::other)?;
         let existing: Option<String> = tx
             .query_row(
-                "SELECT conversation_id FROM session_metadata WHERE session_key = ?1",
+                "SELECT conversation_id FROM session_metadata WHERE session_key=?1",
                 params![session_key],
-                |row| row.get::<_, Option<String>>(0),
+                |r| r.get(0),
             )
-            .ok()
-            .flatten();
-
-        let resolved = match existing.filter(|id| !id.is_empty()) {
-            Some(id) => id,
-            None => {
-                let candidate = uuid::Uuid::new_v4().to_string();
-                // Upsert-if-null/empty: only write when no value is committed.
-                // Under the IMMEDIATE lock no concurrent writer can race this,
-                // but the predicate is kept defensive so a non-IMMEDIATE
-                // caller path could not clobber a winner.
-                tx.execute(
-                    "UPDATE session_metadata SET conversation_id = ?1
-                     WHERE session_key = ?2
-                       AND (conversation_id IS NULL OR conversation_id = '')",
-                    params![candidate, session_key],
-                )
-                .map_err(std::io::Error::other)?;
-                // Re-read the committed value (the fact, not the candidate).
-                tx.query_row(
-                    "SELECT conversation_id FROM session_metadata WHERE session_key = ?1",
-                    params![session_key],
-                    |row| row.get::<_, String>(0),
-                )
-                .map_err(std::io::Error::other)?
+            .map_err(std::io::Error::other)?;
+        let id = if let Some(id) = existing.filter(|s| !s.is_empty()) {
+            let u = uuid::Uuid::parse_str(&id)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            if u.get_version_num() != 4 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "conversation id is not UUID v4",
+                ));
             }
+            id
+        } else {
+            let id = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "UPDATE session_metadata SET conversation_id=?1 WHERE session_key=?2",
+                params![id, session_key],
+            )
+            .map_err(std::io::Error::other)?;
+            id
         };
-
-        tx.commit().map_err(std::io::Error::other)?;
-        Ok(resolved)
-    }
-
-    /// Atomically clear history + rotate the conversation id in one
-    /// record-scoped `IMMEDIATE` transaction. The fresh id is the fact of the
-    /// new conversation; it is returned (not re-derived by the caller). This
-    /// is the `/new`/`/clear` path - `remove_last`, `update_last`, `compact`,
-    /// and crash repair intentionally do NOT rotate.
-    fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String> {
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(std::io::Error::other)?;
-        let now = Utc::now().to_rfc3339();
-
-        // Ensure a metadata row exists (rotate may be requested before any
-        // message was appended).
-        tx.execute(
-            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
-             VALUES (?1, ?2, ?3, 0)
-             ON CONFLICT(session_key) DO NOTHING",
-            params![session_key, now, now],
-        )
-        .map_err(std::io::Error::other)?;
-
-        // Clear the history. The FTS5 `sessions_ad` trigger keeps the index in
-        // sync with the row deletion.
-        tx.execute(
-            "DELETE FROM sessions WHERE session_key = ?1",
-            params![session_key],
-        )
-        .map_err(std::io::Error::other)?;
-
-        // Fresh id + message_count reset + activity stamp, together.
-        let new_id = uuid::Uuid::new_v4().to_string();
-        tx.execute(
-            "UPDATE session_metadata
-             SET message_count = 0, last_activity = ?1, conversation_id = ?2
-             WHERE session_key = ?3",
-            params![now, new_id, session_key],
-        )
-        .map_err(std::io::Error::other)?;
-
-        tx.commit().map_err(std::io::Error::other)?;
-        Ok(new_id)
-    }
-
-    /// Append `message` iff the record still carries `expected_conversation_id`,
-    /// all in one `IMMEDIATE` transaction. The classify read, the message
-    /// INSERT, and the metadata UPDATE commit together; a stale or deleted
-    /// record is left untouched (the empty transaction rolls back on drop).
-    fn append_if_conversation_matches(
-        &self,
-        session_key: &str,
-        expected_conversation_id: &str,
-        message: &ChatMessage,
-    ) -> std::io::Result<ConditionalSessionWrite> {
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(std::io::Error::other)?;
-
-        let status = classify_conversation(&tx, session_key, expected_conversation_id)
-            .map_err(std::io::Error::other)?;
-        if status != ConditionalSessionWrite::Applied {
-            // No writes: drop the transaction (rollback) and return the status.
-            return Ok(status);
-        }
-
-        let now = Utc::now().to_rfc3339();
-        tx.execute(
-            "INSERT INTO sessions (session_key, role, content, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![session_key, message.role, message.content, now],
-        )
-        .map_err(std::io::Error::other)?;
-        tx.execute(
-            "UPDATE session_metadata
-             SET last_activity = ?1, message_count = message_count + 1
-             WHERE session_key = ?2",
-            params![now, session_key],
-        )
-        .map_err(std::io::Error::other)?;
-
-        tx.commit().map_err(std::io::Error::other)?;
-        Ok(ConditionalSessionWrite::Applied)
-    }
-
-    /// Remove the last message iff the record still carries
-    /// `expected_conversation_id`, in one `IMMEDIATE` transaction. A matching
-    /// record with no messages is a no-op mutation that still reports `Applied`
-    /// (the caller's preconditions remain authoritative).
-    fn remove_last_if_conversation_matches(
-        &self,
-        session_key: &str,
-        expected_conversation_id: &str,
-    ) -> std::io::Result<ConditionalSessionWrite> {
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(std::io::Error::other)?;
-
-        let status = classify_conversation(&tx, session_key, expected_conversation_id)
-            .map_err(std::io::Error::other)?;
-        if status != ConditionalSessionWrite::Applied {
-            return Ok(status);
-        }
-
-        let last_id: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM sessions WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
-                params![session_key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(std::io::Error::other)?
-            .flatten();
-        if let Some(id) = last_id {
-            tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])
+        let history = {
+            let mut stmt = tx
+                .prepare("SELECT role,content FROM sessions WHERE session_key=?1 ORDER BY id ASC")
                 .map_err(std::io::Error::other)?;
-            tx.execute(
-                "UPDATE session_metadata SET message_count = MAX(0, message_count - 1)
-                 WHERE session_key = ?1",
-                params![session_key],
-            )
-            .map_err(std::io::Error::other)?;
-        }
-
+            let rows = stmt
+                .query_map(params![session_key], |r| {
+                    Ok(ChatMessage {
+                        role: r.get(0)?,
+                        content: r.get(1)?,
+                    })
+                })
+                .map_err(std::io::Error::other)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(std::io::Error::other)?
+        };
         tx.commit().map_err(std::io::Error::other)?;
-        Ok(ConditionalSessionWrite::Applied)
+        Ok(ChannelConversationRecord {
+            conversation_id: id,
+            history,
+        })
     }
-
-    /// Update the last message in place iff the record still carries
-    /// `expected_conversation_id`, in one `IMMEDIATE` transaction. A matching
-    /// record with no messages is a no-op that still reports `Applied`.
-    fn update_last_if_conversation_matches(
+    fn mutate_conversation_if_current(
         &self,
         session_key: &str,
-        expected_conversation_id: &str,
-        message: &ChatMessage,
+        expected: &str,
+        mutation: SessionMutation<'_>,
     ) -> std::io::Result<ConditionalSessionWrite> {
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(std::io::Error::other)?;
-
-        let status = classify_conversation(&tx, session_key, expected_conversation_id)
-            .map_err(std::io::Error::other)?;
-        if status != ConditionalSessionWrite::Applied {
-            return Ok(status);
-        }
-
-        let last_id: Option<i64> = tx
+        let current: Option<Option<String>> = tx
             .query_row(
-                "SELECT id FROM sessions WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+                "SELECT conversation_id FROM session_metadata WHERE session_key=?1",
                 params![session_key],
-                |row| row.get(0),
+                |r| r.get(0),
             )
             .optional()
-            .map_err(std::io::Error::other)?
-            .flatten();
-        if let Some(id) = last_id {
-            let now = Utc::now().to_rfc3339();
-            tx.execute(
-                "UPDATE sessions SET role = ?1, content = ?2 WHERE id = ?3",
-                params![message.role, message.content, id],
-            )
             .map_err(std::io::Error::other)?;
-            tx.execute(
-                "UPDATE session_metadata SET last_activity = ?1 WHERE session_key = ?2",
-                params![now, session_key],
-            )
-            .map_err(std::io::Error::other)?;
+        let Some(Some(current)) = current else {
+            return Ok(ConditionalSessionWrite::Deleted);
+        };
+        let valid_v4 =
+            |id: &str| uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.get_version_num() == 4);
+        if !valid_v4(&current) || !valid_v4(expected) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "conversation identity is not UUID v4",
+            ));
         }
-
+        if current != expected {
+            return Ok(ConditionalSessionWrite::Stale);
+        }
+        let now = Utc::now().to_rfc3339();
+        match mutation {
+            SessionMutation::Append(m) => {
+                tx.execute(
+                    "INSERT INTO sessions(session_key,role,content,created_at) VALUES(?1,?2,?3,?4)",
+                    params![session_key, m.role, m.content, now],
+                )
+                .map_err(std::io::Error::other)?;
+            }
+            SessionMutation::RemoveLast {
+                expected_role,
+                expected_content,
+            } => {
+                tx.execute("DELETE FROM sessions WHERE id=(SELECT id FROM sessions WHERE session_key=?1 AND role=?2 AND content=?3 AND id=(SELECT MAX(id) FROM sessions WHERE session_key=?1))",params![session_key,expected_role,expected_content]).map_err(std::io::Error::other)?;
+            }
+            SessionMutation::UpdateLast(m) => {
+                tx.execute("UPDATE sessions SET role=?1,content=?2 WHERE id=(SELECT MAX(id) FROM sessions WHERE session_key=?3)",params![m.role,m.content,session_key]).map_err(std::io::Error::other)?;
+            }
+        }
+        let count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE session_key=?1",
+                params![session_key],
+                |r| r.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        tx.execute(
+            "UPDATE session_metadata SET message_count=?1,last_activity=?2 WHERE session_key=?3",
+            params![count, now, session_key],
+        )
+        .map_err(std::io::Error::other)?;
         tx.commit().map_err(std::io::Error::other)?;
         Ok(ConditionalSessionWrite::Applied)
     }
@@ -1266,6 +1116,25 @@ impl SessionBackend for SqliteSessionBackend {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn sqlite_schema_probe_and_alter_errors_propagate() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE session_metadata (session_key TEXT)", [])
+            .unwrap();
+        assert!(ensure_column(&conn, "session_key", "invalid ddl").is_ok());
+        let error = ensure_column(
+            &conn,
+            "missing",
+            "ALTER TABLE missing_table ADD COLUMN x TEXT",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to add session_metadata.missing")
+        );
+    }
 
     #[test]
     fn round_trip_sqlite() {
@@ -2013,43 +1882,24 @@ mod tests {
     }
 
     #[test]
-    fn conversation_id_concurrent_resolve_converges() {
+    fn sqlite_open_conversation_concurrent_first_open_converges() {
         use std::sync::{Arc, Barrier};
-        use std::thread;
-
         let tmp = TempDir::new().unwrap();
-        // Two independent backend instances (separate connections) on the
-        // same db file - the IMMEDIATE txn + busy_timeout must serialize
-        // them onto one id.
         let a = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
         let b = SqliteSessionBackend::new(tmp.path()).unwrap();
         let barrier = Arc::new(Barrier::new(2));
-        let key = "conv_concurrent";
-
-        let bar = barrier.clone();
-        let a_c = a.clone();
-        let h1 = thread::spawn(move || {
-            bar.wait();
-            a_c.resolve_or_create_conversation_id(key).unwrap()
+        let a2 = Arc::clone(&a);
+        let b1 = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            b1.wait();
+            a2.open_conversation("same").unwrap().conversation_id
         });
-        let bar2 = barrier.clone();
-        let h2 = thread::spawn(move || {
-            bar2.wait();
-            b.resolve_or_create_conversation_id(key).unwrap()
+        let b2 = Arc::clone(&barrier);
+        let second = std::thread::spawn(move || {
+            b2.wait();
+            b.open_conversation("same").unwrap().conversation_id
         });
-        let id1 = h1.join().unwrap();
-        let id2 = h2.join().unwrap();
-
-        assert!(!id1.is_empty() && !id2.is_empty());
-        assert_eq!(
-            id1, id2,
-            "two concurrent first-access resolves must converge on one id"
-        );
-
-        // A third fresh instance must read the same committed id.
-        let c = SqliteSessionBackend::new(tmp.path()).unwrap();
-        let id3 = c.resolve_or_create_conversation_id(key).unwrap();
-        assert_eq!(id3, id1);
+        assert_eq!(first.join().unwrap(), second.join().unwrap());
     }
 
     #[test]
@@ -2113,113 +1963,54 @@ mod tests {
     // ── crash / delete / migration hardening tests ───────────────────
 
     #[test]
-    fn delete_session_rolls_back_when_second_statement_fails() {
-        // Inject a REAL failure: a BEFORE DELETE trigger on session_metadata
-        // raises ABORT, forcing the second DELETE inside `delete_session` to
-        // fail. With the single-IMMEDIATE-transaction rewrite the first
-        // DELETE (messages) must roll back, so both messages and metadata
-        // survive the aborted call.
+    fn delete_session_rolls_back_when_metadata_delete_fails() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
         backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.conn.lock().execute(
+            "CREATE TRIGGER fail_metadata_delete BEFORE DELETE ON session_metadata BEGIN SELECT RAISE(ABORT, 'injected failure'); END", [],
+        ).unwrap();
+        assert!(backend.delete_session("s1").is_err());
+        assert_eq!(backend.load("s1").len(), 1);
+        assert!(backend.session_exists("s1"));
+    }
 
-        {
-            let conn = backend.conn.lock();
-            conn.execute(
-                "CREATE TRIGGER fail_metadata_delete BEFORE DELETE ON session_metadata
-                 BEGIN
-                     SELECT RAISE(ABORT, 'injected failure');
-                 END",
-                [],
-            )
+    #[test]
+    fn migrate_from_single_jsonl_snapshot_preserves_id_and_history() {
+        let tmp = TempDir::new().unwrap();
+        let source = crate::session_store::SessionStore::new(tmp.path()).unwrap();
+        let opened = source.open_conversation("snapshot").unwrap();
+        source
+            .append("snapshot", &ChatMessage::user("hello"))
             .unwrap();
-        }
-        let result = backend.delete_session("s1");
-        assert!(
-            result.is_err(),
-            "delete must error when second statement fails"
-        );
-        // Rollback worked: messages and metadata both still present.
-        assert!(
-            !backend.load("s1").is_empty(),
-            "messages must survive rollback"
-        );
-        assert!(
-            backend
-                .list_sessions_with_metadata()
-                .iter()
-                .any(|m| m.key == "s1"),
-            "metadata must survive rollback"
-        );
+        source
+            .append("snapshot", &ChatMessage::assistant("hi"))
+            .unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(backend.migrate_from_jsonl(tmp.path()).unwrap(), 1);
+        let migrated = backend.open_conversation("snapshot").unwrap();
+        assert_eq!(migrated.conversation_id, opened.conversation_id);
+        assert_eq!(migrated.history.len(), 2);
+        assert!(tmp.path().join("sessions/snapshot.jsonl.migrated").exists());
     }
 
     #[test]
-    fn migrate_from_jsonl_carries_over_sidecar_conversation_id() {
+    fn migrate_existing_target_skips_without_upgrading_or_renaming_source() {
         let tmp = TempDir::new().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions_dir).unwrap();
-
-        let key = "sidecar_user";
-        let jsonl_path = sessions_dir.join(format!("{key}.jsonl"));
-        std::fs::write(&jsonl_path, "{\"role\":\"user\",\"content\":\"hello\"}\n").unwrap();
-        let meta_path = sessions_dir.join(format!("{key}.meta.json"));
-        std::fs::write(&meta_path, "{\"conversation_id\":\"conv-abc-123\"}\n").unwrap();
-
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let source_path = sessions.join("existing.jsonl");
+        std::fs::write(&source_path, "{\"role\":\"user\",\"content\":\"legacy\"}\n").unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        let migrated = backend.migrate_from_jsonl(tmp.path()).unwrap();
-        assert_eq!(migrated, 1);
-
-        let meta = backend
-            .list_sessions_with_metadata()
-            .into_iter()
-            .find(|m| m.key == key)
-            .expect("migrated session must be listed");
-        assert_eq!(
-            meta.conversation_id.as_deref(),
-            Some("conv-abc-123"),
-            "sidecar conversation_id must be carried over"
-        );
-        assert_eq!(
-            meta.message_count, 1,
-            "message_count must reflect the migrated message"
-        );
-
-        // Idempotency: re-running migrate finds no `.jsonl` (renamed to
-        // `.jsonl.migrated`) -> 0, and messages are NOT duplicated.
-        let migrated_again = backend.migrate_from_jsonl(tmp.path()).unwrap();
-        assert_eq!(migrated_again, 0, "re-migrate must skip the renamed file");
-        assert_eq!(
-            backend.load(key).len(),
-            1,
-            "re-migrate must not duplicate messages"
-        );
-    }
-
-    #[test]
-    fn migrate_from_jsonl_without_sidecar_leaves_conversation_id_unset() {
-        let tmp = TempDir::new().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions_dir).unwrap();
-
-        let key = "no_sidecar_user";
-        let jsonl_path = sessions_dir.join(format!("{key}.jsonl"));
-        std::fs::write(&jsonl_path, "{\"role\":\"user\",\"content\":\"hello\"}\n").unwrap();
-        // No sidecar file: a legacy JSONL with no recorded identity.
-
-        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        let migrated = backend.migrate_from_jsonl(tmp.path()).unwrap();
-        assert_eq!(migrated, 1);
-
-        let meta = backend
-            .list_sessions_with_metadata()
-            .into_iter()
-            .find(|m| m.key == key)
-            .expect("migrated session must be listed");
+        backend.open_conversation("existing").unwrap();
+        assert_eq!(backend.migrate_from_jsonl(tmp.path()).unwrap(), 0);
+        assert!(source_path.exists());
+        assert!(!source_path.with_extension("jsonl.migrated").exists());
         assert!(
-            meta.conversation_id.is_none(),
-            "conversation_id must be unset when no sidecar is present"
+            !std::fs::read_to_string(source_path)
+                .unwrap()
+                .contains("session_meta")
         );
-        assert_eq!(meta.message_count, 1);
     }
 
     // ── conditional-write (conversation-id fence) tests ───────────────
@@ -2230,6 +2021,86 @@ mod tests {
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
         let backend: &dyn SessionBackend = &backend;
         crate::session_backend::assert_conditional_write_contract(backend);
+    }
+
+    #[test]
+    fn sqlite_legacy_rollback_updates_message_count_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let key = "legacy_rollback";
+        backend.append(key, &ChatMessage::user("one")).unwrap();
+        backend.append(key, &ChatMessage::assistant("two")).unwrap();
+        let id = backend.open_conversation(key).unwrap().conversation_id;
+        assert_eq!(
+            backend
+                .remove_last_if_conversation_matches(key, &id)
+                .unwrap(),
+            ConditionalSessionWrite::Applied
+        );
+        assert_eq!(backend.load(key).len(), 1);
+        assert_eq!(backend.get_session_metadata(key).unwrap().message_count, 1);
+        assert_eq!(
+            backend
+                .remove_last_if_conversation_matches(key, &id)
+                .unwrap(),
+            ConditionalSessionWrite::Applied
+        );
+        assert!(backend.load(key).is_empty());
+        assert_eq!(backend.get_session_metadata(key).unwrap().message_count, 0);
+        assert_eq!(
+            backend
+                .remove_last_if_conversation_matches(key, &id)
+                .unwrap(),
+            ConditionalSessionWrite::Applied
+        );
+        assert_eq!(
+            backend
+                .remove_last_if_conversation_matches(key, &uuid::Uuid::new_v4().to_string())
+                .unwrap(),
+            ConditionalSessionWrite::Stale
+        );
+        backend.delete_session(key).unwrap();
+        assert_eq!(
+            backend
+                .remove_last_if_conversation_matches(key, &id)
+                .unwrap(),
+            ConditionalSessionWrite::Deleted
+        );
+    }
+
+    #[test]
+    fn conditional_write_rejects_malformed_conversation_ids() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let key = "malformed";
+        let record = backend.open_conversation(key).unwrap();
+        assert!(
+            backend
+                .mutate_conversation_if_current(
+                    key,
+                    "not-a-uuid",
+                    SessionMutation::Append(&ChatMessage::user("bad")),
+                )
+                .is_err()
+        );
+        backend
+            .conn
+            .lock()
+            .execute(
+                "UPDATE session_metadata SET conversation_id = 'also-bad' WHERE session_key = ?1",
+                params![key],
+            )
+            .unwrap();
+        assert!(
+            backend
+                .mutate_conversation_if_current(
+                    key,
+                    &record.conversation_id,
+                    SessionMutation::Append(&ChatMessage::user("bad")),
+                )
+                .is_err()
+        );
+        assert!(backend.load(key).is_empty());
     }
 
     #[test]

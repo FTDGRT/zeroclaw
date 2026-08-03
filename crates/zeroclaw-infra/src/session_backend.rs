@@ -71,6 +71,38 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// A channel conversation and its persisted identity.
+#[derive(Debug, Clone)]
+pub struct ChannelConversationRecord {
+    pub conversation_id: String,
+    pub history: Vec<ChatMessage>,
+}
+
+impl PartialEq for ChannelConversationRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.conversation_id == other.conversation_id
+            && self.history.len() == other.history.len()
+            && self
+                .history
+                .iter()
+                .zip(&other.history)
+                .all(|(left, right)| left.role == right.role && left.content == right.content)
+    }
+}
+
+impl Eq for ChannelConversationRecord {}
+
+/// One atomic mutation of a channel conversation.
+#[derive(Debug, Clone, Copy)]
+pub enum SessionMutation<'a> {
+    Append(&'a ChatMessage),
+    RemoveLast {
+        expected_role: &'a str,
+        expected_content: &'a str,
+    },
+    UpdateLast(&'a ChatMessage),
+}
+
 /// Outcome of a conversation-id-fenced session write.
 ///
 /// A history append / update / rollback / compaction is conditional on the
@@ -276,71 +308,79 @@ pub trait SessionBackend: Send + Sync {
         Vec::new()
     }
 
-    /// Atomically resolve-or-create the cross-turn conversation identity for
-    /// a session record. The UUID is a fact of record creation, generated
-    /// server-side and persisted; `session_key` only locates the record.
-    ///
-    /// Concurrency contract: two independent backend instances (or two
-    /// processes) that resolve the same key for the first time MUST converge
-    /// on one and the same id. In durable mode the backend record is the
-    /// single source of truth; legacy rows (NULL/empty id) are backfilled
-    /// on first resolve. Production backends MUST NOT provide a "fresh UUID
-    /// every call" default - the id is stable once written.
-    ///
-    /// No default implementation is provided so that every mock is forced to
-    /// declare its behavior explicitly.
-    fn resolve_or_create_conversation_id(&self, session_key: &str) -> std::io::Result<String>;
+    /// Open the current conversation record, creating an empty UUID-v4 record
+    /// when it is absent. Backends without channel-record support return
+    /// `Unsupported` by default so third-party implementations remain source
+    /// compatible.
+    fn open_conversation(&self, _session_key: &str) -> std::io::Result<ChannelConversationRecord> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "channel conversation records are unsupported",
+        ))
+    }
 
-    /// Atomically clear the session history AND rotate the conversation id
-    /// in a single record-scoped operation. Returns the fresh id.
-    ///
-    /// This is ONE atomic op (clear history + new id together), NOT a
-    /// caller-composed `delete + resolve`. `remove_last`, `update_last`,
-    /// `compact`, and crash repair do NOT rotate the id. No default
-    /// implementation is provided.
-    fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String>;
+    /// Apply one mutation only while the record carries the expected identity.
+    fn mutate_conversation_if_current(
+        &self,
+        _session_key: &str,
+        _expected_conversation_id: &str,
+        _mutation: SessionMutation<'_>,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "conditional channel conversation writes are unsupported",
+        ))
+    }
 
-    /// Append `message` to the session ONLY if its record still carries
-    /// `expected_conversation_id`. The read of the current id, the message
-    /// write, and the metadata update MUST land in one record-scoped atomic
-    /// operation (a single transaction / per-key lock) so a concurrent
-    /// `/new` rotation or delete cannot interleave. Returns
-    /// [`ConditionalSessionWrite::Applied`] on match, `Stale` if the id was
-    /// rotated, `Deleted` if the record is gone. A real I/O / DB error stays
-    /// `Err` - it MUST NOT degrade to `Stale`/`Deleted`. Conditional methods
-    /// MUST NOT create the metadata record (`INSERT ... ON CONFLICT` to create
-    /// is forbidden); only the resolve path may backfill a legacy id. No
-    /// default implementation is provided so every mock declares its semantics.
+    #[doc(hidden)]
+    fn resolve_or_create_conversation_id(&self, _key: &str) -> std::io::Result<String> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "legacy conversation identity API is unsupported",
+        ))
+    }
+    #[doc(hidden)]
+    fn clear_and_rotate_conversation(&self, _key: &str) -> std::io::Result<String> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "legacy conversation rotation API is unsupported",
+        ))
+    }
+    #[doc(hidden)]
     fn append_if_conversation_matches(
         &self,
-        session_key: &str,
-        expected_conversation_id: &str,
-        message: &ChatMessage,
-    ) -> std::io::Result<ConditionalSessionWrite>;
-
-    /// Remove the last message ONLY if the record still carries
-    /// `expected_conversation_id`. Same atomicity and error contract as
-    /// [`SessionBackend::append_if_conversation_matches`]. With no messages the
-    /// result is still `Applied` when the id matches (a no-op mutation), so the
-    /// caller's preconditions remain the source of truth. No default
-    /// implementation is provided.
+        _key: &str,
+        _id: &str,
+        _message: &ChatMessage,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "legacy conditional conversation API is unsupported",
+        ))
+    }
+    #[doc(hidden)]
     fn remove_last_if_conversation_matches(
         &self,
-        session_key: &str,
-        expected_conversation_id: &str,
-    ) -> std::io::Result<ConditionalSessionWrite>;
-
-    /// Update the last message in place ONLY if the record still carries
-    /// `expected_conversation_id`. Same atomicity and error contract as
-    /// [`SessionBackend::append_if_conversation_matches`]. With no messages the
-    /// result is still `Applied` when the id matches (caller decides via its
-    /// own preconditions). No default implementation is provided.
+        _key: &str,
+        _id: &str,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "legacy conditional conversation API is unsupported",
+        ))
+    }
+    #[doc(hidden)]
     fn update_last_if_conversation_matches(
         &self,
-        session_key: &str,
-        expected_conversation_id: &str,
-        message: &ChatMessage,
-    ) -> std::io::Result<ConditionalSessionWrite>;
+        _key: &str,
+        _id: &str,
+        _message: &ChatMessage,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "legacy conditional conversation API is unsupported",
+        ))
+    }
 }
 
 /// Session state information.
@@ -361,39 +401,120 @@ pub struct SessionState {
 #[cfg(test)]
 pub(crate) fn assert_conditional_write_contract(backend: &dyn SessionBackend) {
     let key = "channel.main_room_alice";
-    let current = backend.resolve_or_create_conversation_id(key).unwrap();
+    let opened = backend.open_conversation(key).unwrap();
+    let parsed = uuid::Uuid::parse_str(&opened.conversation_id).unwrap();
+    assert_eq!(parsed.get_version_num(), 4);
+    assert!(opened.history.is_empty());
 
+    let reopened = backend.open_conversation(key).unwrap();
+    assert_eq!(reopened.conversation_id, opened.conversation_id);
+    assert!(reopened.history.is_empty());
+
+    let user = ChatMessage::user("before");
     assert_eq!(
         backend
-            .append_if_conversation_matches(key, &current, &ChatMessage::user("before"))
+            .mutate_conversation_if_current(
+                key,
+                &opened.conversation_id,
+                SessionMutation::Append(&user),
+            )
             .unwrap(),
         ConditionalSessionWrite::Applied,
     );
+    let assistant = ChatMessage::assistant("draft");
+    backend
+        .mutate_conversation_if_current(
+            key,
+            &opened.conversation_id,
+            SessionMutation::Append(&assistant),
+        )
+        .unwrap();
+    backend
+        .mutate_conversation_if_current(
+            key,
+            &opened.conversation_id,
+            SessionMutation::RemoveLast {
+                expected_role: "assistant",
+                expected_content: "mismatch",
+            },
+        )
+        .unwrap();
+    assert_eq!(backend.open_conversation(key).unwrap().history.len(), 2);
+    backend
+        .mutate_conversation_if_current(
+            key,
+            &opened.conversation_id,
+            SessionMutation::RemoveLast {
+                expected_role: "assistant",
+                expected_content: "draft",
+            },
+        )
+        .unwrap();
+    let updated = ChatMessage::user("updated");
+    backend
+        .mutate_conversation_if_current(
+            key,
+            &opened.conversation_id,
+            SessionMutation::UpdateLast(&updated),
+        )
+        .unwrap();
+    let record = backend.open_conversation(key).unwrap();
+    assert_eq!(record.conversation_id, opened.conversation_id);
+    assert_eq!(record.history.len(), 1);
+    assert_eq!(record.history[0].content, "updated");
 
-    let rotated = backend.clear_and_rotate_conversation(key).unwrap();
-    assert_ne!(current, rotated);
+    let stale_id = uuid::Uuid::new_v4().to_string();
     assert_eq!(
         backend
-            .append_if_conversation_matches(key, &current, &ChatMessage::assistant("stale"))
+            .mutate_conversation_if_current(
+                key,
+                &stale_id,
+                SessionMutation::Append(&ChatMessage::assistant("stale")),
+            )
             .unwrap(),
         ConditionalSessionWrite::Stale,
     );
-    assert!(
-        backend.load(key).is_empty(),
-        "a stale append must not mutate history"
+    let rotated = backend.clear_and_rotate_conversation(key).unwrap();
+    assert_ne!(rotated, opened.conversation_id);
+    assert_eq!(
+        backend
+            .mutate_conversation_if_current(
+                key,
+                &opened.conversation_id,
+                SessionMutation::RemoveLast {
+                    expected_role: "user",
+                    expected_content: "updated",
+                },
+            )
+            .unwrap(),
+        ConditionalSessionWrite::Stale,
     );
-
+    assert!(backend.open_conversation(key).unwrap().history.is_empty());
     backend.delete_session(key).unwrap();
     assert_eq!(
         backend
-            .append_if_conversation_matches(key, &rotated, &ChatMessage::assistant("deleted"))
+            .mutate_conversation_if_current(
+                key,
+                &rotated,
+                SessionMutation::RemoveLast {
+                    expected_role: "user",
+                    expected_content: "updated",
+                },
+            )
             .unwrap(),
         ConditionalSessionWrite::Deleted,
     );
-    assert!(
-        !backend.session_exists(key),
-        "a deleted append must not recreate the record"
+    assert!(!backend.session_exists(key));
+
+    let fresh = backend.open_conversation(key).unwrap();
+    assert_ne!(fresh.conversation_id, opened.conversation_id);
+    assert_eq!(
+        uuid::Uuid::parse_str(&fresh.conversation_id)
+            .unwrap()
+            .get_version_num(),
+        4
     );
+    assert!(fresh.history.is_empty());
 }
 
 #[cfg(test)]

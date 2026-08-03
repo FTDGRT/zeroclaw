@@ -1,6 +1,9 @@
 //! JSONL-based session persistence for channel conversations.
 
-use crate::session_backend::SessionBackend;
+use crate::session_backend::{
+    ChannelConversationRecord, ConditionalSessionWrite, SessionBackend, SessionMutation,
+};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -8,27 +11,50 @@ use std::sync::{Arc, OnceLock, Weak};
 use zeroclaw_api::model_provider::ChatMessage;
 pub use zeroclaw_api::session_keys::sanitize_session_key;
 
+const LOCK_SUFFIX: &str = ".lock";
+const META_SUFFIX: &str = ".meta.json";
+
 type MutationLock = parking_lot::Mutex<()>;
 
 static MUTATION_LOCKS: OnceLock<parking_lot::Mutex<HashMap<PathBuf, Weak<MutationLock>>>> =
     OnceLock::new();
 
-/// Suffix for the per-key advisory file lock (held across resolve / rotate /
-/// delete so two `SessionStore` instances on the same dir converge on one
-/// conversation id). Kept distinct from `.jsonl` so it never shows up in
-/// `list_sessions`.
-const LOCK_SUFFIX: &str = ".lock";
-/// Suffix for the conversation-identity sidecar persisted next to `.jsonl`.
-const META_SUFFIX: &str = ".meta.json";
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionHeader {
+    #[serde(rename = "type")]
+    kind: String,
+    version: u8,
+    conversation_id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySidecar {
+    conversation_id: String,
+}
 
-/// Append-only JSONL session store for channel conversations.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionMessage {
+    role: String,
+    content: String,
+}
+
+impl From<SessionMessage> for ChatMessage {
+    fn from(message: SessionMessage) -> Self {
+        Self {
+            role: message.role,
+            content: message.content,
+        }
+    }
+}
+
 pub struct SessionStore {
     sessions_dir: PathBuf,
     mutation_lock: Arc<MutationLock>,
 }
 
 impl SessionStore {
-    /// Create a new session store, ensuring the sessions directory exists.
     pub fn new(workspace_dir: &Path) -> std::io::Result<Self> {
         let sessions_dir = workspace_dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir)?;
@@ -38,312 +64,261 @@ impl SessionStore {
             mutation_lock,
         })
     }
-
-    /// Compute the file path for a session key, sanitizing for filesystem safety.
-    fn session_path(&self, session_key: &str) -> PathBuf {
+    fn session_path(&self, key: &str) -> PathBuf {
         self.sessions_dir
-            .join(format!("{}.jsonl", sanitize_session_key(session_key)))
+            .join(format!("{}.jsonl", sanitize_session_key(key)))
     }
-
-    /// Path to the per-key advisory lock file. Derives from the sanitized key
-    /// the same way `.jsonl` does so the two stay siblings.
-    fn lock_path(&self, session_key: &str) -> PathBuf {
-        self.sessions_dir.join(format!(
-            "{}{}",
-            sanitize_session_key(session_key),
-            LOCK_SUFFIX
-        ))
+    fn lock_path(&self, key: &str) -> PathBuf {
+        self.sessions_dir
+            .join(format!("{}{}", sanitize_session_key(key), LOCK_SUFFIX))
     }
-
-    /// Path to the conversation-identity sidecar (`{"conversation_id": "..."}`).
-    fn meta_path(&self, session_key: &str) -> PathBuf {
-        self.sessions_dir.join(format!(
-            "{}{}",
-            sanitize_session_key(session_key),
-            META_SUFFIX
-        ))
+    fn meta_path(&self, key: &str) -> PathBuf {
+        self.sessions_dir
+            .join(format!("{}{}", sanitize_session_key(key), META_SUFFIX))
     }
-
-    /// Run `f` while holding the per-key exclusive file lock. Creates the
-    /// `.lock` file if it does not yet exist. The lock is advisory and
-    /// process-local-coherent: it serializes resolve / clear+rotate / delete
-    /// across independent `SessionStore` instances pointing at the same dir,
-    /// which is what makes concurrent first-access converge on one id.
+    #[cfg(test)]
+    fn read_conversation_id(&self, key: &str) -> std::io::Result<Option<String>> {
+        Ok(self
+            .read_record_unlocked(key, false)?
+            .map(|record| record.conversation_id))
+    }
     #[allow(clippy::suspicious_open_options)]
     fn with_key_lock<R>(
         &self,
-        session_key: &str,
+        key: &str,
         f: impl FnOnce() -> std::io::Result<R>,
     ) -> std::io::Result<R> {
-        let lock_path = self.lock_path(session_key);
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Lock file content is irrelevant - only the file lock is used - so
-        // neither truncate nor append is wanted here.
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(&lock_path)?;
+            .open(self.lock_path(key))?;
         file.lock()?;
         f()
     }
-
-    /// Classify a conditional write against the sidecar's current id, WITHOUT
-    /// taking the per-key lock (the caller already holds `with_key_lock`).
-    /// A missing sidecar (record deleted, or a never-resolved key) is
-    /// `Deleted`; a present-but-different id is `Stale`; a match is `Applied`.
-    fn classify_conversation_unlocked(
+    fn valid_id(id: &str) -> bool {
+        uuid::Uuid::parse_str(id).is_ok_and(|u| u.get_version_num() == 4)
+    }
+    fn read_record_unlocked(
         &self,
-        session_key: &str,
-        expected: &str,
-    ) -> std::io::Result<crate::session_backend::ConditionalSessionWrite> {
-        use crate::session_backend::ConditionalSessionWrite;
-        match self.read_conversation_id(session_key)? {
-            None => Ok(ConditionalSessionWrite::Deleted),
-            Some(current) if current != expected => Ok(ConditionalSessionWrite::Stale),
-            Some(_) => Ok(ConditionalSessionWrite::Applied),
-        }
-    }
-
-    /// Read the persisted conversation id from the sidecar. `None` if the
-    /// sidecar is absent (legacy `.jsonl` with no identity yet) or holds an
-    /// empty value.
-    fn read_conversation_id(&self, session_key: &str) -> std::io::Result<Option<String>> {
-        let path = self.meta_path(session_key);
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => {
-                let v: serde_json::Value = serde_json::from_str(&contents)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                Ok(v.get("conversation_id")
-                    .and_then(|x| x.as_str())
-                    .map(str::to_string)
-                    .filter(|s| !s.is_empty()))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Persist the conversation id to the sidecar via a sibling temp file +
-    /// flush/sync + atomic rename, so a crash mid-write never leaves a
-    /// truncated or empty identity. Caller already holds the per-key lock.
-    fn write_conversation_id(&self, session_key: &str, id: &str) -> std::io::Result<()> {
-        let path = self.meta_path(session_key);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::json!({ "conversation_id": id }).to_string() + "\n";
-        let tmp = path.with_extension("tmp");
-        {
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(json.as_bytes())?;
-            file.sync_all()?;
-        }
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    }
-
-    /// Load all messages for a session from its JSONL file.
-    /// Returns an empty vec if the file does not exist or is unreadable.
-    pub fn load(&self, session_key: &str) -> Vec<ChatMessage> {
-        self.load_unlocked(session_key)
-    }
-
-    /// `load` body without the per-key lock. The conditional writers already
-    /// hold `with_key_lock` and call this so they don't nest-lock; `load`
-    /// itself is lock-free (a read-only scan), so unlocking it is a no-op
-    /// safety-wise.
-    fn load_unlocked(&self, session_key: &str) -> Vec<ChatMessage> {
-        let path = self.session_path(session_key);
+        key: &str,
+        upgrade: bool,
+    ) -> std::io::Result<Option<ChannelConversationRecord>> {
+        let path = self.session_path(key);
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
-            Err(_) => return Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
         };
-
-        let reader = std::io::BufReader::new(file);
-        let mut messages = Vec::new();
-
-        for line in reader.lines() {
-            let Ok(line) = line else { continue };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Ok(msg) = serde_json::from_str::<ChatMessage>(trimmed) {
-                messages.push(msg);
-            }
+        let lines: Vec<String> = std::io::BufReader::new(file)
+            .lines()
+            .collect::<Result<_, _>>()?;
+        let nonempty: Vec<&str> = lines
+            .iter()
+            .map(String::as_str)
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        if nonempty.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "session record has no header",
+            ));
         }
-
-        messages
-    }
-
-    /// Append a single message to the session JSONL file. Runs under the
-    /// same per-key exclusive lock as resolve/rotate/delete so a concurrent
-    /// append can never interleave with a `/clear` truncation mid-write.
-    pub fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let _guard = self.mutation_lock.lock();
-        self.with_key_lock(session_key, || self.append_unlocked(session_key, message))
-    }
-
-    /// `append` file-write body, without the per-key lock. Caller (the
-    /// conditional writers) already holds `with_key_lock`.
-    fn append_unlocked(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let path = self.session_path(session_key);
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-
-        let json = serde_json::to_string(message)
+        let first: serde_json::Value = serde_json::from_str(nonempty[0])
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        writeln!(file, "{json}")?;
-        Ok(())
-    }
-
-    /// Remove the last message from a session's JSONL file.
-    /// Rewrite approach: load all messages, drop the last, rewrite. This is
-    /// O(n) but rollbacks are rare.
-    pub fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
-        let _guard = self.mutation_lock.lock();
-        let mut messages = self.load(session_key);
-        if messages.is_empty() {
-            return Ok(false);
-        }
-        messages.pop();
-        self.rewrite(session_key, &messages)?;
-        Ok(true)
-    }
-
-    /// Replace the last message without exposing an intermediate truncated session.
-    pub fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
-        self.update_last_with(session_key, message, |temp, path| {
-            temp.persist(path).map(|_| ()).map_err(|error| error.error)
-        })
-    }
-
-    fn update_last_with<F>(
-        &self,
-        session_key: &str,
-        message: &ChatMessage,
-        persist: F,
-    ) -> std::io::Result<bool>
-    where
-        F: FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
-    {
-        let _guard = self.mutation_lock.lock();
-        let mut messages = self.load(session_key);
-        let Some(last) = messages.last_mut() else {
-            return Ok(false);
+        let (id, start, legacy) = if first.get("type").is_some() {
+            let h: SessionHeader = serde_json::from_value(first)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            if h.kind != "session_meta" || h.version != 1 || !Self::valid_id(&h.conversation_id) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid session header",
+                ));
+            }
+            (h.conversation_id, 1, false)
+        } else {
+            let id = match std::fs::read_to_string(self.meta_path(key)) {
+                Ok(raw) => {
+                    let side: LegacySidecar = serde_json::from_str(&raw)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    if !Self::valid_id(&side.conversation_id) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid legacy conversation id",
+                        ));
+                    }
+                    side.conversation_id
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    uuid::Uuid::new_v4().to_string()
+                }
+                Err(e) => return Err(e),
+            };
+            (id, 0, true)
         };
-        *last = message.clone();
-        self.rewrite_with(session_key, &messages, persist)?;
-        Ok(true)
+        let mut history = Vec::new();
+        for line in &nonempty[start..] {
+            let message: SessionMessage = serde_json::from_str(line)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            history.push(message.into());
+        }
+        let record = ChannelConversationRecord {
+            conversation_id: id,
+            history,
+        };
+        if legacy && upgrade {
+            self.write_record_unlocked(key, &record)?;
+            if let Err(e) = std::fs::remove_file(self.meta_path(key)) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"error":e.to_string()})),
+                        "could not remove folded session sidecar"
+                    );
+                }
+            }
+        }
+        Ok(Some(record))
     }
-
-    /// Compact a session file by rewriting only valid messages (removes corrupt lines).
-    pub fn compact(&self, session_key: &str) -> std::io::Result<()> {
-        let _guard = self.mutation_lock.lock();
-        let messages = self.load(session_key);
-        self.rewrite(session_key, &messages)
-    }
-
-    fn rewrite(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
-        self.rewrite_with(session_key, messages, |temp, path| {
-            temp.persist(path).map(|_| ()).map_err(|error| error.error)
-        })
-    }
-
-    fn rewrite_unlocked(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
-        self.rewrite_with(session_key, messages, |temp, path| {
-            temp.persist(path).map(|_| ()).map_err(|error| error.error)
-        })
-    }
-
-    fn rewrite_with<F>(
+    fn write_record_unlocked(
         &self,
-        session_key: &str,
-        messages: &[ChatMessage],
+        key: &str,
+        record: &ChannelConversationRecord,
+    ) -> std::io::Result<()> {
+        self.write_record_with(key, record, |temp, path| {
+            temp.persist(path).map(|_| ()).map_err(|error| error.error)
+        })
+    }
+
+    fn write_record_with<F>(
+        &self,
+        key: &str,
+        record: &ChannelConversationRecord,
         persist: F,
     ) -> std::io::Result<()>
     where
         F: FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
     {
-        let path = self.session_path(session_key);
+        let path = self.session_path(key);
         let mut temp = tempfile::NamedTempFile::new_in(&self.sessions_dir)?;
-        for msg in messages {
-            serde_json::to_writer(&mut temp, msg)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let header = SessionHeader {
+            kind: "session_meta".into(),
+            version: 1,
+            conversation_id: record.conversation_id.clone(),
+        };
+        serde_json::to_writer(&mut temp, &header).map_err(std::io::Error::other)?;
+        temp.write_all(b"\n")?;
+        for message in &record.history {
+            serde_json::to_writer(&mut temp, message).map_err(std::io::Error::other)?;
             temp.write_all(b"\n")?;
         }
-
         temp.as_file().sync_all()?;
         persist(temp, &path)
     }
-
-    /// Clear all messages from a session by truncating its JSONL file.
-    /// The file is preserved (empty) so the session key remains in `list_sessions`.
-    pub fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+    pub(crate) fn with_locked_conversation<R>(
+        &self,
+        key: &str,
+        f: impl FnOnce(
+            &dyn Fn() -> std::io::Result<Option<ChannelConversationRecord>>,
+            &Path,
+        ) -> std::io::Result<R>,
+    ) -> std::io::Result<R> {
         let _guard = self.mutation_lock.lock();
-        let count = self.load(session_key).len();
-        if count > 0 {
-            self.rewrite(session_key, &[])?;
-        }
-        Ok(count)
-    }
-
-    /// Delete a session's JSONL file and conversation-identity sidecar.
-    /// Returns `true` if either existed. The per-key `.lock` file is
-    /// intentionally NOT unlinked so concurrent operations on the same key
-    /// stay coherent. The delete is performed under the per-key exclusive
-    /// lock so it cannot race a concurrent resolve / rotate.
-    pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let _guard = self.mutation_lock.lock();
-        self.with_key_lock(session_key, || {
-            let data_path = self.session_path(session_key);
-            let meta_path = self.meta_path(session_key);
-            let data_existed = data_path.exists();
-            let meta_existed = meta_path.exists();
-            // Remove the identity sidecar FIRST and propagate its error. A
-            // silently-ignored sidecar removal (`let _ = ...`) would leave the
-            // old conversation_id on disk after the data file is gone, so the
-            // next resolve would read back and REUSE a "deleted" id - exactly
-            // the identity-leak the review flagged. Ordering sidecar-before-data
-            // means a failure here aborts before we touch history, leaving a
-            // coherent "both still present" state rather than "history gone,
-            // stale id survives".
-            if meta_existed {
-                std::fs::remove_file(&meta_path)?;
-            }
-            if data_existed {
-                std::fs::remove_file(&data_path)?;
-            }
-            Ok(data_existed || meta_existed)
+        self.with_key_lock(key, || {
+            let load = || self.read_record_unlocked(key, true);
+            f(&load, &self.session_path(key))
         })
     }
-
-    /// Return the modification time of a session's JSONL file.
-    pub fn session_mtime(&self, session_key: &str) -> Option<std::time::SystemTime> {
-        std::fs::metadata(self.session_path(session_key))
+    pub fn load(&self, key: &str) -> Vec<ChatMessage> {
+        let _guard = self.mutation_lock.lock();
+        self.with_key_lock(key, || {
+            Ok(self
+                .read_record_unlocked(key, true)?
+                .map_or_else(Vec::new, |r| r.history))
+        })
+        .unwrap_or_default()
+    }
+    pub fn append(&self, key: &str, m: &ChatMessage) -> std::io::Result<()> {
+        let _guard = self.mutation_lock.lock();
+        self.with_key_lock(key, || {
+            let mut r =
+                self.read_record_unlocked(key, true)?
+                    .unwrap_or(ChannelConversationRecord {
+                        conversation_id: uuid::Uuid::new_v4().to_string(),
+                        history: vec![],
+                    });
+            r.history.push(m.clone());
+            self.write_record_unlocked(key, &r)
+        })
+    }
+    pub fn remove_last(&self, key: &str) -> std::io::Result<bool> {
+        let _guard = self.mutation_lock.lock();
+        self.with_key_lock(key, || {
+            let Some(mut r) = self.read_record_unlocked(key, true)? else {
+                return Ok(false);
+            };
+            if r.history.pop().is_none() {
+                return Ok(false);
+            }
+            self.write_record_unlocked(key, &r)?;
+            Ok(true)
+        })
+    }
+    pub fn compact(&self, key: &str) -> std::io::Result<()> {
+        let _guard = self.mutation_lock.lock();
+        self.with_key_lock(key, || {
+            if let Some(r) = self.read_record_unlocked(key, true)? {
+                self.write_record_unlocked(key, &r)?
+            }
+            Ok(())
+        })
+    }
+    pub fn clear_messages(&self, key: &str) -> std::io::Result<usize> {
+        let _guard = self.mutation_lock.lock();
+        self.with_key_lock(key, || {
+            let Some(mut r) = self.read_record_unlocked(key, true)? else {
+                return Ok(0);
+            };
+            let n = r.history.len();
+            r.history.clear();
+            self.write_record_unlocked(key, &r)?;
+            Ok(n)
+        })
+    }
+    pub fn delete_session(&self, key: &str) -> std::io::Result<bool> {
+        let _guard = self.mutation_lock.lock();
+        self.with_key_lock(key, || {
+            let deleted = match std::fs::remove_file(self.session_path(key)) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e),
+            };
+            if let Err(e) = std::fs::remove_file(self.meta_path(key)) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                        "could not remove legacy session sidecar"
+                    );
+                }
+            }
+            Ok(deleted)
+        })
+    }
+    pub fn session_mtime(&self, key: &str) -> Option<std::time::SystemTime> {
+        std::fs::metadata(self.session_path(key))
             .and_then(|m| m.modified())
             .ok()
     }
-
-    /// List all session keys that have files on disk.
     pub fn list_sessions(&self) -> Vec<String> {
-        let entries = match std::fs::read_dir(&self.sessions_dir) {
-            Ok(e) => e,
-            Err(_) => return Vec::new(),
-        };
-
-        entries
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let name = entry.file_name().into_string().ok()?;
-                name.strip_suffix(".jsonl").map(String::from)
-            })
+        std::fs::read_dir(&self.sessions_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter_map(|n| n.strip_suffix(".jsonl").map(str::to_owned))
             .collect()
     }
 }
@@ -364,194 +339,128 @@ fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<MutationLock>> 
 }
 
 impl SessionBackend for SessionStore {
-    fn load(&self, session_key: &str) -> Vec<ChatMessage> {
-        self.load(session_key)
+    fn resolve_or_create_conversation_id(&self, k: &str) -> std::io::Result<String> {
+        Ok(self.open_conversation(k)?.conversation_id)
+    }
+    fn clear_and_rotate_conversation(&self, k: &str) -> std::io::Result<String> {
+        let _guard = self.mutation_lock.lock();
+        self.with_key_lock(k, || {
+            let r = ChannelConversationRecord {
+                conversation_id: uuid::Uuid::new_v4().to_string(),
+                history: Vec::new(),
+            };
+            self.write_record_unlocked(k, &r)?;
+            Ok(r.conversation_id)
+        })
+    }
+    fn append_if_conversation_matches(
+        &self,
+        k: &str,
+        id: &str,
+        message: &ChatMessage,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        self.mutate_conversation_if_current(k, id, SessionMutation::Append(message))
+    }
+    fn remove_last_if_conversation_matches(
+        &self,
+        k: &str,
+        id: &str,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        let _guard = self.mutation_lock.lock();
+        self.with_key_lock(k, || {
+            let Some(mut record) = self.read_record_unlocked(k, true)? else {
+                return Ok(ConditionalSessionWrite::Deleted);
+            };
+            if !Self::valid_id(id) || record.conversation_id != id {
+                return Ok(ConditionalSessionWrite::Stale);
+            }
+            if record.history.pop().is_some() {
+                self.write_record_unlocked(k, &record)?;
+            }
+            Ok(ConditionalSessionWrite::Applied)
+        })
+    }
+    fn update_last_if_conversation_matches(
+        &self,
+        k: &str,
+        id: &str,
+        message: &ChatMessage,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        self.mutate_conversation_if_current(k, id, SessionMutation::UpdateLast(message))
     }
 
-    fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        self.append(session_key, message)
+    fn load(&self, k: &str) -> Vec<ChatMessage> {
+        self.load(k)
     }
-
-    fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
-        self.remove_last(session_key)
+    fn append(&self, k: &str, m: &ChatMessage) -> std::io::Result<()> {
+        self.append(k, m)
     }
-
-    fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
-        self.update_last(session_key, message)
+    fn remove_last(&self, k: &str) -> std::io::Result<bool> {
+        self.remove_last(k)
     }
-
     fn list_sessions(&self) -> Vec<String> {
         self.list_sessions()
     }
-
-    fn list_sessions_with_metadata(&self) -> Vec<crate::session_backend::SessionMetadata> {
-        use chrono::{DateTime, Utc};
-        self.list_sessions()
-            .into_iter()
-            .map(|key| {
-                let last_activity: DateTime<Utc> = self
-                    .session_mtime(&key)
-                    .map(DateTime::<Utc>::from)
-                    .unwrap_or_else(Utc::now);
-                crate::session_backend::SessionMetadata {
-                    name: None,
-                    created_at: last_activity,
-                    last_activity,
-                    message_count: 0,
-                    key,
-                    agent_alias: None,
-                    channel_id: None,
-                    room_id: None,
-                    sender_id: None,
-                    // The listing is intentionally partial (mirrors `name` /
-                    // `message_count` being best-effort here). The
-                    // authoritative read is `resolve_or_create_conversation_id`.
-                    conversation_id: None,
+    fn compact(&self, k: &str) -> std::io::Result<()> {
+        self.compact(k)
+    }
+    fn clear_messages(&self, k: &str) -> std::io::Result<usize> {
+        self.clear_messages(k)
+    }
+    fn delete_session(&self, k: &str) -> std::io::Result<bool> {
+        self.delete_session(k)
+    }
+    fn session_exists(&self, k: &str) -> bool {
+        self.session_path(k).exists()
+    }
+    fn open_conversation(&self, k: &str) -> std::io::Result<ChannelConversationRecord> {
+        let _guard = self.mutation_lock.lock();
+        self.with_key_lock(k, || {
+            if let Some(r) = self.read_record_unlocked(k, true)? {
+                return Ok(r);
+            }
+            let r = ChannelConversationRecord {
+                conversation_id: uuid::Uuid::new_v4().to_string(),
+                history: vec![],
+            };
+            self.write_record_unlocked(k, &r)?;
+            Ok(r)
+        })
+    }
+    fn mutate_conversation_if_current(
+        &self,
+        k: &str,
+        id: &str,
+        m: SessionMutation<'_>,
+    ) -> std::io::Result<ConditionalSessionWrite> {
+        let _guard = self.mutation_lock.lock();
+        self.with_key_lock(k, || {
+            let Some(mut r) = self.read_record_unlocked(k, true)? else {
+                return Ok(ConditionalSessionWrite::Deleted);
+            };
+            if r.conversation_id != id {
+                return Ok(ConditionalSessionWrite::Stale);
+            }
+            match m {
+                SessionMutation::Append(x) => r.history.push(x.clone()),
+                SessionMutation::RemoveLast {
+                    expected_role,
+                    expected_content,
+                } => {
+                    if r.history
+                        .last()
+                        .is_some_and(|x| x.role == expected_role && x.content == expected_content)
+                    {
+                        r.history.pop();
+                    }
                 }
-            })
-            .collect()
-    }
-
-    fn compact(&self, session_key: &str) -> std::io::Result<()> {
-        self.compact(session_key)
-    }
-
-    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
-        self.clear_messages(session_key)
-    }
-
-    fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        self.delete_session(session_key)
-    }
-
-    /// Quick existence probe mirroring how `delete_session` decides whether
-    /// the session is on disk Checking file presence is the same
-    /// O(1) `stat` that `delete_session` itself performs.
-    fn session_exists(&self, session_key: &str) -> bool {
-        self.session_path(session_key).exists()
-    }
-
-    /// Atomically resolve-or-create the conversation id for a session key.
-    /// Reads the `.meta.json` sidecar under the per-key exclusive lock; if
-    /// absent/empty (legacy `.jsonl` with no sidecar, or a brand new key) it
-    /// generates a UUID and persists it via temp+sync+rename. The exclusive
-    /// lock makes two `SessionStore` instances on the same dir converge on a
-    /// single id.
-    fn resolve_or_create_conversation_id(&self, session_key: &str) -> std::io::Result<String> {
-        self.with_key_lock(session_key, || {
-            if let Some(existing) = self.read_conversation_id(session_key)? {
-                return Ok(existing);
+                SessionMutation::UpdateLast(x) => {
+                    if let Some(last) = r.history.last_mut() {
+                        *last = x.clone()
+                    }
+                }
             }
-            let id = uuid::Uuid::new_v4().to_string();
-            self.write_conversation_id(session_key, &id)?;
-            Ok(id)
-        })
-    }
-
-    /// Atomically clear the JSONL history AND rotate the conversation id in
-    /// one record-scoped operation under the per-key exclusive lock. The
-    /// `.jsonl` is truncated (file preserved so the key stays listed) and a
-    /// fresh UUID is persisted to the sidecar. This is the `/new`/`/clear`
-    /// path - `remove_last`, `update_last`, `compact`, and crash repair do
-    /// NOT rotate.
-    fn clear_and_rotate_conversation(&self, session_key: &str) -> std::io::Result<String> {
-        self.with_key_lock(session_key, || {
-            let data_path = self.session_path(session_key);
-            if let Some(parent) = data_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            // Write the fresh id FIRST (via write_conversation_id's own
-            // temp+sync+rename, so this step alone is crash-atomic), THEN
-            // truncate history. A crash between the two steps leaves
-            // "new id + stale history" (the FULL old history may survive
-            // because the truncate below has not been fsynced yet) rather
-            // than "empty history + stale id" (a `/clear` that silently
-            // didn't rotate). Both steps run under the same per-key exclusive
-            // lock as before.
-            let id = uuid::Uuid::new_v4().to_string();
-            self.write_conversation_id(session_key, &id)?;
-            // Truncate the history. `File::create` truncates to empty while
-            // preserving the file so the key remains in `list_sessions`.
-            // fsync so the truncate is durable on power loss (returning Ok
-            // alone is not a durability guarantee).
-            {
-                let file = std::fs::File::create(&data_path)?;
-                file.sync_all()?;
-            }
-            Ok(id)
-        })
-    }
-
-    /// Append `message` iff the sidecar still carries `expected_conversation_id`,
-    /// all inside one per-key lock closure so the classify check and the file
-    /// write cannot interleave with a `/new` rotation or delete. A stale or
-    /// deleted record is left untouched: the data file is NOT recreated
-    /// (`.create(true)` only runs once classify returns `Applied`). A fresh but
-    /// empty session (sidecar present, no `.jsonl`) matching the id may create
-    /// its first message.
-    fn append_if_conversation_matches(
-        &self,
-        session_key: &str,
-        expected_conversation_id: &str,
-        message: &ChatMessage,
-    ) -> std::io::Result<crate::session_backend::ConditionalSessionWrite> {
-        use crate::session_backend::ConditionalSessionWrite;
-        self.with_key_lock(session_key, || {
-            let status =
-                self.classify_conversation_unlocked(session_key, expected_conversation_id)?;
-            if status != ConditionalSessionWrite::Applied {
-                return Ok(status);
-            }
-            self.append_unlocked(session_key, message)?;
-            Ok(ConditionalSessionWrite::Applied)
-        })
-    }
-
-    /// Remove the last message iff the sidecar still carries
-    /// `expected_conversation_id`, inside one per-key lock closure. A matching
-    /// record with no messages is a no-op that still reports `Applied`.
-    fn remove_last_if_conversation_matches(
-        &self,
-        session_key: &str,
-        expected_conversation_id: &str,
-    ) -> std::io::Result<crate::session_backend::ConditionalSessionWrite> {
-        use crate::session_backend::ConditionalSessionWrite;
-        self.with_key_lock(session_key, || {
-            let status =
-                self.classify_conversation_unlocked(session_key, expected_conversation_id)?;
-            if status != ConditionalSessionWrite::Applied {
-                return Ok(status);
-            }
-            let mut messages = self.load_unlocked(session_key);
-            if !messages.is_empty() {
-                messages.pop();
-                self.rewrite_unlocked(session_key, &messages)?;
-            }
-            Ok(ConditionalSessionWrite::Applied)
-        })
-    }
-
-    /// Update the last message in place iff the sidecar still carries
-    /// `expected_conversation_id`, inside one per-key lock closure. A matching
-    /// record with no messages is a no-op that still reports `Applied`.
-    fn update_last_if_conversation_matches(
-        &self,
-        session_key: &str,
-        expected_conversation_id: &str,
-        message: &ChatMessage,
-    ) -> std::io::Result<crate::session_backend::ConditionalSessionWrite> {
-        use crate::session_backend::ConditionalSessionWrite;
-        self.with_key_lock(session_key, || {
-            let status =
-                self.classify_conversation_unlocked(session_key, expected_conversation_id)?;
-            if status != ConditionalSessionWrite::Applied {
-                return Ok(status);
-            }
-            let mut messages = self.load_unlocked(session_key);
-            if let Some(last) = messages.last_mut() {
-                *last = message.clone();
-                self.rewrite_unlocked(session_key, &messages)?;
-            }
+            self.write_record_unlocked(k, &r)?;
             Ok(ConditionalSessionWrite::Applied)
         })
     }
@@ -560,8 +469,6 @@ impl SessionBackend for SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, mpsc};
-    use std::time::Duration;
     use tempfile::TempDir;
 
     #[test]
@@ -660,19 +567,20 @@ mod tests {
     }
 
     #[test]
-    fn append_is_truly_append_only() {
+    fn jsonl_formal_record_retains_header_across_appends() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
-        let key = "test_session";
-
-        store.append(key, &ChatMessage::user("msg1")).unwrap();
-        store.append(key, &ChatMessage::user("msg2")).unwrap();
-
-        // Read raw file to verify append-only format
-        let path = store.session_path(key);
-        let content = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = content.trim().lines().collect();
-        assert_eq!(lines.len(), 2);
+        store.append("formal", &ChatMessage::user("one")).unwrap();
+        store
+            .append("formal", &ChatMessage::assistant("two"))
+            .unwrap();
+        let raw = std::fs::read_to_string(store.session_path("formal")).unwrap();
+        let lines: Vec<_> = raw.lines().collect();
+        let header: SessionHeader = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(header.kind, "session_meta");
+        assert_eq!(header.version, 1);
+        assert!(SessionStore::valid_id(&header.conversation_id));
+        assert_eq!(lines.len(), 3);
     }
 
     #[test]
@@ -701,121 +609,27 @@ mod tests {
     }
 
     #[test]
-    fn update_last_via_trait_replaces_final_message() {
+    fn jsonl_corrupt_or_duplicate_header_fails_closed() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
-        let backend: &dyn SessionBackend = &store;
-        let key = "update_test";
-
-        backend.append(key, &ChatMessage::user("first")).unwrap();
-        backend.append(key, &ChatMessage::assistant("old")).unwrap();
-
-        assert!(
-            backend
-                .update_last(key, &ChatMessage::assistant("new"))
-                .unwrap()
-        );
-
-        let messages = backend.load(key);
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].content, "first");
-        assert_eq!(messages[1].content, "new");
-    }
-
-    #[test]
-    fn failed_rewrite_preserves_original_file() {
-        let tmp = TempDir::new().unwrap();
-        let store = SessionStore::new(tmp.path()).unwrap();
-        let key = "rewrite_failure";
-
-        store.append(key, &ChatMessage::user("first")).unwrap();
-        store
-            .append(key, &ChatMessage::assistant("second"))
-            .unwrap();
-        let path = store.session_path(key);
-        let original = std::fs::read(&path).unwrap();
-
-        let mut temp_path = None;
-        let result = store.rewrite_with(key, &[ChatMessage::user("replacement")], |temp, _path| {
-            temp_path = Some(temp.path().to_path_buf());
-            Err(std::io::Error::other("injected persist failure"))
-        });
-
-        assert!(result.is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-        assert!(!temp_path.unwrap().exists());
-    }
-
-    #[test]
-    fn concurrent_append_waits_for_update_last_commit() {
-        let tmp = TempDir::new().unwrap();
-        let update_store = Arc::new(SessionStore::new(tmp.path()).unwrap());
-        let append_store = Arc::new(SessionStore::new(tmp.path()).unwrap());
-        let key = "concurrent_update";
-        update_store
-            .append(key, &ChatMessage::user("first"))
-            .unwrap();
-        update_store
-            .append(key, &ChatMessage::assistant("old"))
-            .unwrap();
-
-        let (staged_tx, staged_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let update_worker = Arc::clone(&update_store);
-        let updater = std::thread::spawn(move || {
-            update_worker.update_last_with(key, &ChatMessage::assistant("new"), |temp, path| {
-                staged_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                temp.persist(path).map(|_| ()).map_err(|error| error.error)
-            })
-        });
-
-        staged_rx.recv().unwrap();
-        let (append_started_tx, append_started_rx) = mpsc::channel();
-        let (append_done_tx, append_done_rx) = mpsc::channel();
-        let append_store = Arc::clone(&append_store);
-        let appender = std::thread::spawn(move || {
-            append_started_tx.send(()).unwrap();
-            let result = append_store.append(key, &ChatMessage::user("concurrent"));
-            append_done_tx.send(()).unwrap();
-            result
-        });
-
-        append_started_rx.recv().unwrap();
-        assert!(
-            append_done_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err()
-        );
-
-        release_tx.send(()).unwrap();
-        assert!(updater.join().unwrap().unwrap());
-        appender.join().unwrap().unwrap();
-
-        let messages = update_store.load(key);
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0].content, "first");
-        assert_eq!(messages[1].content, "new");
-        assert_eq!(messages[2].content, "concurrent");
-    }
-
-    #[test]
-    fn compact_removes_corrupt_lines() {
-        let tmp = TempDir::new().unwrap();
-        let store = SessionStore::new(tmp.path()).unwrap();
-        let key = "compact_test";
-
-        let path = store.session_path(key);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut file = std::fs::File::create(&path).unwrap();
-        writeln!(file, r#"{{"role":"user","content":"ok"}}"#).unwrap();
-        writeln!(file, "corrupt line").unwrap();
-        writeln!(file, r#"{{"role":"assistant","content":"hi"}}"#).unwrap();
-
-        store.compact(key).unwrap();
-
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(raw.trim().lines().count(), 2);
+        let id = uuid::Uuid::new_v4();
+        std::fs::write(store.session_path("corrupt"), "not-json\n").unwrap();
+        assert!(store.open_conversation("corrupt").is_err());
+        std::fs::write(
+            store.session_path("duplicate"),
+            format!(
+                "{{\"type\":\"session_meta\",\"version\":1,\"conversation_id\":\"{id}\"}}\n{{\"type\":\"session_meta\",\"version\":1,\"conversation_id\":\"{id}\"}}\n"
+            ),
+        ).unwrap();
+        assert!(store.open_conversation("duplicate").is_err());
+        std::fs::write(
+            store.session_path("unknown_message_field"),
+            format!(
+                "{{\"type\":\"session_meta\",\"version\":1,\"conversation_id\":\"{id}\"}}\n{{\"role\":\"user\",\"content\":\"hello\",\"unexpected\":true}}\n"
+            ),
+        )
+        .unwrap();
+        assert!(store.open_conversation("unknown_message_field").is_err());
     }
 
     #[test]
@@ -832,23 +646,18 @@ mod tests {
     }
 
     #[test]
-    fn handles_corrupt_lines_gracefully() {
+    fn jsonl_legacy_file_upgrades_to_header_and_preserves_messages() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
-        let key = "corrupt_test";
-
-        // Write valid message + corrupt line + valid message
-        let path = store.session_path(key);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut file = std::fs::File::create(&path).unwrap();
-        writeln!(file, r#"{{"role":"user","content":"hello"}}"#).unwrap();
-        writeln!(file, "this is not valid json").unwrap();
-        writeln!(file, r#"{{"role":"assistant","content":"world"}}"#).unwrap();
-
-        let messages = store.load(key);
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].content, "hello");
-        assert_eq!(messages[1].content, "world");
+        std::fs::write(
+            store.session_path("legacy"),
+            "{\"role\":\"user\",\"content\":\"hello\"}\n{\"role\":\"assistant\",\"content\":\"world\"}\n",
+        ).unwrap();
+        let record = store.open_conversation("legacy").unwrap();
+        assert!(SessionStore::valid_id(&record.conversation_id));
+        assert_eq!(record.history.len(), 2);
+        let raw = std::fs::read_to_string(store.session_path("legacy")).unwrap();
+        assert!(raw.lines().next().unwrap().contains("session_meta"));
     }
 
     #[test]
@@ -994,39 +803,47 @@ mod tests {
     // ── conversation_id (atomic channel identity) tests ───────────────
 
     #[test]
-    fn conversation_id_resolve_is_idempotent_jsonl() {
+    fn jsonl_sidecar_is_folded_into_header_without_changing_id() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
-
-        let id1 = store.resolve_or_create_conversation_id("k").unwrap();
-        let id2 = store.resolve_or_create_conversation_id("k").unwrap();
-        assert!(!id1.is_empty());
-        assert_eq!(id1, id2, "repeated resolve must return the same id");
-        // Sidecar is written next to the jsonl.
-        assert!(store.meta_path("k").exists());
+        let id = uuid::Uuid::new_v4().to_string();
+        std::fs::write(
+            store.session_path("legacy"),
+            "{\"role\":\"user\",\"content\":\"old\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            store.meta_path("legacy"),
+            format!("{{\"conversation_id\":\"{id}\"}}\n"),
+        )
+        .unwrap();
+        let record = store.open_conversation("legacy").unwrap();
+        assert_eq!(record.conversation_id, id);
+        assert_eq!(record.history.len(), 1);
+        assert!(!store.meta_path("legacy").exists());
+        assert!(
+            std::fs::read_to_string(store.session_path("legacy"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .contains(&id)
+        );
     }
 
     #[test]
-    fn conversation_id_legacy_jsonl_backfills_sidecar() {
+    fn jsonl_corrupt_sidecar_fails_closed() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
-
-        // Legacy: a `.jsonl` exists with NO sidecar (pre-dates the identity
-        // column). First resolve must synthesize the sidecar, not fail.
-        store.append("legacy", &ChatMessage::user("old")).unwrap();
-        assert!(!store.meta_path("legacy").exists(), "legacy has no sidecar");
-
-        let id = store.resolve_or_create_conversation_id("legacy").unwrap();
-        assert!(!id.is_empty());
-        assert!(
-            store.meta_path("legacy").exists(),
-            "resolve must create sidecar"
-        );
-        assert_eq!(
-            store.resolve_or_create_conversation_id("legacy").unwrap(),
-            id,
-            "re-resolve returns the same id"
-        );
+        std::fs::write(
+            store.session_path("legacy"),
+            "{\"role\":\"user\",\"content\":\"old\"}\n",
+        )
+        .unwrap();
+        std::fs::write(store.meta_path("legacy"), "not-json\n").unwrap();
+        assert!(store.open_conversation("legacy").is_err());
+        let raw = std::fs::read_to_string(store.session_path("legacy")).unwrap();
+        assert!(!raw.contains("session_meta"));
     }
 
     #[test]
@@ -1219,38 +1036,13 @@ mod tests {
     }
 
     #[test]
-    fn delete_session_propagates_sidecar_removal_error() {
-        // Inject a REAL failure: replace the sidecar FILE with a DIRECTORY at
-        // the same path. `remove_file` on a directory returns `Err`
-        // cross-platform (no permission bits needed), so the sidecar-removal
-        // step inside `delete_session` is forced to fail. Because sidecar
-        // removal now runs BEFORE data removal and propagates its error,
-        // `delete_session` must return `Err` and the data file must STILL be
-        // present (the failure aborted before touching history).
+    fn delete_session_removes_formal_record_despite_sidecar_cleanup_failure() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
-
-        // Seed a data file + identity sidecar so both exist.
-        store.append("del", &ChatMessage::user("x")).unwrap();
-        let _ = store.resolve_or_create_conversation_id("del").unwrap();
-        let meta_path = store.meta_path("del");
-        let data_path = store.session_path("del");
-        assert!(meta_path.exists(), "sidecar must exist after resolve");
-        assert!(data_path.exists(), "data must exist after append");
-
-        // Swap the sidecar file for a directory so `remove_file` fails.
-        std::fs::remove_file(&meta_path).unwrap();
-        std::fs::create_dir(&meta_path).unwrap();
-
-        let result = store.delete_session("del");
-        assert!(
-            result.is_err(),
-            "delete must propagate sidecar-removal failure"
-        );
-        assert!(
-            data_path.exists(),
-            "data file must survive when sidecar removal fails first"
-        );
+        store.open_conversation("del").unwrap();
+        std::fs::create_dir(store.meta_path("del")).unwrap();
+        assert!(store.delete_session("del").unwrap());
+        assert!(!store.session_path("del").exists());
     }
 
     // ── conditional-write (conversation-id fence) tests ───────────────
@@ -1264,48 +1056,32 @@ mod tests {
     }
 
     #[test]
-    fn conditional_write_append_propagates_real_io_error() {
-        // Inject a REAL failure: resolve creates the sidecar (matching id), then
-        // a DIRECTORY is placed at the `.jsonl` path so `append_unlocked`'s
-        // `OpenOptions::append` fails. classify returns `Applied` first, so the
-        // error MUST surface as `Err` - it must NOT degrade to `Stale`/`Deleted`
-        // (which would hide a storage fault as a lifecycle race).
+    fn jsonl_stale_mutation_does_not_recreate_deleted_file() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
-        let key = "fail_append";
-        let id = store.resolve_or_create_conversation_id(key).unwrap();
-
-        // Block the data path with a directory so the append open fails.
-        let data_path = store.session_path(key);
-        std::fs::create_dir_all(&data_path).unwrap();
-
-        let result = store.append_if_conversation_matches(key, &id, &ChatMessage::user("boom"));
-        assert!(
-            result.is_err(),
-            "a real I/O error must propagate, not degrade to a lifecycle status"
+        let record = store.open_conversation("deleted").unwrap();
+        store.delete_session("deleted").unwrap();
+        assert_eq!(
+            store
+                .mutate_conversation_if_current(
+                    "deleted",
+                    &record.conversation_id,
+                    SessionMutation::Append(&ChatMessage::user("stale")),
+                )
+                .unwrap(),
+            ConditionalSessionWrite::Deleted,
         );
+        assert!(!store.session_path("deleted").exists());
     }
 
     #[test]
-    fn conditional_write_append_creates_first_message_for_fresh_session() {
-        // A fresh-but-empty session has a sidecar but no `.jsonl`; matching the
-        // current id allows creating the first message (does NOT resurrect a
-        // deleted record, whose sidecar is gone and would classify `Deleted`).
+    fn jsonl_leftover_temp_file_does_not_replace_formal_record() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
-        let key = "fresh";
-        let id = store.resolve_or_create_conversation_id(key).unwrap();
-        assert!(!store.session_path(key).exists(), "no data file yet");
-
-        use crate::session_backend::ConditionalSessionWrite;
-        assert_eq!(
-            store
-                .append_if_conversation_matches(key, &id, &ChatMessage::user("first"))
-                .unwrap(),
-            ConditionalSessionWrite::Applied
-        );
-        let messages = store.load(key);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "first");
+        let record = store.open_conversation("formal").unwrap();
+        std::fs::write(store.sessions_dir.join(".formal.999.0.tmp"), "garbage\n").unwrap();
+        let reopened = store.open_conversation("formal").unwrap();
+        assert_eq!(reopened.conversation_id, record.conversation_id);
+        assert!(reopened.history.is_empty());
     }
 }

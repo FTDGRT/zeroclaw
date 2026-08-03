@@ -16,6 +16,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::session_backend::SessionBackend;
+pub use crate::session_backend::{
+    ChannelConversationRecord, ConditionalSessionWrite, SessionMutation,
+};
 
 pub fn effective_gateway_bind_socket_addr(host: &str, port: u16) -> SocketAddr {
     parse_gateway_bind_socket_addr(host, port)
