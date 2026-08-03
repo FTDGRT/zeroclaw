@@ -2812,6 +2812,7 @@ impl Agent {
                         channel: Some(self.channel_name.clone()),
                         agent_alias: self.observer_agent_alias(),
                         turn_id: Some(turn_id.clone()),
+                        conversation_id: self.conversation_id.clone(),
                     });
                 }
                 let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");

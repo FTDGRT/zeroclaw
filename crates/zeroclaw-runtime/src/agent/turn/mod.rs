@@ -3458,6 +3458,7 @@ mod sop_step_reassembly_tests {
             Some("outer"),
             Some(handle),
             None,
+            None,
             &mut exec_cache,
         )
         .await;
