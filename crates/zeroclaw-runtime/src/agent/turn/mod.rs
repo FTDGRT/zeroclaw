@@ -289,7 +289,17 @@ impl<'a> TurnState<'a> {
     }
 }
 
-pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
+pub fn run_tool_call_loop<'a>(
+    p: ToolLoop<'a>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    let conversation_id = p.conversation_id.map(str::to_string);
+    Box::pin(crate::agent::loop_::scope_conversation_id(
+        conversation_id,
+        run_tool_call_loop_scoped(p),
+    ))
+}
+
+async fn run_tool_call_loop_scoped(mut p: ToolLoop<'_>) -> Result<String> {
     let model_switch_state = p
         .exec
         .model_switch_callback

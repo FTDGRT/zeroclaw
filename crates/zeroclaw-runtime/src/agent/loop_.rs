@@ -452,6 +452,29 @@ pub fn filter_by_allowed_tools(
 pub use zeroclaw_api::TOOL_LOOP_SESSION_KEY;
 pub use zeroclaw_api::TOOL_LOOP_THREAD_ID;
 
+tokio::task_local! {
+    static TOOL_LOOP_CONVERSATION_ID: Option<String>;
+}
+
+/// Read the active tool loop's non-empty cross-turn conversation identity.
+pub fn current_tool_loop_conversation_id() -> Option<String> {
+    TOOL_LOOP_CONVERSATION_ID
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .and_then(|id| (!id.trim().is_empty()).then_some(id))
+}
+
+pub(crate) fn scope_conversation_id<F>(
+    conversation_id: Option<String>,
+    future: F,
+) -> tokio::task::futures::TaskLocalFuture<Option<String>, F>
+where
+    F: std::future::Future,
+{
+    TOOL_LOOP_CONVERSATION_ID.scope(conversation_id, future)
+}
+
 // Re-export tool call parsing from the standalone parser crate.
 pub use zeroclaw_tool_call_parser::{
     ParsedToolCall, ToolProtocolEnvelopeKind, build_native_assistant_history_from_parsed_calls,

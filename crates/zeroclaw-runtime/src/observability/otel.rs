@@ -976,6 +976,7 @@ impl Observer for OtelObserver {
 /// label - cross-turn correlation is span-only).
 fn conversation_attr(conversation_id: Option<&str>) -> Option<KeyValue> {
     conversation_id
+        .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(|id| KeyValue::new("gen_ai.conversation.id", id.to_string()))
 }
@@ -2180,6 +2181,13 @@ mod tests {
     #[test]
     fn conversation_attr_omits_when_empty() {
         assert!(conversation_attr(Some("")).is_none());
+        assert!(conversation_attr(Some("   \t\n")).is_none());
+    }
+
+    #[test]
+    fn conversation_attr_trims_non_empty_id() {
+        let attr = conversation_attr(Some("  cid-trimmed  ")).unwrap();
+        assert_eq!(attr.value.as_str(), "cid-trimmed");
     }
 
     /// Every turn-scoped lifecycle variant that carries a `conversation_id`
