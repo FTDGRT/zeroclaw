@@ -1836,6 +1836,32 @@ pub async fn handle_api_session_message_post(
     .into_response()
 }
 
+fn delete_backend_session(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+    requested_id: &str,
+) -> axum::response::Response {
+    match backend.delete_session(session_key) {
+        Ok(true) => Json(serde_json::json!({
+            "deleted": true,
+            "session_id": requested_id
+        }))
+        .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to delete session: {error}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// DELETE /api/sessions/{id} — delete a gateway session
 pub async fn handle_api_session_delete(
     State(state): State<AppState>,
@@ -1860,13 +1886,23 @@ pub async fn handle_api_session_delete(
         format!("gw_{id}")
     };
 
-    // Gateway dashboard sessions (`gw_` keys) are cancelled via the gateway's
-    // own per-session token and removed from the gateway backend. Channel-owned
-    // keys (WhatsApp/Linq/WATI/Nextcloud history keys, never `gw_`-prefixed) go
-    // through the shared Channel lifecycle so any active Channel turn is
-    // cancelled + waited before the record is removed; they must NOT touch the
-    // gateway cancel_tokens map, and a `gw_` key must NOT enter the Channel
-    // registry.
+    // Ownership is metadata-driven, shared with `SessionResetTool`/
+    // `SessionDeleteTool` via `is_channel_owned_session`: a `gw_` key is always
+    // a gateway dashboard session; a durable row is channel-owned iff its
+    // `session_metadata.channel_id` is set; a memory-only Channel store uses its
+    // live record keys.
+    // Gateway dashboard sessions are cancelled via the gateway's own per-session
+    // token and removed from the gateway backend. Channel-owned keys go through
+    // the shared Channel lifecycle so any active Channel turn is cancelled +
+    // waited before the record is removed; they must NOT touch the gateway
+    // cancel_tokens map, and a `gw_` key must NOT enter the Channel registry.
+    let memory_channel_keys = state.channel_sessions.cached_keys_for_test();
+    let channel_backend = state.channel_sessions.backend().map(std::sync::Arc::as_ref);
+    let is_channel_owned = zeroclaw_tools::sessions::is_channel_owned_session(
+        channel_backend,
+        &memory_channel_keys,
+        &session_key,
+    );
     if session_key.starts_with("gw_") {
         let token = state
             .cancel_tokens
@@ -1882,23 +1918,8 @@ pub async fn handle_api_session_delete(
                 "cancelled in-flight turn for deleted session"
             );
         }
-
-        match backend.delete_session(&session_key) {
-            Ok(true) => {
-                Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
-            }
-            Ok(false) => (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Session not found"})),
-            )
-                .into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
-            )
-                .into_response(),
-        }
-    } else {
+        delete_backend_session(backend.as_ref(), &session_key, &id)
+    } else if is_channel_owned {
         match state.channel_sessions.delete_session(&session_key).await {
             Ok(true) => {
                 Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
@@ -1914,6 +1935,10 @@ pub async fn handle_api_session_delete(
             )
                 .into_response(),
         }
+    } else {
+        // Unattributed non-gateway records are backend-owned. Do not touch the
+        // gateway token map or the Channel in-flight registry.
+        delete_backend_session(backend.as_ref(), &session_key, &id)
     }
 }
 
@@ -5150,7 +5175,7 @@ pub(crate) mod tests {
     /// entry and removes the backend record; it must NOT touch the Channel
     /// active-turn registry.
     #[tokio::test]
-    async fn session_delete_gw_key_uses_cancel_tokens_not_channel_registry() {
+    async fn gw_delete_uses_gateway_cancel_token_and_backend_only() {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
         // Seed a gw_ session in the backend so delete reports it existed.
@@ -5192,9 +5217,11 @@ pub(crate) mod tests {
     /// `cancel_tokens` map, and a `gw_` key must not enter the Channel path.
     #[tokio::test]
     async fn session_delete_channel_key_uses_shared_lifecycle_not_cancel_tokens() {
-        use zeroclaw_infra::session_backend::ConditionalSessionWrite;
+        use zeroclaw_infra::session_backend::{ConditionalSessionWrite, SessionContext};
         let tmp = tempfile::TempDir::new().unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
         let channel_sessions = Arc::new(
             zeroclaw_infra::channel_conversation::ChannelConversationStore::new(Some(Arc::clone(
                 &backend,
@@ -5202,6 +5229,16 @@ pub(crate) mod tests {
         );
         let key = "whatsapp.main_room_alice";
         let id = channel_sessions.resolve_conversation_id(key).unwrap();
+        backend
+            .set_session_context(
+                key,
+                SessionContext {
+                    channel_id: Some("whatsapp.main"),
+                    room_id: Some("room"),
+                    sender_id: Some("alice"),
+                },
+            )
+            .unwrap();
         // Seed a Channel turn so the record exists and its token can be
         // cancelled by the shared delete.
         let token = tokio_util::sync::CancellationToken::new();
@@ -5284,5 +5321,95 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(resp.into_response().status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The gateway API delete uses the same metadata-driven ownership rule as
+    /// `SessionResetTool`/`SessionDeleteTool` (`is_channel_owned_session`), not
+    /// a `!gw_` prefix guess: a non-`gw_` durable record remains non-channel
+    /// until its `session_metadata.channel_id` is stamped.
+    #[tokio::test]
+    async fn channel_delete_requires_channel_metadata_not_non_gw_guess() {
+        use zeroclaw_infra::session_backend::SessionContext;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let channel_sessions = zeroclaw_infra::channel_conversation::ChannelConversationStore::new(
+            Some(Arc::clone(&backend)),
+        );
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(Arc::clone(&backend));
+        state.channel_sessions = Arc::new(channel_sessions);
+
+        // A `gw_` key is never channel-owned.
+        let memory_keys = state.channel_sessions.cached_keys_for_test();
+        assert!(!zeroclaw_tools::sessions::is_channel_owned_session(
+            Some(backend.as_ref()),
+            &memory_keys,
+            "gw_dashboard",
+        ));
+
+        // A non-`gw_` key with NO record and NO channel metadata is NOT
+        // channel-owned (this is the guard against the `!gw_` guess).
+        assert!(!zeroclaw_tools::sessions::is_channel_owned_session(
+            Some(backend.as_ref()),
+            &memory_keys,
+            "whatsapp.main_room_nobody",
+        ));
+
+        // A durable record alone does not prove Channel ownership.
+        let key = "whatsapp.main_room_alice";
+        let _ = state.channel_sessions.resolve_conversation_id(key).unwrap();
+        let backend_ref: &dyn SessionBackend = backend.as_ref();
+        assert!(!zeroclaw_tools::sessions::is_channel_owned_session(
+            Some(backend_ref),
+            &memory_keys,
+            key,
+        ));
+        let decoy = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(key.to_string(), decoy.clone());
+        let response = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(key.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!decoy.is_cancelled());
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock")
+                .contains_key(key),
+            "unattributed non-gw delete must not touch gateway cancel tokens"
+        );
+
+        // Re-create and stamp reliable channel metadata to establish ownership.
+        let _ = state.channel_sessions.resolve_conversation_id(key).unwrap();
+        // Stamping reliable channel metadata makes the same record Channel-owned.
+        backend
+            .set_session_context(
+                key,
+                SessionContext {
+                    channel_id: Some("whatsapp.main"),
+                    room_id: Some("room"),
+                    sender_id: Some("alice"),
+                },
+            )
+            .unwrap();
+        assert!(
+            zeroclaw_tools::sessions::is_channel_owned_session(
+                Some(backend_ref),
+                &memory_keys,
+                key,
+            ),
+            "channel_id metadata must establish Channel ownership"
+        );
     }
 }

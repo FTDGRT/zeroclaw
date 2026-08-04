@@ -551,6 +551,8 @@ async fn handle_alias_task(
         Some(&session_id),
         Some(&alias),
         Some(&conversation_id),
+        &[],
+        None,
     )
     .await
     {

@@ -832,6 +832,8 @@ pub async fn agent_turn(
         conversation_id,
         turn_id,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -867,6 +869,8 @@ async fn agent_turn_with_sop_reassembly(
     conversation_id: Option<&str>,
     turn_id: Option<&str>,
     sop_reassembly: Option<SopStepReassembly<'_>>,
+    cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    new_messages_out: Option<&mut Vec<ChatMessage>>,
 ) -> Result<String> {
     let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
     #[cfg(test)]
@@ -930,14 +934,14 @@ async fn agent_turn_with_sop_reassembly(
         history,
         channel_name,
         channel_reply_target,
-        cancellation_token: None,
+        cancellation_token,
         on_delta: None,
         shared_budget: None, // no shared budget for agent_turn callers
         channel,
         collected_receipts: None,
         event_tx: None,
         steering: None,
-        new_messages_out: None,
+        new_messages_out,
         image_cache: None,
         // Origin and the per-turn memory half are threaded from the entry
         // point; source/transport/trust stay phase-1 placeholders until
@@ -2990,6 +2994,17 @@ async fn repl_loop<R: ReplInput>(
     Ok(())
 }
 
+/// Result of a non-interactive agent turn, including the complete provider
+/// transcript after tool calls and retries.
+#[derive(Debug, Clone)]
+pub struct ProcessMessageOutcome {
+    pub response: String,
+    pub history: Vec<ChatMessage>,
+}
+
+/// Run one non-interactive message through the agent tool loop.
+///
+/// This compatibility wrapper preserves the historic String-returning API.
 pub async fn process_message(
     config: Config,
     agent_alias: &str,
@@ -2998,6 +3013,33 @@ pub async fn process_message(
     origin: TurnOrigin,
     conversation_id: Option<&str>,
 ) -> Result<String> {
+    Ok(process_message_with_history(
+        config,
+        agent_alias,
+        message,
+        session_id,
+        origin,
+        conversation_id,
+        &[],
+        None,
+        None,
+    )
+    .await?
+    .response)
+}
+
+/// Channel-capable variant returning the complete provider transcript.
+pub async fn process_message_with_history(
+    config: Config,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+    conversation_id: Option<&str>,
+    prior_history: &[ChatMessage],
+    cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    channel_sessions: Option<Arc<zeroclaw_infra::channel_conversation::ChannelConversationStore>>,
+) -> Result<ProcessMessageOutcome> {
     use ::zeroclaw_log::Instrument;
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
@@ -3029,6 +3071,7 @@ pub async fn process_message(
     let __zc_message = message.to_string();
     let __zc_session_id = session_id.map(str::to_string);
     let __zc_conversation_id = conversation_id.map(str::to_string);
+    let __zc_prior_history = prior_history.to_vec();
     let __zc_attribution_span =
         ::zeroclaw_log::attribution_span!(&crate::agent::AgentAttribution(__zc_alias.as_str()));
     let __zc_scope_span = ::zeroclaw_log::info_span!(
@@ -3150,7 +3193,7 @@ pub async fn process_message(
             sop_engine,
             sop_audit,
             None,
-            None,
+            channel_sessions,
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -3448,7 +3491,7 @@ pub async fn process_message(
             &config.skills.extra_registries,
             config.skills.install_suggestions.enabled,
         ) {
-            return Ok(suggestion);
+            return Ok((suggestion, Vec::new()));
         }
 
         // Memory context is injected once in the engine, keyed on the ingress
@@ -3488,10 +3531,11 @@ pub async fn process_message(
             format!("{context}[{now}] {effective_message}")
         };
 
-        let mut history = vec![
-            ChatMessage::system(&system_prompt),
-            ChatMessage::user(&enriched),
-        ];
+        let mut history = Vec::with_capacity(__zc_prior_history.len() + 2);
+        history.push(ChatMessage::system(&system_prompt));
+        history.extend(__zc_prior_history);
+        history.push(ChatMessage::user(&enriched));
+        let mut generated_history = Vec::new();
         let mut excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
             &agent.resolved.tool_filter_groups,
@@ -3514,7 +3558,7 @@ pub async fn process_message(
             .as_ref()
             .map(|c| c as &dyn zeroclaw_api::channel::Channel);
 
-        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+        let response = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 thinking_params.native_thinking,
                 agent_turn_with_sop_reassembly(
@@ -3559,14 +3603,18 @@ pub async fn process_message(
                     conversation_id,
                     Some(&turn_id),
                     Some(SopStepReassembly { config: &config }),
+                    cancellation_token,
+                    Some(&mut generated_history),
                 ),
             )
-            .await
+            .await;
+        Ok((response?, generated_history))
     };
-    __zc_body
+    let (response, history) = __zc_body
         .instrument(__zc_scope_span)
         .instrument(__zc_attribution_span)
-        .await
+        .await?;
+    Ok(ProcessMessageOutcome { response, history })
 }
 
 #[cfg(test)]
@@ -16002,6 +16050,24 @@ Let me check the result."#;
         );
     }
 
+    #[test]
+    fn process_message_public_api_accepts_original_six_arguments() {
+        fn assert_future<F>(_: F)
+        where
+            F: std::future::Future<Output = anyhow::Result<String>>,
+        {
+        }
+
+        assert_future(super::process_message(
+            zeroclaw_config::schema::Config::default(),
+            "compat-agent",
+            "hello",
+            None,
+            TurnOrigin::SubTurn,
+            None,
+        ));
+    }
+
     #[tokio::test]
     async fn process_message_provides_sop_reassembly_to_agent_turn() {
         use zeroclaw_config::schema::{
@@ -16788,7 +16854,13 @@ Let me check the result."#;
 
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+        let mut history = vec![
+            ChatMessage::system("test"),
+            ChatMessage::user("old ".repeat(2_000)),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("hello"),
+        ];
+        let mut generated_history = Vec::new();
 
         let result = run_tool_call_loop(ToolLoop {
             conversation_id: None,
@@ -16817,7 +16889,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_token_budget: 128,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -16831,7 +16903,7 @@ Let me check the result."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+            new_messages_out: Some(&mut generated_history),
             image_cache: None,
             memory: None,
             ingress: IngressContext::sub_turn(),
@@ -16842,6 +16914,24 @@ Let me check the result."#;
         .expect("tool loop should succeed");
 
         assert_eq!(result, "done");
+        assert!(
+            history
+                .iter()
+                .all(|message| !message.content.starts_with("old ")),
+            "oversized prior turn must be trimmed"
+        );
+        let generated_roles: Vec<&str> = generated_history
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect();
+        assert_eq!(generated_roles.len(), 3);
+        assert_eq!(generated_roles[0], "assistant");
+        assert!(matches!(generated_roles[1], "tool" | "user"));
+        assert_eq!(generated_roles[2], "assistant");
+        assert_eq!(
+            generated_history[2].content, "done",
+            "current tool-call/result/final transcript survives prior-history trimming"
+        );
 
         let events = capturing.events.lock();
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("cli"));
