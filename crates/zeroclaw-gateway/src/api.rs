@@ -1896,7 +1896,11 @@ pub async fn handle_api_session_delete(
     // the shared Channel lifecycle so any active Channel turn is cancelled +
     // waited before the record is removed; they must NOT touch the gateway
     // cancel_tokens map, and a `gw_` key must NOT enter the Channel registry.
-    let memory_channel_keys = state.channel_sessions.cached_keys_for_test();
+    let memory_channel_keys = if state.channel_sessions.contains_memory_record(&session_key) {
+        vec![session_key.clone()]
+    } else {
+        Default::default()
+    };
     let channel_backend = state.channel_sessions.backend().map(std::sync::Arc::as_ref);
     let is_channel_owned = zeroclaw_tools::sessions::is_channel_owned_session(
         channel_backend,
@@ -5342,7 +5346,7 @@ pub(crate) mod tests {
         state.channel_sessions = Arc::new(channel_sessions);
 
         // A `gw_` key is never channel-owned.
-        let memory_keys = state.channel_sessions.cached_keys_for_test();
+        let memory_keys = Vec::new();
         assert!(!zeroclaw_tools::sessions::is_channel_owned_session(
             Some(backend.as_ref()),
             &memory_keys,

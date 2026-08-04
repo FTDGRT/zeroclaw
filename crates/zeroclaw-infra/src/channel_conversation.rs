@@ -11,12 +11,11 @@
 //!
 //! The captured conversation id is also a write fence: history append / update
 //! / rollback / compaction are conditional on the record still carrying the id
-//! the turn captured before any async work began. A stale (rotated) or deleted
-//! result is an expected lifecycle race, not retried, and must not recreate a
-//! record. Active Channel turn workers register a lease here so `/new`,
-//! `/clear`, and delete can cancel and wait for competing workers (excluding
-//! the commanding turn) before mutating; the conditional write remains the
-//! final correctness boundary.
+//! the turn captured before any async work began. A stale or deleted result is
+//! an expected lifecycle race, not retried, and must not recreate a record.
+//! Active Channel turn workers register cancellation tokens here so `/new`,
+//! `/clear`, and delete can stop competing workers before deleting the record;
+//! the conditional write remains the final correctness boundary.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -223,27 +222,6 @@ impl ChannelConversationStore {
         }
     }
 
-    pub async fn reset_session(&self, history_key: &str) -> std::io::Result<String> {
-        self.cancel_in_flight(history_key).await;
-        let lock = self.persistence_lock(history_key).await;
-        let _guard = lock.lock().await;
-        if let Some(backend) = &self.backend {
-            let id = backend.clear_and_rotate_conversation(history_key)?;
-            self.cache.lock().pop(history_key);
-            return Ok(id);
-        }
-        let mut cache = self.cache.lock();
-        let id = uuid::Uuid::new_v4().to_string();
-        cache.put(
-            history_key.to_string(),
-            CachedChannelSession::Memory(MemorySessionRecord {
-                history: Vec::new(),
-                conversation_id: id.clone(),
-            }),
-        );
-        Ok(id)
-    }
-
     pub async fn delete_session(&self, history_key: &str) -> std::io::Result<bool> {
         self.delete(history_key).await
     }
@@ -282,6 +260,15 @@ impl ChannelConversationStore {
         self.backend.as_ref()
     }
 
+    /// Whether the memory-only store currently owns `history_key`.
+    pub fn contains_memory_record(&self, history_key: &str) -> bool {
+        self.backend.is_none()
+            && matches!(
+                self.cache.lock().peek(history_key),
+                Some(CachedChannelSession::Memory(_))
+            )
+    }
+
     // ── conversation-id resolve / rotate ───────────────────────────────
 
     /// Resolve the opaque cross-turn conversation id for a `history_key`.
@@ -308,41 +295,6 @@ impl ChannelConversationStore {
                 conversation_id: id.clone(),
             }),
         );
-        Ok(id)
-    }
-
-    /// Atomically clear the session history AND rotate the conversation id for
-    /// a `history_key`, returning the fresh id.
-    ///
-    /// In durable mode this is one record-scoped backend op (clear history +
-    /// new id together) and also drops any `DurableHistory` cache view so the
-    /// next load re-reads the cleared backend. In memory-only mode the
-    /// `Memory` record's id is replaced and its history cleared (the entry is
-    /// kept, not evicted). On backend failure the error is propagated verbatim.
-    pub fn clear_and_rotate_conversation(&self, history_key: &str) -> std::io::Result<String> {
-        if let Some(backend) = &self.backend {
-            let id = backend.clear_and_rotate_conversation(history_key)?;
-            self.cache.lock().pop(history_key);
-            return Ok(id);
-        }
-
-        let mut cache = self.cache.lock();
-        let id = uuid::Uuid::new_v4().to_string();
-        match cache.get_mut(history_key) {
-            Some(CachedChannelSession::Memory(rec)) => {
-                rec.conversation_id = id.clone();
-                rec.history.clear();
-            }
-            _ => {
-                cache.put(
-                    history_key.to_string(),
-                    CachedChannelSession::Memory(MemorySessionRecord {
-                        history: Vec::new(),
-                        conversation_id: id.clone(),
-                    }),
-                );
-            }
-        }
         Ok(id)
     }
 
@@ -408,7 +360,11 @@ impl ChannelConversationStore {
         max_history: usize,
     ) -> std::io::Result<ConditionalSessionWrite> {
         if let Some(backend) = &self.backend {
-            let status = backend.append_if_conversation_matches(key, expected_id, &message)?;
+            let status = backend.mutate_conversation_if_current(
+                key,
+                expected_id,
+                crate::SessionMutation::Append(&message),
+            )?;
             if status == ConditionalSessionWrite::Applied {
                 let mut cache = self.cache.lock();
                 if let Some(CachedChannelSession::DurableHistory(history)) = cache.get_mut(key) {
@@ -449,7 +405,14 @@ impl ChannelConversationStore {
         expected_content: &str,
     ) -> std::io::Result<ConditionalSessionWrite> {
         if let Some(backend) = &self.backend {
-            let status = backend.remove_last_if_conversation_matches(key, expected_id)?;
+            let status = backend.mutate_conversation_if_current(
+                key,
+                expected_id,
+                crate::SessionMutation::RemoveLast {
+                    expected_role,
+                    expected_content,
+                },
+            )?;
             if status == ConditionalSessionWrite::Applied {
                 let mut cache = self.cache.lock();
                 if let Some(CachedChannelSession::DurableHistory(history)) = cache.get_mut(key) {
@@ -494,10 +457,9 @@ impl ChannelConversationStore {
             // reset/delete cache invalidation. Lifecycle backend operations do
             // not retain their own lock while waiting for this cache lock.
             let mut cache = self.cache.lock();
-            if !backend.session_exists(key) {
+            let Some(current) = backend.current_conversation_id(key)? else {
                 return Ok(ConditionalSessionWrite::Deleted);
-            }
-            let current = backend.resolve_or_create_conversation_id(key)?;
+            };
             if current != expected_id {
                 return Ok(ConditionalSessionWrite::Stale);
             }
@@ -536,24 +498,13 @@ impl ChannelConversationStore {
             .count()
     }
 
-    /// All cached history keys (memory or durable). Test-intended observable so
-    /// integration tests in downstream crates that previously iterated the
-    /// orchestrator's history map can still enumerate which senders have a
-    /// cached view. Kept `pub` (not `cfg(test)`) because downstream test crates
-    /// compile this crate in non-test mode; it is a read-only accessor with no
-    /// production callers.
-    pub fn cached_keys_for_test(&self) -> Vec<String> {
+    /// Return the keys currently materialized in the bounded history cache.
+    pub fn cached_keys(&self) -> Vec<String> {
         self.cache.lock().iter().map(|(k, _)| k.clone()).collect()
     }
 
-    /// Test-only snapshot of the current record for `history_key`, returning
-    /// `None` when the record is absent. Mirrors the open path's id+history view
-    /// WITHOUT creating a record on miss, so a harness can assert "gone after
-    /// delete" without recreating it. Durable mode reads the backend id via
-    /// metadata (no create); memory-only peeks the LRU. Kept `pub` (not
-    /// `cfg(test)`) because downstream test crates compile this crate in non-test
-    /// mode; it is a read-only accessor with no production callers.
-    pub async fn existing_record_for_test(
+    /// Read the current complete record without creating one on a miss.
+    pub async fn existing_record(
         &self,
         history_key: &str,
     ) -> Option<crate::ChannelConversationRecord> {
@@ -593,11 +544,12 @@ mod tests {
     use crate::session_sqlite::SqliteSessionBackend;
     use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
     use std::sync::mpsc::{Receiver, SyncSender};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     const BLOCK_NONE: u8 = 0;
     const BLOCK_LOAD: u8 = 1;
-    const BLOCK_RESOLVE: u8 = 2;
+    const BLOCK_CURRENT_ID: u8 = 2;
 
     struct BlockingBackend {
         inner: Arc<dyn SessionBackend>,
@@ -620,7 +572,10 @@ mod tests {
                 .is_ok()
             {
                 self.reached.send(()).unwrap();
-                self.release.lock().recv().unwrap();
+                self.release
+                    .lock()
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("blocked backend operation must be released");
             }
         }
     }
@@ -654,10 +609,21 @@ mod tests {
             self.inner.session_exists(key)
         }
 
-        fn resolve_or_create_conversation_id(&self, key: &str) -> std::io::Result<String> {
-            let id = self.inner.resolve_or_create_conversation_id(key)?;
-            self.maybe_block(BLOCK_RESOLVE);
+        fn open_conversation(
+            &self,
+            key: &str,
+        ) -> std::io::Result<crate::ChannelConversationRecord> {
+            self.inner.open_conversation(key)
+        }
+
+        fn current_conversation_id(&self, key: &str) -> std::io::Result<Option<String>> {
+            let id = self.inner.current_conversation_id(key)?;
+            self.maybe_block(BLOCK_CURRENT_ID);
             Ok(id)
+        }
+
+        fn resolve_or_create_conversation_id(&self, key: &str) -> std::io::Result<String> {
+            self.inner.resolve_or_create_conversation_id(key)
         }
 
         fn clear_and_rotate_conversation(&self, key: &str) -> std::io::Result<String> {
@@ -835,27 +801,6 @@ mod tests {
     }
 
     #[test]
-    fn memory_append_after_rotate_is_stale_and_does_not_recreate() {
-        let state = ChannelConversationStore::new(None);
-        let key = "stale_key";
-        let id_a = state.resolve_conversation_id(key).unwrap();
-        let id_b = state.clear_and_rotate_conversation(key).unwrap();
-        assert_ne!(id_a, id_b);
-
-        // A worker holding the old id must see Stale, not Applied, and must not
-        // recreate old history.
-        assert_eq!(
-            state
-                .append_history_if_current(key, &id_a, ChatMessage::assistant("stale"), 50)
-                .unwrap(),
-            ConditionalSessionWrite::Stale
-        );
-        assert!(state.load_history(key).is_empty());
-        // The current id is still id_b.
-        assert_eq!(state.resolve_conversation_id(key).unwrap(), id_b);
-    }
-
-    #[test]
     fn memory_append_after_delete_is_deleted() {
         let state = ChannelConversationStore::new(None);
         let key = "deleted_key";
@@ -874,19 +819,6 @@ mod tests {
         // resurrect the old one).
         let id_after = state.resolve_conversation_id(key).unwrap();
         assert_ne!(id, id_after);
-    }
-
-    #[tokio::test]
-    async fn reset_cancels_without_waiting_for_worker() {
-        let state = ChannelConversationStore::new(None);
-        let key = "reset_without_wait";
-        let id_a = state.resolve_conversation_id(key).unwrap();
-        let token = CancellationToken::new();
-        state.register_in_flight(key, token.clone()).await;
-
-        let id_b = state.reset_session(key).await.unwrap();
-        assert!(token.is_cancelled());
-        assert_ne!(id_a, id_b);
     }
 
     #[tokio::test]
@@ -926,19 +858,28 @@ mod tests {
 
         let loader_state = Arc::clone(&state);
         let loader = tokio::task::spawn_blocking(move || loader_state.load_history(key));
-        tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
-            .await
-            .unwrap();
-        let reset_state = Arc::clone(&state);
-        let reset = zeroclaw_spawn::spawn!(async move { reset_state.reset_session(key).await });
-        tokio::task::spawn_blocking(move || lifecycle_rx.recv().unwrap())
-            .await
-            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            reached_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("backend operation must reach its blocking point")
+        })
+        .await
+        .unwrap();
+        let delete_state = Arc::clone(&state);
+        let delete = zeroclaw_spawn::spawn!(async move { delete_state.delete(key).await });
+        tokio::task::spawn_blocking(move || {
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("lifecycle operation must reach the backend")
+        })
+        .await
+        .unwrap();
         release_tx.send(()).unwrap();
         assert_eq!(loader.await.unwrap()[0].content, "A");
-        let id_b = reset.await.unwrap().unwrap();
-        assert_ne!(id_a, id_b);
+        assert!(delete.await.unwrap().unwrap());
         assert!(state.load_history(key).is_empty());
+        let id_b = state.open(key).await.unwrap().conversation_id;
+        assert_ne!(id_a, id_b);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -956,7 +897,7 @@ mod tests {
         let (lifecycle_tx, lifecycle_rx) = std::sync::mpsc::sync_channel(1);
         let backend_impl = Arc::new(BlockingBackend {
             inner,
-            block_point: AtomicU8::new(BLOCK_RESOLVE),
+            block_point: AtomicU8::new(BLOCK_CURRENT_ID),
             reached: reached_tx,
             release: Mutex::new(release_rx),
             lifecycle_done: lifecycle_tx,
@@ -969,22 +910,31 @@ mod tests {
         let compact = tokio::task::spawn_blocking(move || {
             compact_state.compact_history_if_current(key, &expected, |_| {})
         });
-        tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
-            .await
-            .unwrap();
-        let reset_state = Arc::clone(&state);
-        let reset = zeroclaw_spawn::spawn!(async move { reset_state.reset_session(key).await });
-        tokio::task::spawn_blocking(move || lifecycle_rx.recv().unwrap())
-            .await
-            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            reached_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("backend operation must reach its blocking point")
+        })
+        .await
+        .unwrap();
+        let delete_state = Arc::clone(&state);
+        let delete = zeroclaw_spawn::spawn!(async move { delete_state.delete(key).await });
+        tokio::task::spawn_blocking(move || {
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("lifecycle operation must reach the backend")
+        })
+        .await
+        .unwrap();
         release_tx.send(()).unwrap();
         assert_eq!(
             compact.await.unwrap().unwrap(),
             ConditionalSessionWrite::Applied
         );
-        let id_b = reset.await.unwrap().unwrap();
-        assert_ne!(id_a, id_b);
+        assert!(delete.await.unwrap().unwrap());
         assert!(state.load_history(key).is_empty());
+        let id_b = state.open(key).await.unwrap().conversation_id;
+        assert_ne!(id_a, id_b);
     }
 
     #[test]

@@ -167,15 +167,15 @@ impl SessionStore {
         };
         if legacy && upgrade {
             self.write_record_unlocked(key, &record)?;
-            if let Err(e) = std::fs::remove_file(self.meta_path(key)) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"error":e.to_string()})),
-                        "could not remove folded session sidecar"
-                    );
-                }
+            if let Err(e) = std::fs::remove_file(self.meta_path(key))
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error":e.to_string()})),
+                    "could not remove folded session sidecar"
+                );
             }
         }
         Ok(Some(record))
@@ -293,15 +293,15 @@ impl SessionStore {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                 Err(e) => return Err(e),
             };
-            if let Err(e) = std::fs::remove_file(self.meta_path(key)) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                        "could not remove legacy session sidecar"
-                    );
-                }
+            if let Err(e) = std::fs::remove_file(self.meta_path(key))
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "could not remove legacy session sidecar"
+                );
             }
             Ok(deleted)
         })
@@ -1054,11 +1054,11 @@ mod tests {
     // ── conditional-write (conversation-id fence) tests ───────────────
 
     #[test]
-    fn conditional_write_contract_jsonl() {
+    fn channel_conversation_contract_jsonl() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
         let backend: &dyn SessionBackend = &store;
-        crate::session_backend::assert_conditional_write_contract(backend);
+        crate::session_backend::assert_channel_conversation_contract(backend);
     }
 
     #[test]

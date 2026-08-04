@@ -552,11 +552,9 @@ pub struct SessionResetTool {
     backend: Arc<dyn SessionBackend>,
     security: Arc<SecurityPolicy>,
     ownership_scope: Option<SessionOwnershipScope>,
-    /// Shared Channel session lifecycle. When the target key is a
-    /// Channel-owned session and this handle is present, reset goes through the
-    /// shared lifecycle (`reset_session`, which cancels + waits competing
-    /// workers and rotates the conversation id). Otherwise reset clears the
-    /// backend history via `clear_and_rotate_conversation`.
+    /// Shared Channel session lifecycle. When the target key is Channel-owned,
+    /// reset cancels competing workers and deletes the current record. The next
+    /// ordinary message creates the replacement record.
     channel_sessions: Option<Arc<ChannelConversationStore>>,
 }
 
@@ -583,9 +581,8 @@ impl SessionResetTool {
         }
     }
 
-    /// Wire the shared Channel session lifecycle so a Channel-owned target key
-    /// resets through `reset_session` (cancel + wait competing workers, rotate
-    /// the conversation id). Non-Channel targets keep the backend-only path.
+    /// Wire the shared Channel lifecycle for Channel-owned reset targets.
+    /// Non-Channel targets keep the generic backend rotation path.
     pub fn with_channel_sessions(
         mut self,
         channel_sessions: Arc<ChannelConversationStore>,
@@ -663,17 +660,14 @@ impl Tool for SessionResetTool {
                 .unwrap_or_else(|| session_id.trim().to_string()),
         };
 
-        // A Channel-owned key (a record with `session_metadata.channel_id`, or
-        // a live memory-only record in the shared store) with the shared handle
-        // wired in resets through the lifecycle: cancel + wait competing
-        // workers, then rotate the conversation id and clear history. Gateway
-        // dashboard (`gw_`) and non-channel sessions keep the backend-only
-        // clear-and-rotate path. Ownership is metadata-driven, not a `!gw_`
-        // prefix guess.
+        // Channel reset deletes the current record; only the next ordinary
+        // message creates a replacement identity. Generic WS/RPC sessions keep
+        // the backend rotation behavior required by their durable lifecycle.
         let memory_channel_keys = self
             .channel_sessions
             .as_ref()
-            .map(|store| store.cached_keys_for_test())
+            .filter(|store| store.contains_memory_record(&target_session_key))
+            .map(|_| vec![target_session_key.clone()])
             .unwrap_or_default();
         let channel_backend = self
             .channel_sessions
@@ -682,7 +676,7 @@ impl Tool for SessionResetTool {
         let is_channel_owned =
             is_channel_owned_session(channel_backend, &memory_channel_keys, &target_session_key);
         if is_channel_owned && let Some(ref channel_sessions) = self.channel_sessions {
-            match channel_sessions.reset_session(&target_session_key).await {
+            match channel_sessions.delete(&target_session_key).await {
                 Ok(_) => Ok(ToolResult {
                     success: true,
                     output: format!("Session '{target_session_key}' reset.").into(),
@@ -841,7 +835,8 @@ impl Tool for SessionDeleteTool {
         let memory_channel_keys = self
             .channel_sessions
             .as_ref()
-            .map(|store| store.cached_keys_for_test())
+            .filter(|store| store.contains_memory_record(&target_session_key))
+            .map(|_| vec![target_session_key.clone()])
             .unwrap_or_default();
         let channel_backend = self
             .channel_sessions
@@ -1951,11 +1946,10 @@ mod tests {
         (tmp, backend)
     }
 
-    /// `sessions_reset` on a Channel-owned key with the shared handle wired
-    /// rotates the conversation id (UUID differs before/after) and clears
-    /// history.
+    /// `sessions_reset` deletes a Channel-owned record. A later ordinary open
+    /// creates the replacement identity.
     #[tokio::test]
-    async fn sessions_reset_channel_key_rotates_id_and_clears_history() {
+    async fn sessions_reset_channel_key_deletes_then_next_open_creates_id() {
         use zeroclaw_infra::channel_conversation::ChannelConversationStore;
         let key = "telegram__alice";
         let (_tmp, backend) = durable_channel_backend(key);
@@ -1971,10 +1965,13 @@ mod tests {
         let result = tool.execute(json!({"session_id": key})).await.unwrap();
         assert!(result.success, "reset must succeed");
 
-        // The id rotated and history is cleared.
-        let id_after = channel_sessions.resolve_conversation_id(key).unwrap();
-        assert_ne!(id_before, id_after, "reset must rotate the conversation id");
-        assert!(backend.load(key).is_empty(), "reset must clear history");
+        assert!(!backend.session_exists(key), "reset must delete the record");
+        assert!(
+            channel_sessions.existing_record(key).await.is_none(),
+            "reset must not retain an empty record"
+        );
+        let id_after = channel_sessions.open(key).await.unwrap().conversation_id;
+        assert_ne!(id_before, id_after, "the next open must create a new id");
     }
 
     /// `sessions_delete` on a Channel-owned key with the shared handle wired
@@ -2005,10 +2002,10 @@ mod tests {
         );
     }
 
-    /// With an active Channel lease present, reset/delete cancel + wait for it,
-    /// and the stale conditional append gets Stale / Deleted respectively.
+    /// With an active Channel turn present, reset cancels it and deletes the
+    /// record, so a stale conditional append gets `Deleted`.
     #[tokio::test]
-    async fn sessions_reset_with_active_lease_cancels_and_makes_append_stale() {
+    async fn sessions_reset_with_active_turn_cancels_and_makes_append_deleted() {
         use zeroclaw_infra::channel_conversation::ChannelConversationStore;
         use zeroclaw_infra::session_backend::ConditionalSessionWrite;
         let key = "telegram__alice";
@@ -2036,12 +2033,11 @@ mod tests {
             "reset must cancel the active Channel lease"
         );
 
-        // The stale append (with the pre-rotation id) is Stale.
         assert_eq!(
             channel_sessions
                 .append_history_if_current(key, &id, ChatMessage::assistant("stale"), 50)
                 .unwrap(),
-            ConditionalSessionWrite::Stale
+            ConditionalSessionWrite::Deleted
         );
     }
 
@@ -2135,8 +2131,7 @@ mod tests {
         // Memory-only (no backend): a live Channel record in the store's key
         // set is the signal. `legacy_internal_key` is not in the set.
         let _ = store;
-        let memory_store = ChannelConversationStore::new(None);
-        let memory_keys = memory_store.cached_keys_for_test();
+        let memory_keys = vec!["memory_key".to_string()];
         assert!(!is_channel_owned_session(
             None,
             &memory_keys,
@@ -2144,19 +2139,17 @@ mod tests {
         ));
     }
 
-    /// When the shared store's reset storage op fails, the in-memory record is
-    /// kept (not cleared): the LRU entry survives so a retry can re-attempt.
-    /// `reset_session` returns the error; the cache pop is skipped on failure.
+    /// When Channel reset cannot delete durable storage, the current record is
+    /// kept intact so a retry can re-attempt the lifecycle operation.
     #[tokio::test]
     async fn channel_reset_storage_failure_keeps_memory_record() {
         use zeroclaw_infra::channel_conversation::ChannelConversationStore;
 
-        // A backend whose `clear_and_rotate_conversation` always fails, so the
-        // durable `reset_session` path returns Err without popping the cache.
-        struct FailingRotateBackend {
+        // A backend whose record deletion always fails.
+        struct FailingDeleteBackend {
             inner: Arc<dyn SessionBackend>,
         }
-        impl SessionBackend for FailingRotateBackend {
+        impl SessionBackend for FailingDeleteBackend {
             fn load(&self, k: &str) -> Vec<ChatMessage> {
                 self.inner.load(k)
             }
@@ -2169,11 +2162,8 @@ mod tests {
             fn list_sessions(&self) -> Vec<String> {
                 self.inner.list_sessions()
             }
-            fn delete_session(&self, k: &str) -> std::io::Result<bool> {
-                self.inner.delete_session(k)
-            }
-            fn clear_and_rotate_conversation(&self, _k: &str) -> std::io::Result<String> {
-                Err(std::io::Error::other("injected rotate failure"))
+            fn delete_session(&self, _k: &str) -> std::io::Result<bool> {
+                Err(std::io::Error::other("injected delete failure"))
             }
             fn current_conversation_id(&self, k: &str) -> std::io::Result<Option<String>> {
                 self.inner.current_conversation_id(k)
@@ -2232,7 +2222,7 @@ mod tests {
         }
 
         let (_tmp, inner) = test_backend();
-        let backend: Arc<dyn SessionBackend> = Arc::new(FailingRotateBackend {
+        let backend: Arc<dyn SessionBackend> = Arc::new(FailingDeleteBackend {
             inner: Arc::clone(&inner),
         });
         let channel_sessions = Arc::new(ChannelConversationStore::new(Some(Arc::clone(&backend))));
@@ -2244,7 +2234,7 @@ mod tests {
         // The record exists with one message before the failed reset.
         assert_eq!(
             channel_sessions
-                .existing_record_for_test(key)
+                .existing_record(key)
                 .await
                 .map(|r| r.history.len())
                 .unwrap_or(0),
@@ -2260,17 +2250,15 @@ mod tests {
             "reset must report failure when the storage op fails"
         );
 
-        // The in-memory record survived the failed reset: the backend still
-        // carries the pre-rotation id, so a stale append against it is Applied
-        // (the record was not cleared/rotated).
+        // The durable record survived the failed reset unchanged.
         assert_eq!(
             backend.current_conversation_id(key).unwrap().as_deref(),
             Some(id.as_str()),
-            "failed reset must keep the pre-rotation conversation id"
+            "failed reset must keep the current conversation id"
         );
         assert_eq!(
             channel_sessions
-                .existing_record_for_test(key)
+                .existing_record(key)
                 .await
                 .map(|r| r.history.len())
                 .unwrap_or(0),

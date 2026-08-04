@@ -15093,7 +15093,7 @@ api_key = "anthropic-key"
 
         /// Build a harness whose `ChannelConversationStore` is backed by a REAL
         /// durable JSONL `SessionStore` at `tmp`. Used to regression-test that
-        /// `is_current` / `existing_record_for_test` do not silently drop
+        /// `is_current` / `existing_record` do not silently drop
         /// durable JSONL turns (the trait-default `get_session_metadata` leaves
         /// `conversation_id` unset for JSONL).
         fn with_jsonl_backend(tmp: &tempfile::TempDir) -> Self {
@@ -18044,7 +18044,7 @@ BTC is currently around $65,000 based on latest tool output."#
         // not carry a `[receipt: ` trailer either, otherwise an LLM trained
         // on echoing receipts could leak signed-looking output even though
         // nothing was actually signed.
-        for key in runtime_ctx.channel_sessions.cached_keys_for_test() {
+        for key in runtime_ctx.channel_sessions.cached_keys() {
             let turns = runtime_ctx.channel_sessions.load_history(&key);
             for msg in turns.iter() {
                 assert!(
@@ -24902,7 +24902,7 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
-        let sender_keys: Vec<String> = runtime_ctx.channel_sessions.cached_keys_for_test();
+        let sender_keys: Vec<String> = runtime_ctx.channel_sessions.cached_keys();
         // Find the actual history key by scanning all stored senders —
         // sanitize_session_key may mangle "chat:42" so we don't assume
         // a literal key.
@@ -30898,7 +30898,7 @@ Done."#;
         let record = harness
             .ctx
             .channel_sessions
-            .existing_record_for_test(&key)
+            .existing_record(&key)
             .await
             .expect("record must exist after two turns");
         let user_turns: Vec<&ChatMessage> =
@@ -30930,7 +30930,7 @@ Done."#;
     async fn durable_jsonl_turn_persists_and_replies_through_turn_may_continue() {
         // Regression: the JSONL SessionStore does NOT override
         // get_session_metadata, so the trait default returns
-        // conversation_id: None. is_current / existing_record_for_test must NOT
+        // conversation_id: None. is_current / existing_record must NOT
         // rely on that path, or every durable JSONL turn is silently dropped
         // (turn_may_continue returns false before the provider/reply). Drive a
         // full turn through the real dispatch path on a JSONL backend and assert
@@ -30952,7 +30952,7 @@ Done."#;
         // turn_may_continue must report the record current (not silently false).
         let record = ctx
             .channel_sessions
-            .existing_record_for_test(&key)
+            .existing_record(&key)
             .await
             .expect("durable JSONL record must persist after the turn");
         assert!(
@@ -31076,7 +31076,7 @@ Done."#;
 
         let id_a = ctx
             .channel_sessions
-            .existing_record_for_test(&key)
+            .existing_record(&key)
             .await
             .expect("record must exist after first turn")
             .conversation_id;
@@ -31102,10 +31102,7 @@ Done."#;
         drop(sent);
 
         assert!(
-            ctx.channel_sessions
-                .existing_record_for_test(&key)
-                .await
-                .is_none(),
+            ctx.channel_sessions.existing_record(&key).await.is_none(),
             "record must be gone after /new"
         );
 
@@ -31115,7 +31112,7 @@ Done."#;
 
         let record_b = ctx
             .channel_sessions
-            .existing_record_for_test(&key)
+            .existing_record(&key)
             .await
             .expect("fresh record must exist after second message");
         assert_ne!(
@@ -31140,10 +31137,16 @@ Done."#;
         let id_a0 = resolve_channel_conversation_id(&ctx, key_a).unwrap();
         let id_b0 = resolve_channel_conversation_id(&ctx, key_b).unwrap();
 
-        ctx.channel_sessions.reset_session(key_a).await.unwrap();
+        ctx.channel_sessions.delete(key_a).await.unwrap();
+        assert!(ctx.channel_sessions.existing_record(key_a).await.is_none());
 
-        let id_a1 = resolve_channel_conversation_id(&ctx, key_a).unwrap();
-        assert_ne!(id_a0, id_a1, "durable rotation must mint a fresh id");
+        let id_a1 = ctx
+            .channel_sessions
+            .open(key_a)
+            .await
+            .unwrap()
+            .conversation_id;
+        assert_ne!(id_a0, id_a1, "the next open must mint a fresh id");
         assert_eq!(
             resolve_channel_conversation_id(&ctx, key_b).unwrap(),
             id_b0,
@@ -31346,9 +31349,7 @@ Done."#;
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
                 let runtime = tokio::runtime::Runtime::new().unwrap();
-                runtime
-                    .block_on(ctx.channel_sessions.reset_session(&key))
-                    .unwrap();
+                let _ = runtime.block_on(ctx.channel_sessions.delete(&key)).unwrap();
             }));
         }
         for h in handles {
@@ -31381,9 +31382,7 @@ Done."#;
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
                 let runtime = tokio::runtime::Runtime::new().unwrap();
-                runtime
-                    .block_on(ctx.channel_sessions.reset_session(&key))
-                    .unwrap();
+                let _ = runtime.block_on(ctx.channel_sessions.delete(&key)).unwrap();
             }));
         }
         for h in handles {
@@ -31443,25 +31442,14 @@ Done."#;
         // Wait until the old turn is blocked inside its body.
         entered.notified().await;
 
-        // Reset while the old turn is blocked, excluding it (its lease id) so
-        // the reset does not wait on the still-blocked turn (which would
-        // deadlock) - mirroring `/new` excluding the commanding turn.
-        let id_b = ctx.channel_sessions.reset_session(key).await.unwrap();
+        ctx.channel_sessions.delete(key).await.unwrap();
         assert!(token.is_cancelled());
-        assert_ne!(id_a_captured, id_b, "reset must mint a fresh id");
+        assert!(ctx.channel_sessions.existing_record(key).await.is_none());
 
         // Release the old turn; its append uses the stale id A.
         release.notify_one();
         handle.await.unwrap();
 
-        // B's history is empty (the stale append did not land).
-        assert!(ctx.channel_sessions.load_history(key).is_empty());
-        // The current id is B; A's content never leaked in.
-        assert_eq!(
-            ctx.channel_sessions.resolve_conversation_id(key).unwrap(),
-            id_b
-        );
-        // Re-appending with the stale id A is Stale (no recreation).
         assert_eq!(
             ctx.channel_sessions
                 .append_history_if_current(
@@ -31471,8 +31459,15 @@ Done."#;
                     50
                 )
                 .unwrap(),
-            ConditionalSessionWrite::Stale
+            ConditionalSessionWrite::Deleted
         );
+        let id_b = ctx
+            .channel_sessions
+            .open(key)
+            .await
+            .unwrap()
+            .conversation_id;
+        assert_ne!(id_a_captured, id_b);
         assert!(ctx.channel_sessions.load_history(key).is_empty());
     }
 
@@ -31494,7 +31489,7 @@ Done."#;
         });
         harness.wait_hook_entered().await;
 
-        let id_b = ctx.channel_sessions.reset_session(&key).await.unwrap();
+        ctx.channel_sessions.delete(&key).await.unwrap();
 
         harness.release_hook();
         worker.await.unwrap();
@@ -31512,17 +31507,8 @@ Done."#;
         drop(sent);
 
         assert!(
-            ctx.channel_sessions
-                .existing_record_for_test(&key)
-                .await
-                .is_none()
-                || ctx
-                    .channel_sessions
-                    .existing_record_for_test(&key)
-                    .await
-                    .map(|r| r.conversation_id == id_b)
-                    .unwrap_or(true),
-            "reset must leave no stale record content from the old turn"
+            ctx.channel_sessions.existing_record(&key).await.is_none(),
+            "reset must delete the record without recreating it"
         );
         assert!(
             ctx.channel_sessions
@@ -31570,7 +31556,7 @@ Done."#;
         );
         drop(sent);
 
-        let record = ctx.channel_sessions.existing_record_for_test(&key).await;
+        let record = ctx.channel_sessions.existing_record(&key).await;
         assert!(
             record.is_none()
                 || record

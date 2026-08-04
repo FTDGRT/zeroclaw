@@ -410,7 +410,7 @@ pub struct SessionState {
 /// JSONL and SQLite backends are pinned to ONE identical semantics. Both call
 /// this from their own test modules plus a backend-specific error test.
 #[cfg(test)]
-pub(crate) fn assert_conditional_write_contract(backend: &dyn SessionBackend) {
+pub(crate) fn assert_channel_conversation_contract(backend: &dyn SessionBackend) {
     let key = "channel.main_room_alice";
     let opened = backend.open_conversation(key).unwrap();
     let parsed = uuid::Uuid::parse_str(&opened.conversation_id).unwrap();
@@ -485,28 +485,12 @@ pub(crate) fn assert_conditional_write_contract(backend: &dyn SessionBackend) {
             .unwrap(),
         ConditionalSessionWrite::Stale,
     );
-    let rotated = backend.clear_and_rotate_conversation(key).unwrap();
-    assert_ne!(rotated, opened.conversation_id);
-    assert_eq!(
-        backend
-            .mutate_conversation_if_current(
-                key,
-                &opened.conversation_id,
-                SessionMutation::RemoveLast {
-                    expected_role: "user",
-                    expected_content: "updated",
-                },
-            )
-            .unwrap(),
-        ConditionalSessionWrite::Stale,
-    );
-    assert!(backend.open_conversation(key).unwrap().history.is_empty());
     backend.delete_session(key).unwrap();
     assert_eq!(
         backend
             .mutate_conversation_if_current(
                 key,
-                &rotated,
+                &opened.conversation_id,
                 SessionMutation::RemoveLast {
                     expected_role: "user",
                     expected_content: "updated",
@@ -519,6 +503,16 @@ pub(crate) fn assert_conditional_write_contract(backend: &dyn SessionBackend) {
 
     let fresh = backend.open_conversation(key).unwrap();
     assert_ne!(fresh.conversation_id, opened.conversation_id);
+    assert_eq!(
+        backend
+            .mutate_conversation_if_current(
+                key,
+                &opened.conversation_id,
+                SessionMutation::Append(&ChatMessage::assistant("stale")),
+            )
+            .unwrap(),
+        ConditionalSessionWrite::Stale,
+    );
     assert_eq!(
         uuid::Uuid::parse_str(&fresh.conversation_id)
             .unwrap()

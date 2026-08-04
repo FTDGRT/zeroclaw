@@ -3036,7 +3036,7 @@ pub async fn process_message(
     origin: TurnOrigin,
     conversation_id: Option<&str>,
 ) -> Result<String> {
-    Ok(process_message_with_history(
+    Ok(Box::pin(process_message_with_history(
         config,
         agent_alias,
         message,
@@ -3046,7 +3046,7 @@ pub async fn process_message(
         &[],
         None,
         None,
-    )
+    ))
     .await?
     .response)
 }
@@ -5211,6 +5211,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            conversation_id: None,
         })
         .await;
 
@@ -8008,6 +8009,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            conversation_id: None,
         })
         .await;
 
@@ -14828,6 +14830,7 @@ Let me check the result."#;
                     ingress: IngressContext::sub_turn(),
                     agent_alias: None,
                     turn_id: &turn_id,
+                    conversation_id: None,
                 }),
             )
             .await;

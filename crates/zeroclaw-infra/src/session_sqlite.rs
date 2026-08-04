@@ -2032,11 +2032,11 @@ mod tests {
     // ── conditional-write (conversation-id fence) tests ───────────────
 
     #[test]
-    fn conditional_write_contract_sqlite() {
+    fn channel_conversation_contract_sqlite() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
         let backend: &dyn SessionBackend = &backend;
-        crate::session_backend::assert_conditional_write_contract(backend);
+        crate::session_backend::assert_channel_conversation_contract(backend);
     }
 
     #[test]

@@ -9995,7 +9995,7 @@ mod tests {
             assert!(
                 state
                     .channel_sessions
-                    .existing_record_for_test(&history_key)
+                    .existing_record(&history_key)
                     .await
                     .is_none(),
                 "delete during blocked {channel} provider must leave no stale writes"
@@ -10034,7 +10034,7 @@ mod tests {
         );
         let stored = state
             .channel_sessions
-            .existing_record_for_test(&history_key)
+            .existing_record(&history_key)
             .await
             .unwrap();
         assert_eq!(
@@ -10050,10 +10050,7 @@ mod tests {
             ]
         );
 
-        state
-            .channel_sessions
-            .clear_and_rotate_conversation(&history_key)
-            .unwrap();
+        state.channel_sessions.delete(&history_key).await.unwrap();
         assert!(
             !persist_generated_channel_history(
                 &state,
@@ -10066,12 +10063,10 @@ mod tests {
         assert!(
             state
                 .channel_sessions
-                .existing_record_for_test(&history_key)
+                .existing_record(&history_key)
                 .await
-                .unwrap()
-                .history
-                .is_empty(),
-            "stale mutation must not write to the rotated record"
+                .is_none(),
+            "stale mutation must not recreate the deleted record"
         );
     }
 
@@ -10127,21 +10122,21 @@ mod tests {
         let record = open_webhook_channel_conversation(&state, &msg)
             .await
             .expect("open must succeed");
-        // Rotate the id AFTER open so the post-preprocess fence sees a stale
-        // record.
-        let _ = state
+        // Delete AFTER open so the post-preprocess fence sees a stale turn.
+        state
             .channel_sessions
-            .clear_and_rotate_conversation(
-                &zeroclaw_channels::orchestrator::conversation_history_key(&msg),
-            )
-            .expect("rotate must succeed");
+            .delete(&zeroclaw_channels::orchestrator::conversation_history_key(
+                &msg,
+            ))
+            .await
+            .expect("delete must succeed");
 
         let session_id = sender_session_id("whatsapp", &msg);
         let turn =
             run_channel_webhook_turn(&state, &msg, &session_id, None, record, async {}).await;
         assert!(
             matches!(turn, ChannelWebhookTurn::StaleAck),
-            "a rotated record must short-circuit with StaleAck"
+            "a deleted record must short-circuit with StaleAck"
         );
         assert_eq!(
             provider_impl.calls.load(Ordering::SeqCst),
