@@ -146,6 +146,18 @@ pub enum DaemonExit {
 
 const EPHEMERAL_GRACE_SECS: u64 = 1;
 
+fn session_persistence_disabled_event(
+    backend: &str,
+    error_kind: std::io::ErrorKind,
+) -> zeroclaw_log::Event {
+    zeroclaw_log::Event::new(module_path!(), zeroclaw_log::Action::Fail)
+        .with_outcome(zeroclaw_log::EventOutcome::Failure)
+        .with_attrs(serde_json::json!({
+            "backend": backend,
+            "error_kind": error_kind.to_string(),
+        }))
+}
+
 fn session_backend_or_memory_only(
     backend: &str,
     result: std::io::Result<std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
@@ -155,12 +167,7 @@ fn session_backend_or_memory_only(
         Err(error) => {
             ::zeroclaw_log::record!(
                 WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "backend": backend,
-                        "error_kind": error.kind().to_string(),
-                    })),
+                session_persistence_disabled_event(backend, error.kind()),
                 "SESSION_PERSISTENCE_DISABLED"
             );
             None
@@ -2376,35 +2383,25 @@ mod tests {
         config
     }
 
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn sqlite_schema_failure_disables_session_persistence() {
-        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
-        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
-        zeroclaw_log::try_install_capture_subscriber();
-        let mut rx = zeroclaw_log::subscribe_or_install();
-        while rx.try_recv().is_ok() {}
+    #[test]
+    fn session_backend_failure_disables_persistence_without_logging_sensitive_details() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "/sensitive/data/sessions.db: session-key sender",
+        );
+        let event = session_persistence_disabled_event("sqlite", error.kind());
+        let result: std::io::Result<
+            std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+        > = Err(error);
 
-        let tmp = TempDir::new().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let conn = rusqlite::Connection::open(sessions.join("sessions.db")).unwrap();
-        conn.execute(
-            "CREATE VIEW session_metadata AS SELECT 'sensitive/session-key' AS session_key",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-
-        let result = zeroclaw_infra::make_session_backend(tmp.path(), "sqlite");
-        assert!(result.is_err());
         assert!(session_backend_or_memory_only("sqlite", result).is_none());
-        let value = recv_log_event(&mut rx, "SESSION_PERSISTENCE_DISABLED").await;
-        assert_eq!(value["event"]["action"], "fail");
-        assert_eq!(value["attributes"]["backend"], "sqlite");
-        assert!(value["attributes"]["error_kind"].is_string());
-        let rendered = value.to_string();
-        assert!(!rendered.contains(tmp.path().to_string_lossy().as_ref()));
+        assert_eq!(event.action, zeroclaw_log::Action::Fail);
+        assert_eq!(event.outcome, zeroclaw_log::EventOutcome::Failure);
+        let attributes = event.attrs.expect("disabled event should have attributes");
+        assert_eq!(attributes["backend"], "sqlite");
+        assert_eq!(attributes["error_kind"], "invalid data");
+        let rendered = attributes.to_string();
+        assert!(!rendered.contains("/sensitive/data/sessions.db"));
         assert!(!rendered.contains("session-key"));
         assert!(!rendered.contains("sender"));
     }

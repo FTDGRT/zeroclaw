@@ -3081,6 +3081,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
