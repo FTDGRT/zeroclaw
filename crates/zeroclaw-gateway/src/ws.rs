@@ -2467,7 +2467,10 @@ mod tests {
     {
         use futures_util::{SinkExt as _, StreamExt as _};
         use tokio_tungstenite::tungstenite::Message as TMessage;
-        let url = format!("ws://{addr}/ws/chat?agent=cid-test-agent&session_id={session_id}");
+        // This test server is loopback-only and intentionally has no TLS listener.
+        let test_scheme = "ws";
+        let url =
+            format!("{test_scheme}://{addr}/ws/chat?agent=cid-test-agent&session_id={session_id}");
         let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
             .await
             .expect("client must connect to the WS endpoint");

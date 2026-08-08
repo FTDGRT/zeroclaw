@@ -303,29 +303,30 @@ impl ChannelConversationStore {
     /// Load the current history view for a key.
     ///
     /// Durable: return the cached `DurableHistory` view if present, else load
-    /// from the backend and cache it (bounded). Memory-only: return the
-    /// `Memory` record's history (empty if the record is absent).
-    pub fn load_history(&self, key: &str) -> Vec<ChatMessage> {
+    /// from the backend and cache it (bounded). Backend failures are returned
+    /// without installing a cache entry. Memory-only: return the `Memory`
+    /// record's history (empty if the record is absent).
+    pub fn load_history(&self, key: &str) -> std::io::Result<Vec<ChatMessage>> {
         if let Some(backend) = &self.backend {
             let mut cache = self.cache.lock();
             if let Some(CachedChannelSession::DurableHistory(history)) = cache.get(key) {
-                return history.clone();
+                return Ok(history.clone());
             }
             // Keep backend materialization and cache installation atomic with
             // lifecycle invalidation. Reset/delete release their backend lock
             // before taking this cache lock, so this order cannot form a cycle.
-            let messages = backend.load(key);
+            let messages = backend.load_fallible(key)?;
             cache.put(
                 key.to_string(),
                 CachedChannelSession::DurableHistory(messages.clone()),
             );
-            messages
+            Ok(messages)
         } else {
             let mut cache = self.cache.lock();
-            match cache.get(key) {
+            Ok(match cache.get(key) {
                 Some(CachedChannelSession::Memory(rec)) => rec.history.clone(),
                 _ => Vec::new(),
-            }
+            })
         }
     }
 
@@ -465,7 +466,7 @@ impl ChannelConversationStore {
             }
             let mut messages = match cache.get(key) {
                 Some(CachedChannelSession::DurableHistory(history)) => history.clone(),
-                _ => backend.load(key),
+                _ => backend.load_fallible(key)?,
             };
             compact(&mut messages);
             cache.put(
@@ -582,9 +583,13 @@ mod tests {
 
     impl SessionBackend for BlockingBackend {
         fn load(&self, key: &str) -> Vec<ChatMessage> {
-            let messages = self.inner.load(key);
+            self.inner.load(key)
+        }
+
+        fn load_fallible(&self, key: &str) -> std::io::Result<Vec<ChatMessage>> {
+            let messages = self.inner.load_fallible(key)?;
             self.maybe_block(BLOCK_LOAD);
-            messages
+            Ok(messages)
         }
 
         fn append(&self, key: &str, message: &ChatMessage) -> std::io::Result<()> {
@@ -660,6 +665,63 @@ mod tests {
             self.inner
                 .update_last_if_conversation_matches(key, expected_id, message)
         }
+    }
+
+    struct FailingLoadBackend {
+        calls: std::sync::atomic::AtomicUsize,
+        fail: std::sync::atomic::AtomicBool,
+        history: Vec<ChatMessage>,
+    }
+
+    impl SessionBackend for FailingLoadBackend {
+        fn load(&self, _: &str) -> Vec<ChatMessage> {
+            self.history.clone()
+        }
+
+        fn load_fallible(&self, _: &str) -> std::io::Result<Vec<ChatMessage>> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.fail.load(AtomicOrdering::SeqCst) {
+                Err(std::io::Error::other("injected history read failure"))
+            } else {
+                Ok(self.history.clone())
+            }
+        }
+
+        fn append(&self, _: &str, _: &ChatMessage) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn remove_last(&self, _: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn failed_history_read_is_not_cached() {
+        let backend = Arc::new(FailingLoadBackend {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: std::sync::atomic::AtomicBool::new(true),
+            history: vec![ChatMessage::user("persisted")],
+        });
+        let state = ChannelConversationStore::new(Some(backend.clone()));
+
+        assert!(state.load_history("key").is_err());
+        assert_eq!(backend.calls.load(AtomicOrdering::SeqCst), 1);
+
+        backend.fail.store(false, AtomicOrdering::SeqCst);
+        let history = state.load_history("key").unwrap();
+        assert_eq!(history[0].content, "persisted");
+        assert_eq!(backend.calls.load(AtomicOrdering::SeqCst), 2);
+
+        let cached = state.load_history("key").unwrap();
+        assert_eq!(cached.len(), history.len());
+        assert_eq!(cached[0].role, history[0].role);
+        assert_eq!(cached[0].content, history[0].content);
+        assert_eq!(backend.calls.load(AtomicOrdering::SeqCst), 2);
     }
 
     #[test]
@@ -766,19 +828,19 @@ mod tests {
         state
             .append_history_if_current(key_b, &id_b, ChatMessage::user("b-turn"), 50)
             .unwrap();
-        assert_eq!(state.load_history(key_b).len(), 1);
+        assert_eq!(state.load_history(key_b).unwrap().len(), 1);
 
         // Touch A so B becomes LRU.
         assert_eq!(state.resolve_conversation_id(key_a).unwrap(), id_a);
         // Insert C -> evicts B entirely.
         let _ = state.resolve_conversation_id(key_c).unwrap();
-        assert!(state.load_history(key_b).is_empty());
+        assert!(state.load_history(key_b).unwrap().is_empty());
 
         // Re-resolve B: fresh id, empty history.
         let id_b2 = state.resolve_conversation_id(key_b).unwrap();
         assert_ne!(id_b, id_b2, "evicted key must get a fresh id");
         assert!(
-            state.load_history(key_b).is_empty(),
+            state.load_history(key_b).unwrap().is_empty(),
             "no old history leaks back"
         );
     }
@@ -794,7 +856,7 @@ mod tests {
         state
             .rollback_last_if_current(key, &id, "user", "failed")
             .unwrap();
-        assert!(state.load_history(key).is_empty());
+        assert!(state.load_history(key).unwrap().is_empty());
         // The record survives (empty history) and the id is unchanged - a
         // failed rollback must not rotate the id.
         assert_eq!(state.resolve_conversation_id(key).unwrap(), id);
@@ -875,9 +937,9 @@ mod tests {
         .await
         .unwrap();
         release_tx.send(()).unwrap();
-        assert_eq!(loader.await.unwrap()[0].content, "A");
+        assert_eq!(loader.await.unwrap().unwrap()[0].content, "A");
         assert!(delete.await.unwrap().unwrap());
-        assert!(state.load_history(key).is_empty());
+        assert!(state.load_history(key).unwrap().is_empty());
         let id_b = state.open(key).await.unwrap().conversation_id;
         assert_ne!(id_a, id_b);
     }
@@ -932,7 +994,7 @@ mod tests {
             ConditionalSessionWrite::Applied
         );
         assert!(delete.await.unwrap().unwrap());
-        assert!(state.load_history(key).is_empty());
+        assert!(state.load_history(key).unwrap().is_empty());
         let id_b = state.open(key).await.unwrap().conversation_id;
         assert_ne!(id_a, id_b);
     }
@@ -947,7 +1009,7 @@ mod tests {
                 .append_history_if_current(key, &id, ChatMessage::user(content), 50)
                 .unwrap();
         }
-        assert_eq!(state.load_history(key).len(), 4);
+        assert_eq!(state.load_history(key).unwrap().len(), 4);
 
         // Compaction with the current id keeps the last 2 messages.
         state
@@ -956,7 +1018,7 @@ mod tests {
                 history.drain(0..keep);
             })
             .unwrap();
-        let compacted = state.load_history(key);
+        let compacted = state.load_history(key).unwrap();
         assert_eq!(compacted.len(), 2);
         assert_eq!(compacted[0].content, "three");
         assert_eq!(compacted[1].content, "four");
@@ -967,6 +1029,6 @@ mod tests {
             .compact_history_if_current(key, &stale, |_| {})
             .unwrap();
         assert_eq!(status, ConditionalSessionWrite::Stale);
-        assert_eq!(state.load_history(key).len(), 2);
+        assert_eq!(state.load_history(key).unwrap().len(), 2);
     }
 }

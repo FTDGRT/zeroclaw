@@ -131,6 +131,16 @@ pub trait SessionBackend: Send + Sync {
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
 
+    /// Load all messages for a durable Channel conversation without hiding
+    /// backend failures. Backends that do not support Channel conversation
+    /// records retain source compatibility through the default implementation.
+    fn load_fallible(&self, _session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "fallible channel history reads are unsupported",
+        ))
+    }
+
     /// Same as `load`, but each row carries its persisted `created_at`
     /// when the backend has one. Default impl falls back to `load`
     /// without timestamps so non-SQLite backends keep working.

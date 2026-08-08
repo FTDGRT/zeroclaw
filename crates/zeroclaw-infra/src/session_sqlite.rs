@@ -203,6 +203,23 @@ impl SqliteSessionBackend {
         }
         Ok(migrated)
     }
+
+    fn load_messages(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
+            .map_err(std::io::Error::other)?;
+        let rows = stmt
+            .query_map(params![session_key], |row| {
+                Ok(ChatMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            })
+            .map_err(std::io::Error::other)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(std::io::Error::other)
+    }
 }
 
 impl SessionBackend for SqliteSessionBackend {
@@ -299,25 +316,11 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
-        let conn = self.conn.lock();
-        let mut stmt = match conn
-            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
-        {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+        self.load_messages(session_key).unwrap_or_default()
+    }
 
-        let rows = match stmt.query_map(params![session_key], |row| {
-            Ok(ChatMessage {
-                role: row.get(0)?,
-                content: row.get(1)?,
-            })
-        }) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-
-        rows.filter_map(|r| r.ok()).collect()
+    fn load_fallible(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        self.load_messages(session_key)
     }
 
     fn load_with_timestamps(
@@ -1150,6 +1153,25 @@ mod tests {
                 .to_string()
                 .contains("Failed to add session_metadata.missing")
         );
+    }
+
+    #[test]
+    fn fallible_load_distinguishes_missing_history_from_query_failure() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        assert!(backend.load_fallible("missing").unwrap().is_empty());
+        backend
+            .append("broken", &ChatMessage::user("persisted"))
+            .unwrap();
+        backend
+            .conn
+            .lock()
+            .execute("DROP TABLE sessions", [])
+            .unwrap();
+
+        assert!(backend.load_fallible("broken").is_err());
+        assert!(backend.load("broken").is_empty());
     }
 
     #[test]

@@ -2459,6 +2459,12 @@ pub(crate) async fn persist_pairing_tokens(
 /// Result of a gateway chat turn.
 struct GatewayChatOutcome {
     response: String,
+    #[cfg(any(
+        feature = "channel-whatsapp-cloud",
+        feature = "channel-linq",
+        feature = "channel-wati",
+        feature = "channel-nextcloud"
+    ))]
     generated_history: Vec<zeroclaw_api::model_provider::ChatMessage>,
 }
 
@@ -2618,6 +2624,12 @@ pub(crate) async fn run_gateway_chat_with_tools(
             .await?;
         Ok(GatewayChatOutcome {
             response,
+            #[cfg(any(
+                feature = "channel-whatsapp-cloud",
+                feature = "channel-linq",
+                feature = "channel-wati",
+                feature = "channel-nextcloud"
+            ))]
             generated_history: Vec::new(),
         })
     }
@@ -2671,6 +2683,12 @@ pub(crate) async fn run_gateway_chat_with_tools(
         .await?;
         Ok(GatewayChatOutcome {
             response: outcome.response,
+            #[cfg(any(
+                feature = "channel-whatsapp-cloud",
+                feature = "channel-linq",
+                feature = "channel-wati",
+                feature = "channel-nextcloud"
+            ))]
             generated_history: outcome.history,
         })
     }

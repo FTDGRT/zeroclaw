@@ -230,13 +230,15 @@ impl SessionStore {
         })
     }
     pub fn load(&self, key: &str) -> Vec<ChatMessage> {
+        self.load_fallible(key).unwrap_or_default()
+    }
+    fn load_fallible(&self, key: &str) -> std::io::Result<Vec<ChatMessage>> {
         let _guard = self.mutation_lock.lock();
         self.with_key_lock(key, || {
             Ok(self
                 .read_record_unlocked(key, true)?
                 .map_or_else(Vec::new, |r| r.history))
         })
-        .unwrap_or_default()
     }
     pub fn append(&self, key: &str, m: &ChatMessage) -> std::io::Result<()> {
         let _guard = self.mutation_lock.lock();
@@ -391,6 +393,9 @@ impl SessionBackend for SessionStore {
     fn load(&self, k: &str) -> Vec<ChatMessage> {
         self.load(k)
     }
+    fn load_fallible(&self, k: &str) -> std::io::Result<Vec<ChatMessage>> {
+        self.load_fallible(k)
+    }
     fn append(&self, k: &str, m: &ChatMessage) -> std::io::Result<()> {
         self.append(k, m)
     }
@@ -504,6 +509,19 @@ mod tests {
 
         let messages = store.load("nonexistent");
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn fallible_load_distinguishes_missing_history_from_invalid_record() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        assert!(store.load_fallible("missing").unwrap().is_empty());
+        std::fs::write(store.session_path("broken"), "not-json\n").unwrap();
+
+        let error = store.load_fallible("broken").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(store.load("broken").is_empty());
     }
 
     #[test]

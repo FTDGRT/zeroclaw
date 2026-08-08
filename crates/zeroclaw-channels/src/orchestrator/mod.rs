@@ -2139,7 +2139,11 @@ fn compact_sender_history(
     // the full history). It is conditional on the record still carrying the id
     // the turn captured; a stale/deleted result is an expected lifecycle race
     // and reports "not compacted" so the caller's overflow messaging is honest.
-    if ctx.channel_sessions.load_history(history_key).is_empty() {
+    if !ctx
+        .channel_sessions
+        .load_history(history_key)
+        .is_ok_and(|history| !history.is_empty())
+    {
         return false;
     }
     let result =
@@ -2168,9 +2172,10 @@ fn compact_sender_history(
             });
     use zeroclaw_infra::session_backend::ConditionalSessionWrite;
     match result {
-        Ok(ConditionalSessionWrite::Applied) => {
-            !ctx.channel_sessions.load_history(history_key).is_empty()
-        }
+        Ok(ConditionalSessionWrite::Applied) => ctx
+            .channel_sessions
+            .load_history(history_key)
+            .is_ok_and(|history| !history.is_empty()),
         _ => false,
     }
 }
@@ -2228,7 +2233,10 @@ async fn append_sender_turn(
     // memory-only records, where compact_history_if_current drops the head
     // beyond max_history in place.
     if status == zeroclaw_infra::ConditionalSessionWrite::Applied
-        && ctx.channel_sessions.load_history(history_key).len() > max_history
+        && ctx
+            .channel_sessions
+            .load_history(history_key)
+            .is_ok_and(|history| history.len() > max_history)
     {
         let _ = ctx.channel_sessions.compact_history_if_current(
             history_key,
@@ -5041,7 +5049,27 @@ async fn process_channel_message_body(
     let had_prior_history = if force_fresh_session {
         false
     } else {
-        !ctx.channel_sessions.load_history(&history_key).is_empty()
+        match ctx.channel_sessions.load_history(&history_key) {
+            Ok(history) => !history.is_empty(),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "Failed to load session history"
+                );
+                reconcile_early_ack(
+                    ctx.as_ref(),
+                    &msg,
+                    target_channel.as_ref(),
+                    early_ack_task,
+                    Some("\u{26A0}\u{FE0F}"),
+                )
+                .await;
+                return;
+            }
+        }
     };
 
     // Preserve the dated user turn verbatim before the LLM call so interrupted
@@ -5100,7 +5128,27 @@ async fn process_channel_message_body(
     let prior_turns_raw = if force_fresh_session {
         vec![ChatMessage::user(&timestamped_content)]
     } else {
-        ctx.channel_sessions.load_history(&history_key)
+        match ctx.channel_sessions.load_history(&history_key) {
+            Ok(history) => history,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "Failed to load session history"
+                );
+                reconcile_early_ack(
+                    ctx.as_ref(),
+                    &msg,
+                    target_channel.as_ref(),
+                    early_ack_task,
+                    Some("\u{26A0}\u{FE0F}"),
+                )
+                .await;
+                return;
+            }
+        }
     };
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
@@ -13785,7 +13833,7 @@ api_key = "anthropic-key"
 
         assert!(compact_sender_history(&ctx, &sender, &id));
 
-        let kept = ctx.channel_sessions.load_history(&sender);
+        let kept = ctx.channel_sessions.load_history(&sender).unwrap();
         assert_eq!(kept.len(), CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
         assert!(kept.iter().all(|turn| {
             let len = turn.content.chars().count();
@@ -13879,7 +13927,7 @@ api_key = "anthropic-key"
             .unwrap();
         let _ = append_sender_turn(&ctx, &sender, &id, ChatMessage::user("hello")).await;
 
-        let turns = ctx.channel_sessions.load_history(&sender);
+        let turns = ctx.channel_sessions.load_history(&sender).unwrap();
         assert!(!turns.is_empty(), "sender history should exist");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].role, "user");
@@ -13999,7 +14047,7 @@ api_key = "anthropic-key"
             zeroclaw_infra::ConditionalSessionWrite::Applied
         );
 
-        let turns = ctx.channel_sessions.load_history(&sender);
+        let turns = ctx.channel_sessions.load_history(&sender).unwrap();
         assert!(!turns.is_empty(), "sender history should remain");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].content, "first");
@@ -14120,7 +14168,7 @@ api_key = "anthropic-key"
         );
 
         // History view should have 2 turns remaining.
-        let turns = ctx.channel_sessions.load_history(&sender);
+        let turns = ctx.channel_sessions.load_history(&sender).unwrap();
         assert!(!turns.is_empty(), "history should remain");
         assert_eq!(turns.len(), 2);
 
@@ -14984,6 +15032,129 @@ api_key = "anthropic-key"
         }
         fn alias(&self) -> &str {
             "CountingBlockingProvider"
+        }
+    }
+
+    struct CountingProvider {
+        call_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CountingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok("unexpected provider reply".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok("unexpected provider reply".to_string())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CountingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "CountingProvider"
+        }
+    }
+
+    struct FailSecondHistoryReadBackend {
+        conversation_id: String,
+        history: std::sync::Mutex<Vec<ChatMessage>>,
+        load_calls: AtomicUsize,
+    }
+
+    impl FailSecondHistoryReadBackend {
+        fn new() -> Self {
+            Self {
+                conversation_id: uuid::Uuid::new_v4().to_string(),
+                history: std::sync::Mutex::new(vec![ChatMessage::assistant("prior")]),
+                load_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl SessionBackend for FailSecondHistoryReadBackend {
+        fn load(&self, _: &str) -> Vec<ChatMessage> {
+            self.history.lock().unwrap().clone()
+        }
+
+        fn load_fallible(&self, _: &str) -> std::io::Result<Vec<ChatMessage>> {
+            if self.load_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(self.history.lock().unwrap().clone())
+            } else {
+                Err(std::io::Error::other("injected history read failure"))
+            }
+        }
+
+        fn append(&self, _: &str, message: &ChatMessage) -> std::io::Result<()> {
+            self.history.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+
+        fn remove_last(&self, _: &str) -> std::io::Result<bool> {
+            Ok(self.history.lock().unwrap().pop().is_some())
+        }
+
+        fn list_sessions(&self) -> Vec<String> {
+            vec!["test-channel_chat-42_alice".to_string()]
+        }
+
+        fn open_conversation(
+            &self,
+            _: &str,
+        ) -> std::io::Result<zeroclaw_infra::ChannelConversationRecord> {
+            Ok(zeroclaw_infra::ChannelConversationRecord {
+                conversation_id: self.conversation_id.clone(),
+                history: self.history.lock().unwrap().clone(),
+            })
+        }
+
+        fn current_conversation_id(&self, _: &str) -> std::io::Result<Option<String>> {
+            Ok(Some(self.conversation_id.clone()))
+        }
+
+        fn mutate_conversation_if_current(
+            &self,
+            _: &str,
+            expected_id: &str,
+            mutation: zeroclaw_infra::SessionMutation<'_>,
+        ) -> std::io::Result<zeroclaw_infra::ConditionalSessionWrite> {
+            if expected_id != self.conversation_id {
+                return Ok(zeroclaw_infra::ConditionalSessionWrite::Stale);
+            }
+            let mut history = self.history.lock().unwrap();
+            match mutation {
+                zeroclaw_infra::SessionMutation::Append(message) => history.push(message.clone()),
+                zeroclaw_infra::SessionMutation::RemoveLast { .. } => {
+                    history.pop();
+                }
+                zeroclaw_infra::SessionMutation::UpdateLast(message) => {
+                    if let Some(last) = history.last_mut() {
+                        *last = message.clone();
+                    }
+                }
+            }
+            Ok(zeroclaw_infra::ConditionalSessionWrite::Applied)
         }
     }
 
@@ -18045,7 +18216,7 @@ BTC is currently around $65,000 based on latest tool output."#
         // on echoing receipts could leak signed-looking output even though
         // nothing was actually signed.
         for key in runtime_ctx.channel_sessions.cached_keys() {
-            let turns = runtime_ctx.channel_sessions.load_history(&key);
+            let turns = runtime_ctx.channel_sessions.load_history(&key).unwrap();
             for msg in turns.iter() {
                 assert!(
                     !msg.content.contains("[receipt: "),
@@ -18167,7 +18338,8 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let turns = runtime_ctx
             .channel_sessions
-            .load_history("telegram_chat-telegram_alice");
+            .load_history("telegram_chat-telegram_alice")
+            .unwrap();
         assert!(!turns.is_empty(), "telegram history should be stored");
         let assistant_turn = turns
             .iter()
@@ -21399,7 +21571,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let expected_notice = channel_runtime_cli_string("channel-runtime-no-reply-refused");
         let turns = runtime_ctx
             .channel_sessions
-            .load_history(history_key.as_str());
+            .load_history(history_key.as_str())
+            .unwrap();
         let marker = turns
             .iter()
             .rev()
@@ -21457,7 +21630,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let expected_notice = channel_runtime_cli_string("channel-runtime-no-reply-refused");
         let turns = runtime_ctx
             .channel_sessions
-            .load_history(history_key.as_str());
+            .load_history(history_key.as_str())
+            .unwrap();
         let marker = turns
             .iter()
             .rev()
@@ -21510,7 +21684,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let expected_notice = channel_runtime_cli_string("channel-runtime-no-reply-refused");
         let turns = runtime_ctx
             .channel_sessions
-            .load_history(history_key.as_str());
+            .load_history(history_key.as_str())
+            .unwrap();
         let marker = turns
             .iter()
             .rev()
@@ -24283,7 +24458,8 @@ BTC is currently around $65,000 based on latest tool output."#
         {
             let turns = runtime_ctx
                 .channel_sessions
-                .load_history("telegram_chat-refresh_alice");
+                .load_history("telegram_chat-refresh_alice")
+                .unwrap();
             assert!(
                 turns.is_empty(),
                 "/new should clear the cached sender history before the next message"
@@ -24517,7 +24693,8 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let turns = runtime_ctx
             .channel_sessions
-            .load_history("test-channel_chat-ctx_alice");
+            .load_history("test-channel_chat-ctx_alice")
+            .unwrap();
         assert!(!turns.is_empty(), "history should be stored for sender");
         assert_eq!(turns[0].role, "user");
         // Cached history must be the raw timestamped user content with NO
@@ -24912,7 +25089,8 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         let turns = runtime_ctx
             .channel_sessions
-            .load_history(sender_keys.first().unwrap());
+            .load_history(sender_keys.first().unwrap())
+            .unwrap();
         assert!(!turns.is_empty(), "history should be stored for sender");
         let user_turns: Vec<_> = turns.iter().filter(|t| t.role == "user").collect();
         assert_eq!(
@@ -25143,7 +25321,8 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let turns = runtime_ctx
             .channel_sessions
-            .load_history("test-channel_chat-image_alice");
+            .load_history("test-channel_chat-image_alice")
+            .unwrap();
         assert!(!turns.is_empty(), "history should be stored for sender");
         assert_eq!(turns[0].role, "user");
         assert!(turns[0].content.starts_with('['));
@@ -27279,7 +27458,8 @@ This is an example JSON object for profile settings."#;
 
         let turns = runtime_ctx
             .channel_sessions
-            .load_history("test-channel_chat-photo_zeroclaw_user");
+            .load_history("test-channel_chat-photo_zeroclaw_user")
+            .unwrap();
         assert!(!turns.is_empty(), "history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
@@ -27437,7 +27617,8 @@ This is an example JSON object for profile settings."#;
 
         let turns = runtime_ctx
             .channel_sessions
-            .load_history("test-channel_chat-format_zeroclaw_user");
+            .load_history("test-channel_chat-format_zeroclaw_user")
+            .unwrap();
         assert!(!turns.is_empty(), "history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
@@ -30927,6 +31108,42 @@ Done."#;
     }
 
     #[tokio::test]
+    async fn history_read_failure_after_user_append_skips_provider() {
+        let channel = Arc::new(RecordingChannel::default());
+        let observer = Arc::new(RecordingObserver::default());
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(FailSecondHistoryReadBackend::new());
+        let mut ctx = (*test_runtime_ctx_with_observer(
+            channel.clone(),
+            Arc::new(CountingProvider {
+                call_count: Arc::clone(&provider_calls),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            observer,
+        ))
+        .clone();
+        let backend_dyn: Arc<dyn SessionBackend> = backend.clone();
+        ctx.session_store = Some(Arc::clone(&backend_dyn));
+        ctx.channel_sessions = Arc::new(
+            zeroclaw_infra::channel_conversation::ChannelConversationStore::new(Some(backend_dyn)),
+        );
+
+        process_channel_message(
+            Arc::new(ctx),
+            ChannelTurnHarness::msg("hello", "m1"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(backend.load_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert!(channel.sent_messages.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn durable_jsonl_turn_persists_and_replies_through_turn_may_continue() {
         // Regression: the JSONL SessionStore does NOT override
         // get_session_metadata, so the trait default returns
@@ -31468,7 +31685,7 @@ Done."#;
             .unwrap()
             .conversation_id;
         assert_ne!(id_a_captured, id_b);
-        assert!(ctx.channel_sessions.load_history(key).is_empty());
+        assert!(ctx.channel_sessions.load_history(key).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -31513,6 +31730,7 @@ Done."#;
         assert!(
             ctx.channel_sessions
                 .load_history(&key)
+                .unwrap()
                 .iter()
                 .all(|m| !m.content.contains("stale reply")),
             "old turn content must not leak after reset"
@@ -31612,7 +31830,7 @@ Done."#;
             "B's id is unchanged"
         );
         assert_eq!(
-            ctx.channel_sessions.load_history(key_b).len(),
+            ctx.channel_sessions.load_history(key_b).unwrap().len(),
             1,
             "B's history is unchanged"
         );
